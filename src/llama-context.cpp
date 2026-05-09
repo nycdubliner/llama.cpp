@@ -4274,7 +4274,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 }
             }
 
-            const auto * cb_eval_new = dflash_graph_hidden_ready ? nullptr : dflash_eval_callback;
+            ggml_backend_sched_eval_callback cb_eval_new = dflash_graph_hidden_ready ? nullptr : dflash_eval_callback;
             void * cb_eval_user_data_new = dflash_graph_hidden_ready ? nullptr : dflash_capture.get();
             cparams.cb_eval = cb_eval_new;
             cparams.cb_eval_user_data = cb_eval_user_data_new;

@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cfloat>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
