@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include "log.h"
 
 #include <algorithm>
 #include <climits>

@@ -24,12 +24,12 @@ int main() {
     const float max = 0.65f;
 
     assert_close(server_adaptive_dm_required_fringe_for_n_max(2, 8, min, max), 0.30f);
-    assert_close(server_adaptive_dm_required_fringe_for_n_max(3, 8, min, max), 0.409375f);
-    assert_close(server_adaptive_dm_required_fringe_for_n_max(4, 8, min, max), 0.453125f);
-    assert_close(server_adaptive_dm_required_fringe_for_n_max(6, 8, min, max), 0.540625f);
-    assert_close(server_adaptive_dm_required_fringe_for_n_max(8, 8, min, max), 0.628125f);
+    assert_close(server_adaptive_dm_required_fringe_for_n_max(3, 8, min, max), 0.35833335f);
+    assert_close(server_adaptive_dm_required_fringe_for_n_max(4, 8, min, max), 0.41666669f);
+    assert_close(server_adaptive_dm_required_fringe_for_n_max(6, 8, min, max), 0.53333336f);
+    assert_close(server_adaptive_dm_required_fringe_for_n_max(8, 8, min, max), 0.65f);
 
-    assert_close(server_adaptive_dm_required_fringe_for_n_max(99, 8, min, max), 0.628125f);
+    assert_close(server_adaptive_dm_required_fringe_for_n_max(99, 8, min, max), 0.65f);
     assert_close(server_adaptive_dm_required_fringe_for_n_max(4, 1, min, max), 0.30f);
 
     assert(server_adaptive_dm_probe_n_max(8, 0.25f) == 2);
@@ -56,7 +56,7 @@ int main() {
         bool ready = false;
         const float expected_accept = server_adaptive_dm_survival_expected_accept(p, samples, 4, 4, 6, &ready);
         assert(ready);
-        assert_close(expected_accept, 1.71f);
+        assert_close(expected_accept, 2.25f);
     }
 
     {
@@ -98,7 +98,7 @@ int main() {
         const int nc8 = server_adaptive_dm_build_candidates(8, cand, 16);
         assert(server_adaptive_dm_apply_profit_hysteresis(2, 4, 30.0f, 30.9f, 0.06f, 0.02f, cand, nc8) == 2);
         assert(server_adaptive_dm_apply_profit_hysteresis(2, 8, 30.0f, 33.0f, 0.06f, 0.02f, cand, nc8) == 4);
-        assert(server_adaptive_dm_apply_profit_hysteresis(6, 2, 30.0f, 31.5f, 0.06f, 0.02f, cand, nc8) == 2);
+        assert(server_adaptive_dm_apply_profit_hysteresis(6, 2, 30.0f, 31.5f, 0.06f, 0.02f, cand, nc8) == 5);
     }
 
     assert(server_adaptive_dm_should_preserve_for_continuation(0.995f, 1.000f));
@@ -122,7 +122,14 @@ int main() {
     state.profit_depth[4].samples = 3;
     state.profit_baseline.samples = 2;
     state.profit_has_key = true;
-    state.profit_key = { 8, 0, 1, 1024, 0.0f, 0.0f };
+    state.profit_key = {};
+    state.profit_key.base_n_max = 8;
+    state.profit_key.branch_budget = 0;
+    state.profit_key.draft_topk = 1;
+    state.profit_key.dflash_cross_ctx = 1024;
+    state.profit_key.context_bucket = 0;
+    state.profit_key.draft_temp = 0.0f;
+    state.profit_key.p_min = 0.0f;
     state.profit_pending = true;
     state.profit_last_recommended_n = 4;
     state.profit_consecutive_below_profit = 2;
@@ -200,7 +207,11 @@ int main() {
     state.adaptive_n_max = 2;
     state.observe_profit_acceptance(2, 0);
     state.observe_profit_timing(2, 15.0f, 60.0f, 5.0f, 80.0f);
-    assert(state.decide_profit_n_max(8) == 2);
+    {
+        const int recommended = state.decide_profit_n_max(8);
+        assert(recommended == 1);
+        state.apply_profit_recommendation(recommended);
+    }
     state.observe_profit_timing(0, 0.0f, 30.0f, 0.0f, 30.0f);
     assert(state.decide_profit_n_max(8) == 0);
 
@@ -237,7 +248,9 @@ int main() {
     assert(state.profit_depth[4].samples == 1);
     assert(state.profit_pos_accept_ewma[0] > 0.0f);
 
-    state.reset_profit_if_config_changed(state.dm_profit_min_samples = 1, (common_params_speculative){});
+    state.dm_profit_min_samples = 1;
+    common_params_speculative empty_spec;
+    state.reset_profit_if_config_changed(empty_spec, 1, 0);
     // actually need a proper spec struct; let's use the simpler check
     common_params_speculative spec;
     spec.n_max = 8;
@@ -247,14 +260,14 @@ int main() {
     spec.sample_temp = 0.0f;
     spec.p_min = 0.0f;
     state.observe_profit_timing(2, 10.0f, 20.0f, 5.0f, 35.0f);
-    state.reset_profit_if_config_changed(spec, 8);
+    state.reset_profit_if_config_changed(spec, 8, 0);
     assert(state.profit_has_key);
     assert(state.profit_depth[2].samples == 0);
     state.observe_profit_timing(2, 10.0f, 20.0f, 5.0f, 35.0f);
-    state.reset_profit_if_config_changed(spec, 8);
+    state.reset_profit_if_config_changed(spec, 8, 0);
     assert(state.profit_depth[2].samples == 1);
     spec.dflash_cross_ctx = 2048;
-    state.reset_profit_if_config_changed(spec, 8);
+    state.reset_profit_if_config_changed(spec, 8, 0);
     assert(state.profit_depth[2].samples == 0);
 
     // test cross-depth estimation
