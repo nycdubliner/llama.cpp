@@ -1432,6 +1432,30 @@ void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_laye
     }
 }
 
+void llama_context::set_dflash_gpu_capture(bool enabled) {
+    if (!dflash_capture) {
+        return;
+    }
+
+    dflash_capture->gpu_capture_enabled = enabled;
+
+    if (enabled) {
+        return;
+    }
+
+    dflash_capture->hidden_gpu.clear();
+    dflash_capture->tapes.clear();
+    cparams.tape_gpu = nullptr;
+    cparams.tape_gpu_n_seqs = 0;
+    cparams.hidden_gpu_n_seqs = 0;
+    for (int s = 0; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
+        cparams.tape_gpu_seqs[s] = nullptr;
+        cparams.hidden_gpu_seqs[s] = nullptr;
+    }
+    cparams.cb_eval = dflash_eval_callback;
+    cparams.cb_eval_user_data = dflash_capture.get();
+}
+
 void llama_context::dflash_reset_hidden_capture() {
     if (!dflash_capture) {
         return;
@@ -1558,6 +1582,12 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
     // populate recurrent-layer metadata if the caller beat set_tape_recording() to it
     dflash_ensure_recurrent_setup();
 
+    if (!dflash_capture->gpu_capture_enabled) {
+        dflash_capture->hidden_gpu.clear();
+        dflash_capture->tapes.clear();
+        return;
+    }
+
     if (model.n_devices() > 1) {
         dflash_capture->hidden_gpu.clear();
         dflash_capture->tapes.clear();
@@ -1672,6 +1702,10 @@ void llama_context::allocate_hidden_gpu(int n_slots, int max_tokens) {
     }
     if (n_slots < 1) {
         n_slots = 1;
+    }
+    if (!dflash_capture->gpu_capture_enabled) {
+        dflash_capture->hidden_gpu.clear();
+        return;
     }
     if (model.n_devices() > 1) {
         dflash_capture->hidden_gpu.clear();
@@ -4234,7 +4268,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // correct layer_hiddens slot. Populate per-seq tape pointers for the
         // graph builder so GPU tape copies target the correct per-slot buffers.
         if (dflash_capture) {
-            const bool dflash_gpu_capture_ready = model.n_devices() <= 1;
+            const bool dflash_gpu_capture_ready = model.n_devices() <= 1 && dflash_capture->gpu_capture_enabled;
             dflash_capture->ubatch = &ubatch;
             cparams.hidden_gpu_n_seqs = 0;
             for (int s = 0; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
@@ -5888,6 +5922,10 @@ int32_t llama_get_n_layer_hiddens(llama_context * ctx) {
 
 void llama_set_dflash_capture(llama_context * ctx, const int32_t * layer_ids, int32_t n_layers) {
     ctx->set_dflash_capture(layer_ids, n_layers);
+}
+
+void llama_set_dflash_gpu_capture(llama_context * ctx, bool enabled) {
+    ctx->set_dflash_gpu_capture(enabled);
 }
 
 void llama_set_dflash_sample_temp(llama_context * ctx, float temp) {

@@ -1389,6 +1389,12 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
     return &ggml_backend_cuda_buffer_type_host;
 }
 
+static bool ggml_cuda_buffer_visible_to_backend(ggml_backend_cuda_context * cuda_ctx, ggml_backend_buffer_type_t buft, bool integrated) {
+    return buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+           ggml_backend_buft_is_cuda_split(buft) ||
+           (integrated && ggml_backend_buft_is_cuda_host(buft));
+}
+
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
 //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 //}
@@ -3101,54 +3107,87 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
-static bool ggml_cuda_buffer_visible_to_backend(
-        ggml_backend_cuda_context * cuda_ctx,
-        ggml_backend_buffer_type_t buft,
-        bool integrated) {
-    return buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
-           ggml_backend_buft_is_cuda_split(buft) ||
-           (integrated && ggml_backend_buft_is_cuda_host(buft));
-}
-
-#ifndef NDEBUG
 static void ggml_cuda_log_nonlocal_src_buffer(
         ggml_backend_cuda_context * cuda_ctx,
         const ggml_tensor * node,
-        int src_idx) {
-    const ggml_tensor * src = node->src[src_idx];
+        int src_index,
+        bool integrated,
+        const char * action) {
+    const ggml_tensor * src = src_index >= 0 ? node->src[src_index] : node;
+    const void * data = src ? src->data : nullptr;
     int ptr_device = -1;
-    int ptr_type = -1;
+    const char * ptr_type = "unknown";
 
-    if (src && src->data) {
+    if (data) {
         cudaPointerAttributes attr;
-        cudaError_t err = cudaPointerGetAttributes(&attr, src->data);
+        cudaError_t err = cudaPointerGetAttributes(&attr, data);
         if (err == cudaSuccess) {
             ptr_device = attr.device;
 #if CUDART_VERSION >= 10000
-            ptr_type = attr.type;
+            switch (attr.type) {
 #else
-            ptr_type = attr.memoryType;
+            switch (attr.memoryType) {
 #endif
+                case cudaMemoryTypeHost:    ptr_type = "host";    break;
+                case cudaMemoryTypeDevice:  ptr_type = "device";  break;
+                case cudaMemoryTypeManaged: ptr_type = "managed"; break;
+                default:                    ptr_type = "other";   break;
+            }
         } else {
-            (void) cudaGetLastError();
+            cudaGetLastError();
         }
     }
 
     GGML_LOG_ERROR(
-        "%s: source buffer is not visible to CUDA backend device %d: node=%s op=%s src[%d]=%s src_buffer=%s src_ptr=%p ptr_device=%d ptr_type=%d dst_buffer=%s\n",
-        __func__,
-        cuda_ctx->device,
-        node->name,
-        ggml_op_name(node->op),
-        src_idx,
-        src ? src->name : "(null)",
-        src && src->buffer ? ggml_backend_buft_name(src->buffer->buft) : "(no buffer)",
-        src ? src->data : nullptr,
-        ptr_device,
-        ptr_type,
-        ggml_backend_buft_name(ggml_backend_cuda_buffer_type(cuda_ctx->device)));
+            "%s: source buffer is not visible to CUDA backend device; action=%s backend_device=%d integrated=%d node=%s op=%s src[%d]=%s src_buft=%s dst_buft=%s src_data=%p ptr_type=%s ptr_device=%d\n",
+            __func__,
+            action ? action : "fail",
+            cuda_ctx->device,
+            integrated ? 1 : 0,
+            node ? node->name : "(null)",
+            node ? ggml_op_name(node->op) : "(null)",
+            src_index,
+            src ? src->name : "(null)",
+            src && src->buffer ? ggml_backend_buft_name(src->buffer->buft) : "(none)",
+            node && node->buffer ? ggml_backend_buft_name(node->buffer->buft) : "(none)",
+            data,
+            ptr_type,
+            ptr_device);
 }
-#endif
+
+static bool ggml_cuda_graph_node_buffers_visible(
+        ggml_backend_cuda_context * cuda_ctx,
+        const ggml_tensor * node,
+        bool integrated,
+        bool log_errors) {
+    if (!node || ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+            node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE ||
+            (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return true;
+    }
+
+    if (!node->buffer || node->buffer->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device)) {
+        if (log_errors) {
+            ggml_cuda_log_nonlocal_src_buffer(cuda_ctx, node, -1, integrated, "fail graph compute");
+        }
+        return false;
+    }
+
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        const ggml_tensor * src = node->src[j];
+        if (!src) {
+            continue;
+        }
+        if (!src->buffer || !ggml_cuda_buffer_visible_to_backend(cuda_ctx, src->buffer->buft, integrated)) {
+            if (log_errors) {
+                ggml_cuda_log_nonlocal_src_buffer(cuda_ctx, node, j, integrated, "fail graph compute");
+            }
+            return false;
+        }
+    }
+
+    return true;
+}
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -3169,7 +3208,6 @@ static bool ggml_cuda_graph_check_compability(ggml_backend_cuda_context * cuda_c
             if (!src || !src->buffer) {
                 continue;
             }
-
             const ggml_backend_buffer_type_t src_buft = src->buffer->buft;
             if (ggml_backend_buft_is_cuda_split(src_buft)) {
                 use_cuda_graph = false; // Split buffers are not supported by CUDA graph capture
@@ -3188,6 +3226,9 @@ static bool ggml_cuda_graph_check_compability(ggml_backend_cuda_context * cuda_c
 #endif
                 break;
             }
+        }
+        if (!use_cuda_graph) {
+            break;
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
@@ -4128,7 +4169,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 }
 
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static enum ggml_status ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -4280,34 +4321,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     i += nodes_to_skip;
                     continue;
                 }
-#ifndef NDEBUG
-                const ggml_backend_buffer_type_t local_buft = ggml_backend_cuda_buffer_type(cuda_ctx->device);
-                if (node->buffer->buft != local_buft) {
-                    GGML_LOG_ERROR("%s: node buffer is not local to CUDA backend device %d: node=%s op=%s node_buffer=%s dst_buffer=%s\n",
-                            __func__, cuda_ctx->device, node->name, ggml_op_name(node->op),
-                            ggml_backend_buft_name(node->buffer->buft), ggml_backend_buft_name(local_buft));
+                if (!ggml_cuda_graph_node_buffers_visible(cuda_ctx, node, integrated, true)) {
+                    return GGML_STATUS_FAILED;
                 }
-                assert(node->buffer->buft == local_buft);
-                for (int j = 0; j < GGML_MAX_SRC; j++) {
-                    if (node->src[j] != nullptr) {
-                        assert(node->src[j]->buffer);
-                        const ggml_backend_buffer_type_t src_buft = node->src[j]->buffer->buft;
-                        const bool src_visible = ggml_cuda_buffer_visible_to_backend(cuda_ctx, src_buft, integrated);
-                        if (!src_visible) {
-                            ggml_cuda_log_nonlocal_src_buffer(cuda_ctx, node, j);
-                        }
-                        assert(src_visible);
-                    }
-                }
-#else
-                GGML_UNUSED(integrated);
-#endif  // NDEBUG
 
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                    return GGML_STATUS_FAILED;
                 }
-                GGML_ASSERT(ok);
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4350,6 +4372,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
     }
+
+    return GGML_STATUS_SUCCESS;
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -4413,6 +4437,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    const bool integrated = ggml_cuda_info().devices[cuda_ctx->device].integrated;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (!ggml_cuda_graph_node_buffers_visible(cuda_ctx, cgraph->nodes[i], integrated, true)) {
+            return GGML_STATUS_FAILED;
+        }
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -4423,7 +4454,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    const ggml_status status = ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    if (status != GGML_STATUS_SUCCESS) {
+        return status;
+    }
 
     return GGML_STATUS_SUCCESS;
 }

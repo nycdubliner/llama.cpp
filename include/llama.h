@@ -1088,6 +1088,11 @@ extern "C" {
     // Pass n_layers=0 to disable capture
     LLAMA_API void llama_set_dflash_capture(struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layers);
 
+    // DFlash: enable graph-embedded GPU hidden/tape capture for target decode.
+    // Disable this before decode when the drafter cannot consume GPU cross-ring
+    // tensors directly, so the eval callback keeps CPU hidden buffers populated.
+    LLAMA_API void llama_set_dflash_gpu_capture(struct llama_context * ctx, bool enabled);
+
     // DFlash: set drafter sampling temperature (Gumbel-max trick)
     // temp=0: greedy argmax (default), temp>0: sample from softmax(logits/temp)
     LLAMA_API void llama_set_dflash_sample_temp(struct llama_context * ctx, float temp);

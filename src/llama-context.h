@@ -117,6 +117,7 @@ struct dflash_capture_data {
 
     // tape recording (for DeltaNet state rollback)
     bool tape_enabled = false;
+    bool gpu_capture_enabled = true;
     std::vector<int32_t> recurrent_layer_ids;       // model layer indices that are DeltaNet
     std::unordered_map<std::string, std::pair<int, int>> tape_name_map;  // name → (layer_idx, type)
     std::vector<dflash_tape_layer> tape_layers;     // one per recurrent layer (CPU fallback)
@@ -474,6 +475,7 @@ public:
 
     // DFlash: configure hidden state capture layers
     void set_dflash_capture(const int32_t * layer_ids, int32_t n_layers);
+    void set_dflash_gpu_capture(bool enabled);
     void set_dflash_sample_temp(float temp);
     void set_dflash_topk(int k);
     void set_dflash_verify_logits(bool enabled, int top_k);

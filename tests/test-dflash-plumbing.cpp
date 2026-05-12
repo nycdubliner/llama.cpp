@@ -143,22 +143,24 @@ int main(int argc, char ** argv) {
     ok &= expect(speculative.find("kv_cache_update requested=%d update=%d") != std::string::npos, "DFlash accept profiling must report drafter K/V cache update time");
     ok &= expect(context_h.find("struct dflash_hidden_gpu") != std::string::npos, "DFlash must define GPU hidden capture storage");
     ok &= expect(cparams_h.find("hidden_gpu_seqs") != std::string::npos, "graph params must expose per-seq GPU hidden targets");
+    ok &= expect(context_h.find("bool gpu_capture_enabled = true") != std::string::npos, "DFlash capture must be able to force CPU hidden callbacks");
+    ok &= expect(llama_h.find("llama_set_dflash_gpu_capture") != std::string::npos, "public DFlash API must expose GPU capture gating");
     ok &= expect(context_cpp.find("allocate_hidden_gpu(n_slots, max_tokens)") != std::string::npos, "GPU tape allocation must allocate hidden capture buffers too");
     ok &= expect(context_cpp.find("dflash_graph_hidden_ready ? nullptr : dflash_eval_callback") != std::string::npos, "eligible DFlash verifier graph must disable eval callback");
     ok &= expect(context_cpp.find("const bool dflash_graph_tape_ready") != std::string::npos, "DFlash decode must gate GPU tape copies separately from hidden capture");
     ok &= expect(context_cpp.find("dflash_graph_hidden_ready =\n                    !dflash_capture->hidden_gpu.empty()") != std::string::npos, "GPU hidden graph capture must not depend on active tape recording");
     ok &= expect(context_cpp.find("dflash_tape_gpu * graph_tp = dflash_graph_tape_ready ? tp : nullptr") != std::string::npos, "GPU tape graph pointers must be disabled when tape recording is inactive");
     ok &= expect(context_cpp.find("multi-GPU target detected") != std::string::npos, "multi-GPU target must fall back from graph-embedded DFlash GPU capture");
-    ok &= expect(context_cpp.find("const bool dflash_gpu_capture_ready = model.n_devices() <= 1") != std::string::npos, "DFlash graph capture must be gated to single-GPU target placement");
-    const size_t gpu_ring_policy = speculative.find("common_dflash_gpu_ring_allowed");
-    const size_t gpu_ring_init = speculative.find("llama_dflash_cross_ring_gpu_init");
+    ok &= expect(context_cpp.find("const bool dflash_gpu_capture_ready = model.n_devices() <= 1 && dflash_capture->gpu_capture_enabled") != std::string::npos, "DFlash graph capture must be gated to single-GPU target placement and explicit GPU capture policy");
+    ok &= expect(speculative.find("common_dflash_gpu_ring_allowed") != std::string::npos, "DFlash GPU cross ring must have an explicit multi-GPU policy");
+    ok &= expect(speculative.find("llama_model_n_devices(llama_get_model(ctx_tgt))") != std::string::npos, "DFlash GPU cross ring policy must check target placement");
+    ok &= expect(speculative.find("llama_model_n_devices(llama_get_model(ctx_dft))") != std::string::npos, "DFlash GPU cross ring policy must check drafter placement");
     ok &= expect(
-        gpu_ring_policy != std::string::npos &&
-        gpu_ring_init != std::string::npos &&
-        gpu_ring_policy < gpu_ring_init &&
-        speculative.find("llama_model_n_devices(model_tgt)", gpu_ring_policy) < gpu_ring_init &&
-        speculative.find("multi-GPU target detected", gpu_ring_policy) < gpu_ring_init,
-        "DFlash GPU cross ring must be disabled before allocation on multi-GPU target placement");
+        speculative.find("common_dflash_gpu_ring_allowed(ctx_tgt, ctx_dft)") != std::string::npos &&
+        speculative.find("common_dflash_gpu_ring_allowed(ctx_tgt, ctx_dft)") < speculative.find("llama_dflash_cross_ring_gpu_init(ctx_dft"),
+        "DFlash GPU cross ring must be disabled before allocation on multi-GPU target or drafter placement");
+    ok &= expect(speculative.find("llama_set_dflash_gpu_capture(ctx_tgt, gpu_ring_requested)") != std::string::npos,
+        "DFlash must force CPU hidden capture whenever the GPU cross ring is unavailable");
     ok &= expect(context_cpp.find("buf.n_tokens <= 0 || buf.data.empty()") != std::string::npos, "empty CPU hidden buffers must not mask GPU hidden buffers");
     ok &= expect(context_cpp.find("hidden->n_tokens = 0") != std::string::npos, "GPU hidden token counts must reset between decodes");
     ok &= expect(context_cpp.find("ggml_backend_tensor_get(tensor, staging.data()") != std::string::npos, "GPU hidden D2D fallback must preserve correctness via readback");
@@ -215,6 +217,13 @@ int main(int argc, char ** argv) {
     ok &= expect(memory_recurrent.find("seq_cp_recurrent_no_sync") != std::string::npos, "recurrent memory must expose DFlash no-sync restore");
     ok &= expect(context_cpp.find("seq_cp_recurrent_no_sync(seq_backup, seq_id") != std::string::npos, "DFlash rollback must avoid synchronous recurrent restore before replay");
     ok &= expect(context_cpp.find("recurrent_restore=%.3f ms") != std::string::npos, "DFlash rollback profiling must expose recurrent restore cost");
+    ok &= expect(cuda_cpp.find("ggml_cuda_buffer_visible_to_backend(ggml_backend_cuda_context * cuda_ctx") != std::string::npos, "CUDA backend must centralize backend buffer visibility checks");
+    ok &= expect(cuda_cpp.find("ggml_cuda_graph_check_compability(ggml_backend_cuda_context * cuda_ctx") != std::string::npos, "CUDA graph compatibility must know the active CUDA backend");
+    ok &= expect(cuda_cpp.find("for (int j = 0; j < GGML_MAX_SRC; ++j)") != std::string::npos, "CUDA graph compatibility must inspect every source buffer");
+    ok &= expect(cuda_cpp.find("ggml_cuda_log_nonlocal_src_buffer") != std::string::npos, "CUDA backend must log non-local source tensor details");
+    ok &= expect(cuda_cpp.find("source buffer is not visible to CUDA backend device") != std::string::npos, "CUDA backend diagnostics must report non-local source tensors");
+    ok &= expect(cuda_cpp.find("assert(src_visible)") == std::string::npos, "CUDA backend must fail closed instead of asserting on non-local source buffers");
+    ok &= expect(cuda_cpp.find("return GGML_STATUS_FAILED;") != std::string::npos, "CUDA backend must propagate non-local source buffer failures");
     ok &= expect(cparams_h.find("dflash_verify_logits") != std::string::npos, "target verifier reduction must be explicitly gated in cparams");
     ok &= expect(cparams_h.find("dflash_reduced_consumer_active") != std::string::npos, "reduced verifier raw-logit skip must be controlled separately from graph topology");
     ok &= expect(llama_h.find("llama_set_dflash_verify_logits") != std::string::npos, "public API must gate target verifier reduction");
