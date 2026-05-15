@@ -4773,7 +4773,39 @@ class DFlashDraftModel(TextModel):
         try:
             self._set_vocab_sentencepiece()
         except FileNotFoundError:
-            self._set_vocab_gpt2()
+            # Gemma 4 target models use a byte-fallback BPE tokenizer that
+            # LlamaHfVocab handles correctly.  Fall back to GPT-2 BPE only
+            # when the tokenizer is not compatible with LlamaHfVocab.
+            try:
+                vocab = gguf.LlamaHfVocab(self.dir_model)
+                tokens = []
+                scores = []
+                toktypes = []
+                visible_tokens = {"<|channel>", "<channel|>", "<|tool_call>", "<tool_call|>", "<|tool_response>", "<tool_response|>", "<|\"|>"}
+
+                for text, score, toktype in vocab.all_tokens():
+                    tokens.append(text)
+                    scores.append(score)
+                    text_str = text.decode()
+                    if text_str in visible_tokens:
+                        toktypes.append(gguf.TokenType.USER_DEFINED)
+                        logger.info(f"Token '{text_str}' is set to USER_DEFINED")
+                    else:
+                        toktypes.append(toktype)
+
+                assert len(tokens) == vocab.vocab_size
+
+                self.gguf_writer.add_tokenizer_model("gemma4")
+                self.gguf_writer.add_token_list(tokens)
+                self.gguf_writer.add_token_scores(scores)
+                self.gguf_writer.add_token_types(toktypes)
+
+                special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
+                special_vocab.add_to_gguf(self.gguf_writer)
+                self.gguf_writer.add_add_space_prefix(False)
+                self.gguf_writer.add_add_bos_token(True)
+            except (FileNotFoundError, TypeError):
+                self._set_vocab_gpt2()
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
