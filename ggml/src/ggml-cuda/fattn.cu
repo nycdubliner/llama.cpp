@@ -8,6 +8,7 @@
 #include "fattn.cuh"
 
 #include <atomic>
+#include <cstring>
 
 // InnerQ: update the fattn-side inverse scale array from host (all devices)
 void turbo_innerq_update_fattn_scales(const float * scale_inv) {
@@ -1274,6 +1275,69 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_F16  = 400,
 };
 
+// Diagnostic env vars (issue #14: HIP + turbo3_tcq crash):
+//   GGML_FATTN_DEBUG=1           — print kernel selection and tensor strides
+//   GGML_FATTN_DEBUG_SYNC=1      — also cudaStreamSynchronize after each launch
+//                                  (slow, pinpoints failure)
+//                                  NOTE: may conflict with CUDA/HIP graph capture;
+//                                  if so, rebuild with -DGGML_HIP_GRAPHS=OFF or the
+//                                  repo's runtime graph-disable option if available.
+//   GGML_FATTN_FORCE_KERNEL=vec  — force VEC kernel (bypass selector)
+//   GGML_FATTN_FORCE_KERNEL=tile — force TILE kernel (reproduce suspected crash path)
+//   GGML_TURBO_DECODE_NATIVE=1   — skip dequant, keep raw turbo types (native VEC path)
+
+static bool fattn_debug_checks_enabled() {
+    static const bool enabled =
+        getenv("GGML_FATTN_DEBUG") != nullptr ||
+        getenv("GGML_FATTN_DEBUG_SYNC") != nullptr;
+    return enabled;
+}
+
+static bool fattn_debug_sync_enabled() {
+    static const bool enabled = getenv("GGML_FATTN_DEBUG_SYNC") != nullptr;
+    return enabled;
+}
+
+static const char * fattn_kernel_name(best_fattn_kernel k) {
+    switch (k) {
+        case BEST_FATTN_KERNEL_NONE:     return "NONE";
+        case BEST_FATTN_KERNEL_TILE:     return "TILE";
+        case BEST_FATTN_KERNEL_VEC:      return "VEC";
+        case BEST_FATTN_KERNEL_WMMA_F16: return "WMMA_F16";
+        case BEST_FATTN_KERNEL_MMA_F16:  return "MMA_F16";
+    }
+    return "UNKNOWN";
+}
+
+static best_fattn_kernel fattn_force_kernel(best_fattn_kernel selected) {
+    const char * e = getenv("GGML_FATTN_FORCE_KERNEL");
+    if (!e || !e[0]) return selected;
+    if (!strcmp(e, "tile")) return BEST_FATTN_KERNEL_TILE;
+    if (!strcmp(e, "vec"))  return BEST_FATTN_KERNEL_VEC;
+    fprintf(stderr, "GGML_FATTN_FORCE_KERNEL=%s is not supported for this configuration; ignoring\n", e);
+    return selected;
+}
+
+#define FATTN_CHECK_LAUNCH(name, stream_)                                       \
+    do {                                                                         \
+        if (fattn_debug_checks_enabled()) {                                      \
+            cudaError_t err__ = cudaGetLastError();                               \
+            if (err__ != cudaSuccess) {                                          \
+                fprintf(stderr, "FATTN launch error after %s: %s\n",             \
+                        name, cudaGetErrorString(err__));                         \
+                GGML_ABORT("FATTN launch error");                                \
+            }                                                                    \
+            if (fattn_debug_sync_enabled()) {                                    \
+                err__ = cudaStreamSynchronize(stream_);                           \
+                if (err__ != cudaSuccess) {                                      \
+                    fprintf(stderr, "FATTN sync error after %s: %s\n",            \
+                            name, cudaGetErrorString(err__));                     \
+                    GGML_ABORT("FATTN sync error");                              \
+                }                                                                \
+            }                                                                    \
+        }                                                                        \
+    } while (0)
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -1694,31 +1758,39 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                     // Rotated-domain dequant: K stays in WHT-rotated space; Q is pre-rotated below.
                     k_turbo2_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                    FATTN_CHECK_LAUNCH("K turbo2 dequant (rotated)", stream);
                 } else if (K->type == GGML_TYPE_TURBO2_0) {
                     k_turbo2_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                    FATTN_CHECK_LAUNCH("K turbo2 dequant (inv-fwht)", stream);
                 } else if (K->type == GGML_TYPE_TURBO3_0 && k_t3_use_rotated) {
                     // Rotated-domain dequant for K=t3 + V=t2 (same Bug #31 pattern, V side).
                     k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                    FATTN_CHECK_LAUNCH("K turbo3 dequant (rotated)", stream);
                 } else if (K->type == GGML_TYPE_TURBO3_0) {
                     k_turbo3_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                    FATTN_CHECK_LAUNCH("K turbo3 dequant (inv-fwht)", stream);
                 } else if (K->type == GGML_TYPE_TURBO4_0) {
                     k_turbo4_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                    FATTN_CHECK_LAUNCH("K turbo4 dequant (inv-fwht)", stream);
                 } else if (K->type == GGML_TYPE_TURBO3_TCQ) {
                     k_turbo3_tcq_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
+                    FATTN_CHECK_LAUNCH("K turbo3_tcq dequant (inv-fwht)", stream);
                 } else if (K->type == GGML_TYPE_TURBO2_TCQ) {
                     k_turbo2_tcq_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
+                    FATTN_CHECK_LAUNCH("K turbo2_tcq dequant (inv-fwht)", stream);
                 } else if (K->type == GGML_TYPE_Q8_0) {
                     // Q8_0 K dequant: only fires at D=512 when V is turbo (no F16/Q8_0 D=512
                     // template, and (Q8_0, TURBO4_0) D=512 has buggy SASS on sm_120 PTX-JIT).
                     // Output goes into TKHE layout matching V_f16_dec → dispatches as F16/F16 D=512.
                     k_q8_0_dequant_f16_tkhe<<<grid_k, K->ne[0], 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                    FATTN_CHECK_LAUNCH("K q8_0 dequant (tkhe)", stream);
                 }
                 K_f16_dec = *K;
                 K_f16_dec.type = GGML_TYPE_F16;
@@ -1747,22 +1819,28 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 if (V->type == GGML_TYPE_TURBO2_0) {
                     k_turbo2_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                    FATTN_CHECK_LAUNCH("V turbo2 dequant", stream);
                 } else if (V->type == GGML_TYPE_TURBO3_TCQ) {
                     k_turbo3_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]));
+                    FATTN_CHECK_LAUNCH("V turbo3_tcq dequant", stream);
                 } else if (V->type == GGML_TYPE_TURBO2_TCQ) {
                     k_turbo2_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]));
+                    FATTN_CHECK_LAUNCH("V turbo2_tcq dequant", stream);
                 } else if (V->type == GGML_TYPE_TURBO4_0) {
                     k_turbo4_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                    FATTN_CHECK_LAUNCH("V turbo4 dequant", stream);
                 } else if (V->type == GGML_TYPE_TURBO3_0) {
                     k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                    FATTN_CHECK_LAUNCH("V turbo3 dequant", stream);
                 } else if (V->type == GGML_TYPE_Q8_0) {
                     // Q8_0 V dequant: only fires at D=512 when K is turbo (mirror of K=Q8_0 path).
                     k_q8_0_dequant_f16_tkhe<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                    FATTN_CHECK_LAUNCH("V q8_0 dequant (tkhe)", stream);
                 }
                 V_f16_dec = *V;
                 V_f16_dec.type = GGML_TYPE_F16;
@@ -1806,13 +1884,36 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             const int64_t n_q_groups = ggml_nelements(Q) / 128;
             k_turbo_fwht_forward<<<(int)n_q_groups, 128, 0, stream>>>(
                 (const float *)Q->data, q_rot_buf[device_dec], ggml_nelements(Q));
+            FATTN_CHECK_LAUNCH("Q turbo FWHT forward (decode dequant)", stream);
             Q_rot_decode = *Q;
             Q_rot_decode.data = q_rot_buf[device_dec];
             orig_q_decode = dst->src[0];
             dst->src[0] = &Q_rot_decode;
         }
 
-        switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+        best_fattn_kernel selected_kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+        best_fattn_kernel best_kernel = fattn_force_kernel(selected_kernel);
+        {
+            static const bool fattn_debug = getenv("GGML_FATTN_DEBUG") != nullptr;
+            if (fattn_debug) {
+                fprintf(stderr,
+                    "FATTN select: dev=%d D=%lld nq=%lld nkv=%lld "
+                    "K=%s V=%s selected=%s effective=%s do_dequant=%d "
+                    "K_nb1=%zu K_nb2=%zu K_nb3=%zu "
+                    "V_nb1=%zu V_nb2=%zu V_nb3=%zu\n",
+                    ggml_cuda_get_device(),
+                    (long long)Q->ne[0], (long long)Q->ne[1],
+                    (long long)dst->src[1]->ne[1],
+                    ggml_type_name(dst->src[1]->type),
+                    ggml_type_name(dst->src[2]->type),
+                    fattn_kernel_name(selected_kernel),
+                    fattn_kernel_name(best_kernel),
+                    (int)do_decode_dequant,
+                    dst->src[1]->nb[1], dst->src[1]->nb[2], dst->src[1]->nb[3],
+                    dst->src[2]->nb[1], dst->src[2]->nb[2], dst->src[2]->nb[3]);
+            }
+        }
+        switch (best_kernel) {
             case BEST_FATTN_KERNEL_NONE:
                 GGML_ABORT("fatal error");
             case BEST_FATTN_KERNEL_TILE:
@@ -1828,6 +1929,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
                 break;
         }
+        FATTN_CHECK_LAUNCH("selected FA dispatch", stream);
 
         if (orig_q_decode) dst->src[0] = orig_q_decode;
         if (orig_k_decode) dst->src[1] = orig_k_decode;
