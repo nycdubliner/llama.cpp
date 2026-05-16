@@ -1555,6 +1555,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
     int ring_write_pos = 0;    // next write slot (0..RING_SIZE-1)
     int ring_filled = 0;       // how many valid slots (0..RING_SIZE)
     int committed_len = 0;     // total tokens committed (unbounded counter)
+    bool cpu_ring_valid = true; // false when CPU ring is stale after GPU-only prefill writes
     bool prefill_flushed = false; // true if flush_prefill() produced tokens during this request
     bool prefill_flush_called = false; // true if flush_prefill() was called at all
     int  prefill_flush_requested = 0; // total tokens requested across all flush_prefill() calls
@@ -1727,6 +1728,16 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
         if (mask_token_id < 0) {
             fail_contract("mask_token_id must be non-negative");
+        }
+        {
+            const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
+            const llama_token target_mask = vocab_tgt ? llama_vocab_mask(vocab_tgt) : LLAMA_TOKEN_NULL;
+            if (target_mask != LLAMA_TOKEN_NULL && mask_token_id != target_mask) {
+                fail_contract(string_format(
+                    "mask_token_id must match target vocab mask token: drafter=%d target=%d",
+                    (int) mask_token_id,
+                    (int) target_mask));
+            }
         }
         if (n_target_layers <= 0) {
             fail_contract("n_target_layers must be positive");
@@ -1928,18 +1939,22 @@ struct common_speculative_state_dflash : public common_speculative_state {
         prefill_flush_called = true;
         prefill_flush_requested += n_tokens;
 
-        if (!validate_target_hiddens("flush_prefill")) {
+        // Determine capture source before validating CPU hidden buffers.
+        // In GPU prefill-staging mode the eval callback is intentionally not
+        // installed, so layer_hiddens / verify hidden_gpu may be empty even
+        // though prefill_gpu contains the correct captured suffix.
+        const bool use_prefill_gpu = llama_dflash_prefill_gpu_active(ctx_tgt);
+
+        if (!use_prefill_gpu && !validate_target_hiddens("flush_prefill")) {
             return 0;
         }
 
-        int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
-        if (n_slots == 0) return 0;
-
-        // Determine capture source: GPU prefill staging or CPU callback.
-        // Source-first: check prefill GPU before CPU hidden, because in
-        // GPU-staging mode the CPU callback was not installed and
-        // llama_get_n_layer_hiddens() returns 0.
-        const bool use_prefill_gpu = llama_dflash_prefill_gpu_active(ctx_tgt);
+        const int32_t n_slots = use_prefill_gpu
+            ? n_target_layers
+            : llama_get_n_layer_hiddens(ctx_tgt);
+        if (n_slots == 0) {
+            return 0;
+        }
 
         dflash_capture_source source;
         int64_t captured = 0;
@@ -1965,8 +1980,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
             offset = 0;
 
             if (n_tokens > 0 && captured < n_tokens) {
-                LOG_WRN("dflash prefill flush incomplete GPU capture: captured=%lld requested=%d seq=%d\n",
+                LOG_ERR("dflash prefill flush incomplete GPU capture: captured=%lld requested=%d seq=%d; refusing partial ring write\n",
                     (long long) captured, n_tokens, seq_id);
+                return 0;
             }
         } else {
             source = dflash_capture_source::cpu_hidden;
@@ -2012,10 +2028,28 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
 
         if (profile) {
-            LOG_INF("dflash prefill flush: source=%s captured=%lld offset=%d n_tokens=%d to_write=%d n_src_layers=%d prefill_flushed=%d ring_write_pos=%d ring_filled=%d committed_len=%d gpu=%d\n",
-                source == dflash_capture_source::prefill_gpu_hidden ? "prefill_gpu" : "cpu",
-                (long long)captured, offset, n_tokens, to_write, n_src_layers, (int)prefill_flushed, ring_write_pos, ring_filled, committed_len,
-                gpu_ring_handle ? 1 : 0);
+            const char * capture_source =
+                source == dflash_capture_source::prefill_gpu_hidden ? "prefill_gpu" :
+                source == dflash_capture_source::verify_gpu_hidden  ? "verify_gpu"  :
+                                                                       "callback_cpu";
+
+            const bool writes_cpu_ring = source != dflash_capture_source::prefill_gpu_hidden;
+            const char * ring_dst =
+                gpu_ring_handle ? (writes_cpu_ring ? "cpu_ring+gpu_ring" : "gpu_ring")
+                                : "cpu_ring";
+
+            LOG_INF("dflash prefill flush: capture_source=%s ring_dst=%s captured=%lld offset=%d n_tokens=%d to_write=%d n_src_layers=%d prefill_flushed=%d ring_write_pos=%d ring_filled=%d committed_len=%d\n",
+                capture_source,
+                ring_dst,
+                (long long) captured,
+                offset,
+                n_tokens,
+                to_write,
+                n_src_layers,
+                (int) prefill_flushed,
+                ring_write_pos,
+                ring_filled,
+                committed_len);
         }
 
         if (!prefill_flushed) {
@@ -2040,6 +2074,10 @@ struct common_speculative_state_dflash : public common_speculative_state {
     //         [layer_0 data: n_entries * n_embd * f32] ...
 
     size_t ring_state_size() const override {
+        if (!cpu_ring_valid) {
+            return 0;
+        }
+
         int n_entries = std::min(ring_filled, RING_SIZE);
         return 6 * sizeof(int32_t) +
                (size_t)n_entries * n_embd * sizeof(float) * n_target_layers;
@@ -2135,6 +2173,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         // mark as flushed so subsequent flush_prefill() calls from suffix
         // decoding APPEND to the restored ring instead of resetting it
         prefill_flushed = true;
+        cpu_ring_valid = true;
 
         return true;
     }
@@ -2508,6 +2547,9 @@ private:
         if (n_tokens <= 0) return 0;
 
         const bool use_prefill_gpu = (source == dflash_capture_source::prefill_gpu_hidden);
+        if (use_prefill_gpu) {
+            cpu_ring_valid = false;
+        }
         // For prefill GPU staging, the CPU callback was not installed so
         // llama_get_n_layer_hiddens() returns 0. Use n_target_layers instead
         // so the D2D loop iterates over all target layers.
@@ -2551,6 +2593,7 @@ private:
         bool gpu_d2d_failed = false;
         int64_t cpu_copy_us = 0;
         int64_t gpu_enqueue_us = 0;
+        bool cpu_ring_written_all = true;
         for (int layer = 0; layer < n_target_layers && layer < n_src_layers; ++layer) {
             float * data = llama_get_layer_hidden(ctx_tgt, layer);
             int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, layer);
@@ -2578,6 +2621,8 @@ private:
                 if (profile) {
                     cpu_copy_us += ggml_time_us() - t_start;
                 }
+            } else if (!use_prefill_gpu && (force_cpu_ring || !gpu_ring_handle)) {
+                cpu_ring_written_all = false;
             }
 
             // GPU ring upload
@@ -2634,6 +2679,9 @@ private:
             }
         }
         log_ring_profile("ring_write", n_tokens, actual_written, cpu_copy_us, gpu_enqueue_us, gpu_sync_us);
+        if (!use_prefill_gpu && cpu_ring_written_all && (force_cpu_ring || !gpu_ring_handle)) {
+            cpu_ring_valid = true;
+        }
         ring_write_pos = (ring_write_pos + actual_written) % RING_SIZE;
         ring_filled = std::min(ring_filled + actual_written, RING_SIZE);
         return actual_written;
@@ -3548,4 +3596,8 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 str_perf.c_str(),
                 str_ext.c_str());
     }
+}
+
+bool common_dflash_prefill_capture_complete_for_test(int captured, int requested) {
+    return requested <= 0 || captured >= requested;
 }
