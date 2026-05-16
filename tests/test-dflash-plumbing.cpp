@@ -153,7 +153,7 @@ int main(int argc, char ** argv) {
     ok &= expect(context_h.find("multi_gpu_replay_fallback_logged") != std::string::npos, "DFlash capture must log multi-GPU recurrent replay fallback once");
     ok &= expect(llama_h.find("llama_set_dflash_gpu_capture") != std::string::npos, "public DFlash API must expose GPU capture gating");
     ok &= expect(context_cpp.find("allocate_hidden_gpu(n_slots, max_tokens)") != std::string::npos, "GPU tape allocation must allocate hidden capture buffers too");
-    ok &= expect(context_cpp.find("dflash_graph_hidden_ready ? nullptr : dflash_eval_callback") != std::string::npos, "eligible DFlash verifier graph must disable eval callback");
+    ok &= expect(context_cpp.find("dflash_skip_eval_callback ? nullptr : dflash_eval_callback") != std::string::npos, "eligible DFlash verifier graph must disable eval callback, including suppressed no-intersection ubatches");
     ok &= expect(context_cpp.find("const bool dflash_graph_tape_ready") != std::string::npos, "DFlash decode must gate GPU tape copies separately from hidden capture");
     ok &= expect(context_cpp.find("dflash_graph_hidden_ready =\n                            !dflash_capture->hidden_gpu.empty()") != std::string::npos, "GPU hidden graph capture must not depend on active tape recording");
     ok &= expect(context_cpp.find("dflash_tape_gpu * graph_tp = dflash_graph_tape_ready ? tp : nullptr") != std::string::npos, "GPU tape graph pointers must be disabled when tape recording is inactive");
@@ -767,6 +767,24 @@ int main(int argc, char ** argv) {
     ok &= expect(context_cpp.find("dflash_capture_n_seqs") != std::string::npos,
         "decode must compute dflash_capture_n_seqs for capture routing");
 
+    // Source-aware ring_write must gate CPU ring tracking on source_has_cpu_hidden
+    ok &= expect(speculative.find("source_has_cpu_hidden") != std::string::npos,
+        "ring_write must check source_has_cpu_hidden for CPU ring tracking");
+    ok &= expect(speculative.find("force_cpu_ring_for_flush") != std::string::npos,
+        "flush_prefill must pass force_cpu_ring_for_flush, not literal true");
+
+    // verify_gpu_hidden must appear in flush_prefill source detection
+    ok &= expect(speculative.find("verify_gpu_hidden") != std::string::npos,
+        "flush_prefill must detect verify_gpu_hidden source when CPU data is absent");
+
+    // Non-overlapping prefill ubatches must suppress eval callback
+    ok &= expect(context_cpp.find("dflash_suppress_callback_for_view") != std::string::npos,
+        "decode must suppress eval callback for no-intersection prefill ubatches");
+
+    // dflash_diagnostic_debug_enabled must gate per-ubatch route logs
+    ok &= expect(context_cpp.find("dflash_diagnostic_debug_enabled") != std::string::npos,
+        "per-ubatch route logs must be gated by GGML_DFLASH_DEBUG, not GGML_DFLASH_PROFILE");
+
     // Graph builders must use dflash_capture_n_tokens/n_seqs
     ok &= expect(gemma4_iswa.find("dflash_capture_n_tokens") != std::string::npos,
         "Gemma4 graph builder must use dflash_capture_n_tokens");
@@ -795,6 +813,38 @@ int main(int argc, char ** argv) {
     // Debug-gated ring mismatch logs
     ok &= expect(speculative.find("common_dflash_debug_logs_enabled") != std::string::npos,
         "ring_write MISMATCH log must be gated by GGML_DFLASH_DEBUG env var");
+
+    // GPU-only writes must invalidate CPU ring even when caller mistakenly asks for CPU tracking
+    // source: 0 = cpu_hidden, 1 = verify_gpu_hidden, 2 = prefill_gpu_hidden
+    ok &= expect(common_dflash_cpu_ring_valid_after_source_write_for_test(
+        false, 0, true, true, true),
+        "CPU callback with all layers copied can validate CPU ring");
+    ok &= expect(!common_dflash_cpu_ring_valid_after_source_write_for_test(
+        true, 0, true, true, false),
+        "CPU callback with missing layer data must not validate CPU ring");
+    ok &= expect(!common_dflash_cpu_ring_valid_after_source_write_for_test(
+        true, 1, true, true, false),
+        "Verify GPU is GPU-only even if force_cpu_ring was accidentally true");
+    ok &= expect(!common_dflash_cpu_ring_valid_after_source_write_for_test(
+        true, 2, true, true, false),
+        "Prefill GPU is GPU-only even if force_cpu_ring was accidentally true");
+    ok &= expect(common_dflash_cpu_ring_valid_after_source_write_for_test(
+        false, 0, false, false, true),
+        "CPU fallback without GPU ring validates only when CPU data exists");
+
+    // Non-overlapping prefill ubatches suppress callback
+    ok &= expect(llama_dflash_suppress_callback_for_prefill_ubatch_for_test(
+        true, true, false),
+        "no-intersection prefill ubatch must suppress callback");
+    ok &= expect(!llama_dflash_suppress_callback_for_prefill_ubatch_for_test(
+        true, true, true),
+        "intersecting prefill ubatch must not suppress callback");
+    ok &= expect(!llama_dflash_suppress_callback_for_prefill_ubatch_for_test(
+        true, false, false),
+        "non-staging ubatch must not suppress callback");
+    ok &= expect(!llama_dflash_suppress_callback_for_prefill_ubatch_for_test(
+        false, true, false),
+        "inactive plan must not suppress callback");
 
     return ok ? 0 : 1;
 }
