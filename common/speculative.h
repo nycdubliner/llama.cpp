@@ -14,6 +14,16 @@ struct common_dflash_ring_write {
     int src_token_offset;
 };
 
+// Describes which portion of a prefill sub-batch should be captured into
+// the DFlash cross ring.  When should_flush is true, src_offset and n_tokens
+// specify the contiguous span within the capture buffer to write.
+// When should_flush is false, no capture is needed for this sub-batch.
+struct common_dflash_prefill_span {
+    bool should_flush = false;
+    int  src_offset   = 0;   // first token offset in the capture buffer
+    int  n_tokens     = 0;   // number of tokens to flush from that offset
+};
+
 common_dflash_ring_write common_dflash_ring_write_plan(int ring_size, int ring_pos, int n_tokens);
 
 // DDTree: tree of likely continuations built from draft logits
@@ -100,8 +110,11 @@ void common_speculative_update_logits_by_indices(common_speculative * spec, llam
 
 // flush hidden states captured during the current prefill sub-batch into
 // the DFlash ring buffer. Call after each llama_decode during split prefill
-// so checkpoint placement doesn't lose hidden state context.
-void common_speculative_flush_prefill(common_speculative * spec);
+// so checkpoint splits don't lose hidden state context between sub-batches.
+// src_offset and n_tokens specify which contiguous span of the captured
+// hidden buffer to write into the ring (from the prefill span calculation).
+// Pass src_offset=0, n_tokens=0 for the default (write entire buffer).
+void common_speculative_flush_prefill(common_speculative * spec, int src_offset = 0, int n_tokens = 0);
 
 // Enable/disable target hidden capture for DFlash prefill.
 // No-op for non-DFlash speculative implementations.

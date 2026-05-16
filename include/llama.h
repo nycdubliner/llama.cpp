@@ -1198,6 +1198,16 @@ extern "C" {
     LLAMA_API void   llama_dflash_cross_ring_gpu_free(void * handle);
     LLAMA_API void   llama_dflash_cross_ring_gpu_write(void * handle, int layer, int ring_pos, const float * data, int n_tokens, int n_embd);
     LLAMA_API bool   llama_dflash_cross_ring_gpu_write_hidden(void * handle, struct llama_context * ctx, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd);
+    // DFlash: copy from prefill GPU staging buffer into the cross ring (D2D).
+    // slot: which DFlash slot's prefill buffer to read from.
+    // src_offset: first token offset within the prefill staging buffer.
+    // Other args identical to llama_dflash_cross_ring_gpu_write_hidden.
+    LLAMA_API bool   llama_dflash_prefill_gpu_write_hidden(void * handle, struct llama_context * ctx, int slot, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd);
+
+    // DFlash: check whether the last decode used GPU-embedded prefill staging
+    // buffers for hidden capture (as opposed to eval callback or verify hidden_gpu).
+    // Returns true when prefill_gpu was populated during the last decode().
+    LLAMA_API bool   llama_dflash_prefill_gpu_active(struct llama_context * ctx);
     LLAMA_API void   llama_dflash_cross_ring_gpu_synchronize(void * handle);
     LLAMA_API void   llama_dflash_cross_ring_gpu_set_cross(struct llama_context * ctx, void * handle, llama_seq_id seq_id, int ring_write_pos, int ring_filled, int n_layers, int n_embd, int ctx_window);
     LLAMA_API bool   llama_dflash_kv_cache_init(struct llama_context * ctx, int ctx_size);

@@ -92,6 +92,30 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
             }
         }
 
+        // DFlash prefill staging: graph-copy l_out into larger prefill GPU buffers
+        // during suffix prefill when the ubatch exceeds verifier hidden capacity.
+        if (cparams.prefill_gpu_n_seqs > 0) {
+            for (int s = 0; s < (int)n_seqs && s < cparams.prefill_gpu_n_seqs; ++s) {
+                auto * pgpu = cparams.prefill_gpu_seqs[s];
+                if (!pgpu) continue;
+
+                int hi = -1;
+                for (int i = 0; i < (int)pgpu->layer_ids.size(); ++i) {
+                    if (pgpu->layer_ids[i] == il) { hi = i; break; }
+                }
+                if (hi < 0 || n_seq_tokens > pgpu->max_tokens) continue;
+
+                ggml_tensor * h_slice = ggml_view_2d(ctx0, cur,
+                    cur->ne[0], n_seq_tokens,
+                    cur->nb[1], (size_t)s * (size_t)n_seq_tokens * cur->nb[1]);
+                ggml_tensor * h_cont = ggml_cont(ctx0, h_slice);
+                ggml_tensor * h_dst = ggml_view_2d(ctx0, pgpu->layers[hi],
+                    pgpu->layers[hi]->ne[0], (int64_t)n_seq_tokens,
+                    pgpu->layers[hi]->nb[1], 0);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_cont, h_dst));
+            }
+        }
+
         // Input for next layer
         inpL = cur;
     }
