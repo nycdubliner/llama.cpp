@@ -1620,6 +1620,10 @@ struct common_speculative_state_dflash : public common_speculative_state {
                 gpu_write_pos, gpu_filled, n_target_layers, n_embd, cross_ctx);
             return gpu_filled;
         }
+        if (!cpu_ring_valid) {
+            LOG_WRN("dflash: CPU cross ring is stale and GPU ring is unavailable; refusing to build DFlash cross data\n");
+            return -1;
+        }
         int cross_len = std::min(ring_filled, cross_ctx > 0 ? cross_ctx : ring_filled);
         cross_buf.resize((size_t)n_target_features * cross_len);
         int read_start = (ring_write_pos - cross_len + RING_SIZE) % RING_SIZE;
@@ -2084,6 +2088,10 @@ struct common_speculative_state_dflash : public common_speculative_state {
     }
 
     void ring_state_save(uint8_t * buf, size_t size) const override {
+        if (!cpu_ring_valid) {
+            return;
+        }
+
         int n_entries = std::min(ring_filled, RING_SIZE);
         size_t expected = 6 * sizeof(int32_t) +
                           (size_t)n_entries * n_embd * sizeof(float) * n_target_layers;
@@ -2195,6 +2203,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
         const int64_t t0 = ggml_time_us();
 
         int cross_len = build_cross_data(ctx_dft);
+        if (cross_len <= 0) {
+            return;
+        }
 
         const int64_t t1 = ggml_time_us();
 
@@ -2313,6 +2324,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
         const int64_t t0 = ggml_time_us();
 
         int cross_len = build_cross_data(ctx_dft);
+        if (cross_len <= 0) {
+            return;
+        }
 
         common_batch_clear(batch_dft);
         common_batch_add(batch_dft, id_last, cross_len, { seq_id }, true);
@@ -2547,7 +2561,12 @@ private:
         if (n_tokens <= 0) return 0;
 
         const bool use_prefill_gpu = (source == dflash_capture_source::prefill_gpu_hidden);
-        if (use_prefill_gpu) {
+
+        // The CPU mirror is valid only when this write updates ring_buf for all
+        // written layers. GPU-only prefill/verify writes update gpu_ring_handle
+        // but leave ring_buf stale, so checkpoint serialization must be disabled.
+        const bool cpu_ring_should_track = force_cpu_ring || !gpu_ring_handle;
+        if (!cpu_ring_should_track) {
             cpu_ring_valid = false;
         }
         // For prefill GPU staging, the CPU callback was not installed so
@@ -2679,8 +2698,8 @@ private:
             }
         }
         log_ring_profile("ring_write", n_tokens, actual_written, cpu_copy_us, gpu_enqueue_us, gpu_sync_us);
-        if (!use_prefill_gpu && cpu_ring_written_all && (force_cpu_ring || !gpu_ring_handle)) {
-            cpu_ring_valid = true;
+        if (cpu_ring_should_track) {
+            cpu_ring_valid = cpu_ring_written_all;
         }
         ring_write_pos = (ring_write_pos + actual_written) % RING_SIZE;
         ring_filled = std::min(ring_filled + actual_written, RING_SIZE);
@@ -3600,4 +3619,23 @@ void common_speculative_print_stats(const common_speculative * spec) {
 
 bool common_dflash_prefill_capture_complete_for_test(int captured, int requested) {
     return requested <= 0 || captured >= requested;
+}
+
+bool common_dflash_cpu_ring_valid_after_write_for_test(
+        bool was_valid,
+        bool force_cpu_ring,
+        bool has_gpu_ring,
+        bool cpu_ring_written_all) {
+    bool cpu_ring_valid = was_valid;
+    const bool cpu_ring_should_track = force_cpu_ring || !has_gpu_ring;
+
+    if (!cpu_ring_should_track) {
+        cpu_ring_valid = false;
+    }
+
+    if (cpu_ring_should_track) {
+        cpu_ring_valid = cpu_ring_written_all;
+    }
+
+    return cpu_ring_valid;
 }

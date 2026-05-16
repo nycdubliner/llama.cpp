@@ -137,6 +137,13 @@ bool   common_speculative_ring_state_load(common_speculative * spec, const uint8
 // test helper: returns true when prefill capture is complete (captured >= requested)
 bool common_dflash_prefill_capture_complete_for_test(int captured, int requested);
 
+// test helper: models cpu_ring_valid state after a ring_write call
+bool common_dflash_cpu_ring_valid_after_write_for_test(
+        bool was_valid,
+        bool force_cpu_ring,
+        bool has_gpu_ring,
+        bool cpu_ring_written_all);
+
 // DDTree: build a tree of likely continuations from draft logits
 // tree_budget: internal total tree nodes for one draft call.
 // Public configuration uses branch_budget, then runtime adds the main draft path.
