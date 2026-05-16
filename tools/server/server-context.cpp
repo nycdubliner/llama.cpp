@@ -4189,18 +4189,21 @@ private:
         }
         llama_set_dflash_verify_logits(ctx, dflash_verify_graph_enabled, dflash_verify_plan.top_k);
 
-        auto should_flush_dflash_prefill = [&](const server_slot & slot, const llama_batch & view, bool log_decision) -> bool {
+        auto should_flush_dflash_prefill = [&](const server_slot & slot, const llama_batch & view, bool log_decision) -> common_dflash_prefill_span {
+            common_dflash_prefill_span no_flush;
+
             if (!slot.can_speculate()) {
-                return false;
+                return no_flush;
             }
 
             // Non-DFlash specs do not maintain a DFlash hidden ring. Keep their existing behavior.
             if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH) {
-                return true;
+                no_flush.should_flush = true;
+                return no_flush;
             }
 
             if (!slot.task) {
-                return false;
+                return no_flush;
             }
 
             bool found_slot_token = false;
@@ -4232,34 +4235,51 @@ private:
             }
 
             if (!found_slot_token) {
-                return false;
+                return no_flush;
             }
 
             const int32_t prompt_total = slot.task->n_tokens();
             const int32_t cross_ctx = std::max<int32_t>(1, params_base.speculative.dflash_cross_ctx);
 
-            // Positions are zero-based; end is exclusive.
-            const int32_t batch_end = (int32_t) batch_pos_max + 1;
+            // Positions the drafter actually needs: [capture_from, prompt_total).
             const int32_t capture_from = std::max<int32_t>(0, prompt_total - cross_ctx);
+            const int32_t batch_end = (int32_t) batch_pos_max + 1;
 
-            // Capture the whole first batch that overlaps the useful suffix.
-            // This may over-capture up to one batch, but skips all earlier chunks
-            // that would be overwritten before generation.
-            const bool should_flush = batch_end > capture_from;
-
-            if (log_decision && dflash_server_profile_enabled()) {
-                if (should_flush) {
-                    SLT_INF(slot,
-                            "dflash prefill: suffix flush, batch_pos=[%d,%d], batch_end=%d, prompt_total=%d, cross_ctx=%d, capture_from=%d\n",
-                            (int) batch_pos_min, (int) batch_pos_max, batch_end, prompt_total, cross_ctx, capture_from);
-                } else {
+            if (batch_end <= capture_from) {
+                // This sub-batch is entirely before the useful suffix — skip it.
+                if (log_decision && dflash_server_profile_enabled()) {
                     SLT_INF(slot,
                             "dflash prefill: skip flush, batch_pos=[%d,%d], batch_end=%d, prompt_total=%d, cross_ctx=%d, capture_from=%d\n",
                             (int) batch_pos_min, (int) batch_pos_max, batch_end, prompt_total, cross_ctx, capture_from);
                 }
+                return no_flush;
             }
 
-            return should_flush;
+            // Compute the exact span within this sub-batch that overlaps the
+            // useful suffix [capture_from, prompt_total).  The capture buffer
+            // is indexed from 0 within the sub-batch, so src_offset is the
+            // distance from batch_pos_min to the start of the useful span.
+            const int32_t span_begin = std::max(batch_pos_min, capture_from);
+            const int32_t span_end   = std::min(batch_end, prompt_total);
+            const int     src_offset = span_begin - batch_pos_min;
+            const int     n_tokens   = span_end - span_begin;
+
+            if (n_tokens <= 0) {
+                return no_flush;
+            }
+
+            common_dflash_prefill_span span;
+            span.should_flush = true;
+            span.src_offset   = src_offset;
+            span.n_tokens     = n_tokens;
+
+            if (log_decision && dflash_server_profile_enabled()) {
+                SLT_INF(slot,
+                        "dflash prefill: suffix flush, batch_pos=[%d,%d], batch_end=%d, prompt_total=%d, cross_ctx=%d, capture_from=%d, src_offset=%d, n_tokens=%d\n",
+                        (int) batch_pos_min, (int) batch_pos_max, batch_end, prompt_total, cross_ctx, capture_from, span.src_offset, span.n_tokens);
+            }
+
+            return span;
         };
 
         // process the created batch of tokens
@@ -4323,7 +4343,7 @@ private:
                     }
 
                     if ((slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) &&
-                            should_flush_dflash_prefill(slot, batch_view, true)) {
+                            should_flush_dflash_prefill(slot, batch_view, true).should_flush) {
                         dflash_capture_needed_for_view = true;
                         break;
                     }
@@ -4420,13 +4440,16 @@ private:
             // hidden states before generation. Earlier prompt chunks are overwritten
             // before the first draft and only add PP overhead.
             //
-            // First safe implementation: flush only the full batch_view that overlaps
-            // the final useful suffix. Do not attempt partial-row capture here.
+            // Compute the exact suffix span [capture_from, prompt_total) and pass
+            // only the useful tokens to flush_prefill. This avoids overcapture:
+            // tokens before capture_from in the sub-batch are skipped via src_offset.
             for (auto & slot : slots) {
                 if ((slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) &&
-                        slot.can_speculate() &&
-                        should_flush_dflash_prefill(slot, batch_view, false)) {
-                    common_speculative_flush_prefill(slot.spec.get());
+                        slot.can_speculate()) {
+                    auto span = should_flush_dflash_prefill(slot, batch_view, false);
+                    if (span.should_flush) {
+                        common_speculative_flush_prefill(slot.spec.get(), span.src_offset, span.n_tokens);
+                    }
                 }
             }
 

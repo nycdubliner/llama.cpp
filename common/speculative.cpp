@@ -307,7 +307,9 @@ struct common_speculative_state {
     // flush captured hidden states into the ring buffer during prefill.
     // called after each llama_decode sub-batch so checkpoint splits don't
     // lose hidden state context between sub-batches.
-    virtual void flush_prefill() {}
+    // src_offset and n_tokens: which contiguous span of the capture buffer
+    // to write.  When n_tokens=0, write the entire capture buffer (legacy).
+    virtual void flush_prefill(int src_offset = 0, int n_tokens = 0) {}
 
     // Enable/disable target hidden capture during prefill.
     // No-op in base class. DFlash overrides to toggle llama_set_dflash_capture.
@@ -1884,7 +1886,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         capture_target_hiddens();
     }
 
-    void flush_prefill() override {
+    void flush_prefill(int src_offset = 0, int n_tokens = 0) override {
         llama_dflash_set_active_slot(ctx_tgt, seq_id);
 
         if (!validate_target_hiddens("flush_prefill")) {
@@ -1894,11 +1896,23 @@ struct common_speculative_state_dflash : public common_speculative_state {
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
         if (n_slots == 0) return;
 
-        int64_t n_tokens = llama_get_layer_hidden_n_tokens(ctx_tgt, 0);
-        if (n_tokens <= 0) return;
+        int64_t captured = llama_get_layer_hidden_n_tokens(ctx_tgt, 0);
+        if (captured <= 0) return;
 
-        LOG_DBG("DFLASH_DBG flush_prefill: n_tokens=%lld prefill_flushed=%d ring_write_pos=%d ring_filled=%d committed_len=%d\n",
-            (long long)n_tokens, (int)prefill_flushed, ring_write_pos, ring_filled, committed_len);
+        // When n_tokens=0, flush the entire capture buffer (legacy path).
+        // When n_tokens>0, flush only the span [src_offset, src_offset+n_tokens).
+        int to_write = n_tokens > 0 ? n_tokens : (int)captured;
+        int offset    = n_tokens > 0 ? src_offset : 0;
+
+        // Clamp to available captured tokens.
+        if (offset < 0) offset = 0;
+        if (offset + to_write > (int)captured) {
+            to_write = std::max(0, (int)captured - offset);
+        }
+        if (to_write <= 0) return;
+
+        LOG_DBG("DFLASH_DBG flush_prefill: captured=%lld src_offset=%d n_tokens=%d to_write=%d prefill_flushed=%d ring_write_pos=%d ring_filled=%d committed_len=%d\n",
+            (long long)captured, offset, n_tokens, to_write, (int)prefill_flushed, ring_write_pos, ring_filled, committed_len);
 
         if (!prefill_flushed) {
             // first flush for this request — reset ring
@@ -1908,7 +1922,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
             llama_dflash_kv_cache_reset(ctx_dft);
         }
 
-        const int actual_written = ring_write((int)n_tokens, 0, true);
+        const int actual_written = ring_write(to_write, offset, true);
         committed_len += actual_written;
         update_drafter_kv_cache(actual_written);
         prefill_flushed = true;
@@ -2384,6 +2398,7 @@ private:
     int ring_write(int n_tokens, int src_offset = 0, bool force_cpu_ring = false) {
         if (n_tokens <= 0) return 0;
 
+        const bool use_prefill_gpu = llama_dflash_prefill_gpu_active(ctx_tgt);
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
         int actual_written = n_tokens;
         bool first_layer = true;
@@ -2391,6 +2406,15 @@ private:
         for (int layer = 0; layer < n_target_layers && layer < n_slots; ++layer) {
             float * data = llama_get_layer_hidden(ctx_tgt, layer);
             int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
+
+            // When using prefill GPU staging, the CPU callback was not installed
+            // so data/ntok are 0.  Skip the CPU sizing loop; actual_written is set
+            // by the caller's n_tokens argument (the span from should_flush_dflash_prefill).
+            if (use_prefill_gpu && !data) {
+                any_layer = true;
+                continue;
+            }
+
             if ((!data && !gpu_ring_handle) || ntok <= 0) continue;
 
             int to_write = std::min(n_tokens, std::max(0, (int)ntok - src_offset));
@@ -2416,8 +2440,15 @@ private:
         for (int layer = 0; layer < n_target_layers && layer < n_slots; ++layer) {
             float * data = llama_get_layer_hidden(ctx_tgt, layer);
             int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, layer);
-            int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
-            if ((!data && !gpu_ring_handle) || ntok <= 0) continue;
+
+            // When using prefill GPU staging, skip per-layer CPU checks and
+            // go straight to D2D upload for each layer.
+            if (use_prefill_gpu && !data) {
+                embd = n_embd;
+            } else {
+                int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
+                if ((!data && !gpu_ring_handle) || ntok <= 0) continue;
+            }
 
             // Keep the CPU ring valid during prefill because prompt checkpoints serialize it.
             // Decode append can skip the CPU copy when GPU ring is active.
@@ -2441,8 +2472,15 @@ private:
                     const int64_t t_start = profile ? ggml_time_us() : 0;
                     bool used_d2d = false;
                     if (!data) {
+                        // No CPU hidden data — try GPU buffer D2D paths.
+                        // For verify decodes (n_tokens <= 25), try the small verify buffer.
+                        // For prefill suffix (larger batches), try the prefill staging buffer.
                         used_d2d = llama_dflash_cross_ring_gpu_write_hidden(gpu_ring_handle, ctx_tgt, layer, plan.ring_pos,
                             src_offset + plan.src_token_offset, plan.n_tokens, embd);
+                        if (!used_d2d) {
+                            used_d2d = llama_dflash_prefill_gpu_write_hidden(gpu_ring_handle, ctx_tgt, seq_id, layer, plan.ring_pos,
+                                src_offset + plan.src_token_offset, plan.n_tokens, embd);
+                        }
                         gpu_d2d_failed = gpu_d2d_failed || !used_d2d;
                     }
                     if (!used_d2d && data) {
@@ -3276,12 +3314,12 @@ void common_speculative_update_logits_by_indices(common_speculative * spec, llam
     }
 }
 
-void common_speculative_flush_prefill(common_speculative * spec) {
+void common_speculative_flush_prefill(common_speculative * spec, int src_offset, int n_tokens) {
     if (spec == nullptr) {
         return;
     }
     for (auto & impl : spec->impls) {
-        impl->flush_prefill();
+        impl->flush_prefill(src_offset, n_tokens);
     }
 }
 

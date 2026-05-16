@@ -89,6 +89,13 @@ struct llama_cparams {
     dflash_hidden_gpu * hidden_gpu_seqs[LLAMA_DFLASH_MAX_SLOTS] = {};
     int hidden_gpu_n_seqs = 0;
 
+    // DFlash GPU-resident hidden staging for suffix-prefill capture. Larger than
+    // hidden_gpu_seqs (sized for one ubatch) and used only during prefill when
+    // capture_active is true and the ubatch exceeds LLAMA_DFLASH_MAX_VERIFY_TOKENS.
+    // When prefill_gpu_n_seqs > 0, hidden_gpu_n_seqs is 0 and vice versa.
+    dflash_hidden_gpu * prefill_gpu_seqs[LLAMA_DFLASH_MAX_SLOTS] = {};
+    int prefill_gpu_n_seqs = 0;
+
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
 };

@@ -689,6 +689,7 @@ struct llm_graph_params {
             cparams.cb_eval              == other.cparams.cb_eval &&
             cparams.cb_eval_user_data    == other.cparams.cb_eval_user_data &&
             cparams.hidden_gpu_n_seqs    == other.cparams.hidden_gpu_n_seqs &&
+            cparams.prefill_gpu_n_seqs   == other.cparams.prefill_gpu_n_seqs &&
             (cparams.tape_gpu != nullptr) == (other.cparams.tape_gpu != nullptr) &&
             arch  == other.arch  &&
             gtype == other.gtype &&

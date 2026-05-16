@@ -133,6 +133,8 @@ struct dflash_capture_data {
     // byte-identical to the pre-multi-slot singleton.
     std::vector<std::unique_ptr<dflash_tape_gpu>> tapes;
     std::vector<std::unique_ptr<dflash_hidden_gpu>> hidden_gpu;
+    std::vector<std::unique_ptr<dflash_hidden_gpu>> prefill_gpu;  // large staging buffer for suffix prefill
+    int prefill_gpu_max_tokens = 0;  // allocation capacity of prefill_gpu
     int active_tape_idx = 0;
 
     // Active ubatch for the in-flight process_ubatch() call. The eval callback
@@ -505,6 +507,11 @@ public:
     void allocate_tape_gpu(int max_tokens) { allocate_tape_gpu(1, max_tokens); }
     void allocate_tape_gpu(int n_slots, int max_tokens);
     void allocate_hidden_gpu(int n_slots, int max_tokens);
+    // DFlash: allocate per-slot GPU staging buffers for suffix-prefill hidden capture.
+    // Unlike hidden_gpu (sized for LLAMA_DFLASH_MAX_VERIFY_TOKENS = 25), this is sized
+    // for one ubatch worth of tokens (typically 128-512). Lazily allocated on first
+    // suffix prefill. Returns true if allocation succeeded or buffers already exist.
+    bool allocate_prefill_gpu(int n_slots, int max_tokens);
 
     // DFlash: select which slot's tape the next llama_decode() writes into.
     // Must be called before each decode when multi-slot tape is in use.
@@ -539,6 +546,9 @@ public:
     // DFlash GPU ring: allocate ring on GPU backend, returns opaque handle
     void * init_cross_ring_gpu(int n_layers, int n_embd, int ring_size);
     bool cross_ring_gpu_write_hidden(void * handle, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd);
+    // DFlash GPU: copy from prefill staging buffer into the cross ring (D2D).
+    // slot: which DFlash slot's prefill buffer to read from.
+    bool prefill_gpu_write_hidden(void * handle, int slot, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd);
 
     // DFlash GPU ring: set GPU device pointer as cross data source (D2D path)
     using set_tensor_d2d_fn_t = void (*)(void *, const void *, size_t, size_t);
@@ -559,12 +569,21 @@ public:
     void set_tree_parent_ids(const int32_t * parents, int n_tokens);
     void clear_tree_parent_ids();
 
-    // DDTree: allocate persistent intermediate buffers for tree verify
+    // DFlash: allocate persistent intermediate buffers for tree verify
     void allocate_tree_buffers(int max_tree_tokens);
 
     // DDTree: rollback SSM state to accepted token from intermediates
     void tree_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, int commit_n, const int32_t * parents);
     void set_tree_seq0_count(int n) { tree_bufs.n_seq0_tokens = n; }
+
+    // DFlash: check if prefill GPU staging buffers have captured data from the last decode.
+    bool prefill_gpu_active() const {
+        if (!dflash_capture) return false;
+        for (auto & pf : dflash_capture->prefill_gpu) {
+            if (pf && pf->n_tokens > 0) return true;
+        }
+        return false;
+    }
 
 private:
     llm_graph_params graph_params(

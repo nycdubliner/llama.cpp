@@ -1557,6 +1557,11 @@ void llama_context::dflash_reset_hidden_capture() {
             hidden->n_tokens = 0;
         }
     }
+    for (auto & pf : dflash_capture->prefill_gpu) {
+        if (pf) {
+            pf->n_tokens = 0;
+        }
+    }
     for (auto & tl : dflash_capture->tape_layers) {
         tl.n_tokens = 0;
     }
@@ -1857,6 +1862,97 @@ void llama_context::allocate_hidden_gpu(int n_slots, int max_tokens) {
 
     LLAMA_LOG_INFO("%s: allocated GPU hidden buffers: %.1f MB total (%d slot%s, %d layers, %d max tokens)\n",
         __func__, total_size / (1024.0 * 1024.0), n_slots, n_slots == 1 ? "" : "s", n_layers, max_tokens);
+}
+
+bool llama_context::allocate_prefill_gpu(int n_slots, int max_tokens) {
+    if (!dflash_capture || dflash_capture->layer_ids.empty()) {
+        return false;
+    }
+    if (n_slots < 1) {
+        n_slots = 1;
+    }
+    if (!dflash_capture->gpu_capture_enabled) {
+        return false;
+    }
+    if (model.n_devices() > 1) {
+        return false;
+    }
+    if (!llama_dflash_gpu_tape_supported_arch(model.arch)) {
+        return false;
+    }
+
+    // Already allocated with sufficient capacity — reuse.
+    if (!dflash_capture->prefill_gpu.empty() &&
+        (int) dflash_capture->prefill_gpu.size() >= n_slots &&
+        dflash_capture->prefill_gpu_max_tokens >= max_tokens) {
+        // Update n_tokens on existing buffers for the new batch size.
+        for (int s = 0; s < n_slots && s < (int) dflash_capture->prefill_gpu.size(); ++s) {
+            dflash_capture->prefill_gpu[s]->n_tokens = 0;
+        }
+        return true;
+    }
+
+    ggml_backend_t gpu_backend = nullptr;
+    for (auto & backend : backends) {
+        auto * dev = ggml_backend_get_device(backend.get());
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu_backend = backend.get();
+            break;
+        }
+    }
+    if (!gpu_backend) {
+        return false;
+    }
+
+    const int n_layers = (int) dflash_capture->layer_ids.size();
+    const int64_t n_embd = model.hparams.n_embd;
+
+    dflash_capture->prefill_gpu.clear();
+    dflash_capture->prefill_gpu.reserve(n_slots);
+
+    size_t total_size = 0;
+    for (int slot = 0; slot < n_slots; ++slot) {
+        const size_t ctx_mem = ggml_tensor_overhead() * ((size_t) n_layers + 2);
+        struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
+        struct ggml_context * hidden_ctx = ggml_init(ctx_params);
+        if (!hidden_ctx) {
+            LLAMA_LOG_WARN("%s: failed to create prefill GPU context for slot %d; using callback fallback\n",
+                __func__, slot);
+            dflash_capture->prefill_gpu.clear();
+            dflash_capture->prefill_gpu_max_tokens = 0;
+            return false;
+        }
+
+        auto hidden = std::make_unique<dflash_hidden_gpu>();
+        hidden->layers.resize(n_layers);
+        hidden->layer_ids = dflash_capture->layer_ids;
+        hidden->n_embd = n_embd;
+        hidden->max_tokens = max_tokens;
+        hidden->n_tokens = 0;
+        hidden->ctx = hidden_ctx;
+
+        for (int i = 0; i < n_layers; ++i) {
+            hidden->layers[i] = ggml_new_tensor_2d(hidden_ctx, GGML_TYPE_F32, n_embd, (int64_t) max_tokens);
+        }
+
+        hidden->buf = ggml_backend_alloc_ctx_tensors(hidden_ctx, gpu_backend);
+        if (!hidden->buf) {
+            LLAMA_LOG_WARN("%s: failed to allocate prefill GPU buffer for slot %d; using callback fallback\n",
+                __func__, slot);
+            dflash_capture->prefill_gpu.clear();
+            dflash_capture->prefill_gpu_max_tokens = 0;
+            return false;
+        }
+
+        total_size += ggml_backend_buffer_get_size(hidden->buf);
+        dflash_capture->prefill_gpu.push_back(std::move(hidden));
+    }
+
+    dflash_capture->prefill_gpu_max_tokens = max_tokens;
+
+    LLAMA_LOG_INFO("%s: allocated prefill GPU staging buffers: %.1f MB total (%d slot%s, %d layers, %d max tokens)\n",
+        __func__, total_size / (1024.0 * 1024.0), n_slots, n_slots == 1 ? "" : "s", n_layers, max_tokens);
+    return true;
 }
 
 void llama_context::set_active_dflash_slot(int slot_idx) {
@@ -4798,34 +4894,102 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     cparams.cb_eval = nullptr;
                     cparams.cb_eval_user_data = nullptr;
                     cparams.hidden_gpu_n_seqs = 0;
+                    cparams.prefill_gpu_n_seqs = 0;
                     cparams.tape_gpu_n_seqs = 0;
                     cparams.tape_gpu = nullptr;
                     for (int s = 0; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
                         cparams.tape_gpu_seqs[s] = nullptr;
                         cparams.hidden_gpu_seqs[s] = nullptr;
+                        cparams.prefill_gpu_seqs[s] = nullptr;
                     }
                     dflash_capture->ubatch = &ubatch;
                 } else {
                     const bool dflash_gpu_capture_ready = model.n_devices() <= 1 && dflash_capture->gpu_capture_enabled;
                     dflash_capture->ubatch = &ubatch;
                     cparams.hidden_gpu_n_seqs = 0;
+                    cparams.prefill_gpu_n_seqs = 0;
                     for (int s = 0; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
                         cparams.hidden_gpu_seqs[s] = nullptr;
+                        cparams.prefill_gpu_seqs[s] = nullptr;
                     }
 
                     // populate per-seq DFlash GPU capture pointers for graph builder
                     bool dflash_graph_hidden_ready = false;
                     const int ns = std::min((int) ubatch.n_seqs_unq, (int) LLAMA_DFLASH_MAX_SLOTS);
 
-                    // Hidden GPU readiness does not depend on tape state.
-                    dflash_graph_hidden_ready =
-                        !dflash_capture->hidden_gpu.empty() &&
-                        dflash_gpu_capture_ready &&
-                        !tree_bufs.active &&
-                        ubatch.n_seq_tokens <= LLAMA_DFLASH_MAX_VERIFY_TOKENS;
+                    // Choose hidden capture buffer set based on ubatch size.
+                    // For verify-sized batches (<= MAX_VERIFY_TOKENS), use the small
+                    // hidden_gpu buffers. For larger prefill suffix batches, use
+                    // prefill_gpu staging buffers (lazily allocated on first use).
+                    const bool use_prefill_staging = ubatch.n_seq_tokens > LLAMA_DFLASH_MAX_VERIFY_TOKENS;
+
+                    if (use_prefill_staging && dflash_gpu_capture_ready && !tree_bufs.active) {
+                        // Lazy allocation of prefill staging GPU buffers on first
+                        // suffix prefill batch that needs them.
+                        if (dflash_capture->prefill_gpu.empty()) {
+                            const int ubatch_size = cparams.n_ubatch > 0 ? cparams.n_ubatch : 512;
+                            allocate_prefill_gpu(ns, ubatch_size);
+                        }
+                        // Size check: if ubatch exceeds allocated capacity, fall back.
+                        const bool prefill_fits = !dflash_capture->prefill_gpu.empty() &&
+                            ubatch.n_seq_tokens <= (uint32_t) dflash_capture->prefill_gpu_max_tokens;
+
+                        if (prefill_fits) {
+                            // Route hidden capture to prefill staging buffers.
+                            dflash_graph_hidden_ready = true;
+                            for (int s = 0; s < ns; ++s) {
+                                const llama_seq_id seq = ubatch.seq_id_unq[s];
+                                dflash_hidden_gpu * hp = nullptr;
+                                if (seq >= 0 && seq < (int) dflash_capture->prefill_gpu.size()) {
+                                    hp = dflash_capture->prefill_gpu[seq].get();
+                                    if (hp) {
+                                        hp->n_tokens = (int) ubatch.n_seq_tokens;
+                                    }
+                                }
+                                cparams.prefill_gpu_seqs[s] = hp;
+                                dflash_graph_hidden_ready = dflash_graph_hidden_ready && hp && hp->n_tokens > 0;
+                            }
+                            for (int s = ns; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
+                                cparams.prefill_gpu_seqs[s] = nullptr;
+                            }
+                            if (dflash_graph_hidden_ready) {
+                                cparams.prefill_gpu_n_seqs = ns;
+                            }
+                        }
+                    }
+
+                    // If not using prefill staging, check verify-sized hidden_gpu.
+                    if (!dflash_graph_hidden_ready) {
+                        dflash_graph_hidden_ready =
+                            !dflash_capture->hidden_gpu.empty() &&
+                            dflash_gpu_capture_ready &&
+                            !tree_bufs.active &&
+                            ubatch.n_seq_tokens <= LLAMA_DFLASH_MAX_VERIFY_TOKENS;
+
+                        for (int s = 0; s < ns; ++s) {
+                            const llama_seq_id seq = ubatch.seq_id_unq[s];
+                            dflash_hidden_gpu * hp = nullptr;
+                            if (seq >= 0 && seq < (int) dflash_capture->hidden_gpu.size()) {
+                                hp = dflash_capture->hidden_gpu[seq].get();
+                                if (hp) {
+                                    hp->n_tokens = ubatch.n_seq_tokens <= (uint32_t) hp->max_tokens ? (int) ubatch.n_seq_tokens : 0;
+                                }
+                            }
+                            cparams.hidden_gpu_seqs[s] = hp;
+                            dflash_graph_hidden_ready = dflash_graph_hidden_ready && hp && hp->n_tokens > 0;
+                        }
+                        for (int s = ns; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
+                            cparams.hidden_gpu_seqs[s] = nullptr;
+                        }
+                        if (dflash_graph_hidden_ready) {
+                            cparams.hidden_gpu_n_seqs = ns;
+                        }
+                    }
 
                     // Tape readiness depends on tape buffers being allocated and enabled.
+                    // During prefill, tape capture is not needed (no verification yet).
                     const bool dflash_graph_tape_ready =
+                        !use_prefill_staging &&
                         !dflash_capture->tapes.empty() &&
                         dflash_gpu_capture_ready &&
                         dflash_capture->tape_enabled &&
@@ -4837,17 +5001,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     for (int s = 0; s < ns; ++s) {
                         const llama_seq_id seq = ubatch.seq_id_unq[s];
                         dflash_tape_gpu * tp = nullptr;
-                        dflash_hidden_gpu * hp = nullptr;
                         if (seq >= 0 && seq < (int) dflash_capture->tapes.size()) {
                             tp = dflash_capture->tapes[seq].get();
                             if (tp) {
                                 tp->n_tokens = ubatch.n_seq_tokens <= (uint32_t) tp->max_tokens ? (int) ubatch.n_seq_tokens : 0;
-                            }
-                        }
-                        if (seq >= 0 && seq < (int) dflash_capture->hidden_gpu.size()) {
-                            hp = dflash_capture->hidden_gpu[seq].get();
-                            if (hp) {
-                                hp->n_tokens = ubatch.n_seq_tokens <= (uint32_t) hp->max_tokens ? (int) ubatch.n_seq_tokens : 0;
                             }
                         }
                         dflash_tape_gpu * graph_tp = dflash_graph_tape_ready ? tp : nullptr;
@@ -4855,18 +5012,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             seqs_changed = true;
                         }
                         cparams.tape_gpu_seqs[s] = graph_tp;
-                        cparams.hidden_gpu_seqs[s] = hp;
-                        dflash_graph_hidden_ready = dflash_graph_hidden_ready && hp && hp->n_tokens > 0;
                     }
                     for (int s = ns; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
                         if (cparams.tape_gpu_seqs[s] != nullptr) {
                             seqs_changed = true;
                         }
                         cparams.tape_gpu_seqs[s] = nullptr;
-                        cparams.hidden_gpu_seqs[s] = nullptr;
                     }
                     cparams.tape_gpu_n_seqs = tape_ns;
-                    cparams.hidden_gpu_n_seqs = dflash_graph_hidden_ready ? ns : 0;
 
                     // sentinel for "GPU tape graph copies are active"
                     cparams.tape_gpu = tape_ns > 0 ? cparams.tape_gpu_seqs[0] : nullptr;
@@ -6681,6 +6834,59 @@ bool llama_context::cross_ring_gpu_write_hidden(void * handle, int layer, int ri
 bool llama_dflash_cross_ring_gpu_write_hidden(void * handle, llama_context * ctx, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd) {
     if (!ctx) return false;
     return ctx->cross_ring_gpu_write_hidden(handle, layer, ring_pos, src_offset, n_tokens, n_embd);
+}
+
+bool llama_context::prefill_gpu_write_hidden(void * handle, int slot, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd) {
+    if (!handle || !dflash_capture) {
+        return false;
+    }
+    if (slot < 0 || slot >= (int) dflash_capture->prefill_gpu.size()) {
+        return false;
+    }
+    auto * pgpu = dflash_capture->prefill_gpu[slot].get();
+    if (!pgpu || layer < 0 || layer >= (int) pgpu->layers.size()) {
+        return false;
+    }
+    if (src_offset < 0 || n_tokens <= 0 || n_embd != pgpu->n_embd ||
+            src_offset + n_tokens > pgpu->n_tokens) {
+        return false;
+    }
+
+    auto * tensor = pgpu->layers[layer];
+    if (!tensor || !tensor->data) {
+        return false;
+    }
+
+    auto * h = (dflash_cross_ring_handle *)handle;
+    const size_t src_offset_bytes = (size_t) src_offset * (size_t) n_embd * sizeof(float);
+    const void * src = (const char *) tensor->data + src_offset_bytes;
+    if (h->fn_write_d2d(h->gpu_ring, layer, ring_pos, src, n_tokens, n_embd)) {
+        return true;
+    }
+
+    static bool warned_prefill_d2h_fallback = false;
+    if (!warned_prefill_d2h_fallback) {
+        LLAMA_LOG_WARN("%s: prefill GPU D2D ring write unavailable; falling back to GPU readback + H2D ring upload\n",
+            __func__);
+        warned_prefill_d2h_fallback = true;
+    }
+
+    const size_t n_bytes = (size_t) n_tokens * (size_t) n_embd * sizeof(float);
+    std::vector<float> staging((size_t) n_tokens * (size_t) n_embd);
+    ggml_backend_tensor_get(tensor, staging.data(), src_offset_bytes, n_bytes);
+    h->fn_write(h->gpu_ring, layer, ring_pos, staging.data(), n_tokens, n_embd);
+    h->fn_synchronize(h->gpu_ring);
+    return true;
+}
+
+bool llama_dflash_prefill_gpu_write_hidden(void * handle, llama_context * ctx, int slot, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd) {
+    if (!ctx) return false;
+    return ctx->prefill_gpu_write_hidden(handle, slot, layer, ring_pos, src_offset, n_tokens, n_embd);
+}
+
+bool llama_dflash_prefill_gpu_active(llama_context * ctx) {
+    if (!ctx) return false;
+    return ctx->prefill_gpu_active();
 }
 
 void llama_dflash_cross_ring_gpu_synchronize(void * handle) {
