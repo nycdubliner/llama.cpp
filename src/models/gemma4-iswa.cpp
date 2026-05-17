@@ -368,7 +368,9 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
         ggml_build_forward_expand(gf, res->t_logits_argmax);
     }
 
-    ggml_build_forward_expand(gf, cur);
+    if (!(cparams.dflash_reduced_consumer_active && cparams.dflash_verify_logits)) {
+        ggml_build_forward_expand(gf, cur);
+    }
 }
 
 // equivalent to get_per_layer_inputs() in python code

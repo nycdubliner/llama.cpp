@@ -163,7 +163,9 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
         ggml_build_forward_expand(gf, res->t_logits_argmax);
     }
 
-    ggml_build_forward_expand(gf, cur);
+    if (!(cparams.dflash_reduced_consumer_active && cparams.dflash_verify_logits)) {
+        ggml_build_forward_expand(gf, cur);
+    }
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen35moe::build_qkvz(

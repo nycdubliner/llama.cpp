@@ -348,6 +348,12 @@ int main(int argc, char ** argv) {
     ok &= expect(qwen35.find("cparams.dflash_verify_logits") != std::string::npos, "Qwen3.5 target graph must emit reduced verifier logits only when gated");
     ok &= expect(qwen35moe.find("cparams.dflash_verify_logits") != std::string::npos, "Qwen3.5-MoE target graph must emit reduced verifier logits only when gated");
     ok &= expect(gemma4_iswa.find("cparams.dflash_verify_logits") != std::string::npos, "Gemma4-ISWA target graph must emit reduced verifier logits only when gated");
+    ok &= expect(qwen35.find("if (!(cparams.dflash_reduced_consumer_active && cparams.dflash_verify_logits))") != std::string::npos,
+        "Qwen3.5 reduced verifier graph must not keep full logits as a graph root");
+    ok &= expect(qwen35moe.find("if (!(cparams.dflash_reduced_consumer_active && cparams.dflash_verify_logits))") != std::string::npos,
+        "Qwen3.5-MoE reduced verifier graph must not keep full logits as a graph root");
+    ok &= expect(gemma4_iswa.find("if (!(cparams.dflash_reduced_consumer_active && cparams.dflash_verify_logits))") != std::string::npos,
+        "Gemma4-ISWA reduced verifier graph must not keep full logits as a graph root");
     ok &= expect(gemma4_iswa.find("ggml_topk_ext(ctx0, cur, topk, 0.0f, 0)") != std::string::npos, "Gemma4-ISWA target verifier top-K must emit raw logit candidates");
     ok &= expect(gemma4_iswa.find("#include <algorithm>") != std::string::npos, "Gemma4-ISWA must include <algorithm> for std::max/std::min in verifier path");
     ok &= expect(speculative.find("n_target_features != n_embd * n_target_layers") != std::string::npos,
