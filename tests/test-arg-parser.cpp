@@ -263,6 +263,10 @@ int main(void) {
 #endif // _WIN32
 
     printf("test-arg-parser: test download functions\n\n");
+    common_download_model_result download_result_fields;
+    download_result_fields.dflash_draft_path = "dflash-draft.gguf";
+    assert(download_result_fields.dflash_draft_path == "dflash-draft.gguf");
+
     const char * GOOD_URL = "http://ggml.ai/";
     const char * BAD_URL  = "http://ggml.ai/404";
 

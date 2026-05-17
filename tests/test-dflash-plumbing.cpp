@@ -26,6 +26,16 @@ static bool expect(bool ok, const char * message) {
     return ok;
 }
 
+static int count_occurrences(const std::string & text, const std::string & needle) {
+    int count = 0;
+    size_t pos = 0;
+    while ((pos = text.find(needle, pos)) != std::string::npos) {
+        ++count;
+        pos += needle.size();
+    }
+    return count;
+}
+
 int main(int argc, char ** argv) {
     bool ok = true;
 
@@ -53,6 +63,9 @@ int main(int argc, char ** argv) {
     const std::string chat_auto_parser_generator = read_file(root + "/common/chat-auto-parser-generator.cpp");
     const std::string speculative = read_file(root + "/common/speculative.cpp");
     const std::string speculative_h = read_file(root + "/common/speculative.h");
+    const std::string download_h = read_file(root + "/common/download.h");
+    const std::string download_cpp = read_file(root + "/common/download.cpp");
+    const std::string arg_cpp = read_file(root + "/common/arg.cpp");
     const std::string dflash_draft = read_file(root + "/src/models/dflash_draft.cpp");
     const std::string memory_recurrent = read_file(root + "/src/llama-memory-recurrent.cpp");
     const std::string qwen35 = read_file(root + "/src/models/qwen35.cpp");
@@ -348,14 +361,46 @@ int main(int argc, char ** argv) {
     ok &= expect(qwen35.find("cparams.dflash_verify_logits") != std::string::npos, "Qwen3.5 target graph must emit reduced verifier logits only when gated");
     ok &= expect(qwen35moe.find("cparams.dflash_verify_logits") != std::string::npos, "Qwen3.5-MoE target graph must emit reduced verifier logits only when gated");
     ok &= expect(gemma4_iswa.find("cparams.dflash_verify_logits") != std::string::npos, "Gemma4-ISWA target graph must emit reduced verifier logits only when gated");
-    ok &= expect(qwen35.find("if (!(cparams.dflash_reduced_consumer_active && cparams.dflash_verify_logits))") != std::string::npos,
-        "Qwen3.5 reduced verifier graph must not keep full logits as a graph root");
-    ok &= expect(qwen35moe.find("if (!(cparams.dflash_reduced_consumer_active && cparams.dflash_verify_logits))") != std::string::npos,
-        "Qwen3.5-MoE reduced verifier graph must not keep full logits as a graph root");
-    ok &= expect(gemma4_iswa.find("if (!(cparams.dflash_reduced_consumer_active && cparams.dflash_verify_logits))") != std::string::npos,
-        "Gemma4-ISWA reduced verifier graph must not keep full logits as a graph root");
+    ok &= expect(qwen35.find("const bool dflash_compact_verifier_only") != std::string::npos &&
+                 qwen35.find("if (!dflash_compact_verifier_only)") != std::string::npos,
+        "Qwen3.5 reduced verifier graph must use the named compact-verifier-only guard");
+    ok &= expect(qwen35moe.find("const bool dflash_compact_verifier_only") != std::string::npos &&
+                 qwen35moe.find("if (!dflash_compact_verifier_only)") != std::string::npos,
+        "Qwen3.5-MoE reduced verifier graph must use the named compact-verifier-only guard");
+    ok &= expect(gemma4_iswa.find("const bool dflash_compact_verifier_only") != std::string::npos &&
+                 gemma4_iswa.find("if (!dflash_compact_verifier_only)") != std::string::npos,
+        "Gemma4-ISWA reduced verifier graph must use the named compact-verifier-only guard");
     ok &= expect(gemma4_iswa.find("ggml_topk_ext(ctx0, cur, topk, 0.0f, 0)") != std::string::npos, "Gemma4-ISWA target verifier top-K must emit raw logit candidates");
     ok &= expect(gemma4_iswa.find("#include <algorithm>") != std::string::npos, "Gemma4-ISWA must include <algorithm> for std::max/std::min in verifier path");
+    ok &= expect(context_h.find("profile_output_extract_us") != std::string::npos,
+        "DFlash profile must track verifier output extraction time");
+    ok &= expect(context_h.find("profile_raw_logits_skipped") != std::string::npos,
+        "DFlash profile must count compact verifier raw-logit skips");
+    ok &= expect(context_cpp.find("profile_output_extract_us") != std::string::npos &&
+                 context_cpp.find("profile_raw_logits_skipped += n_outputs") != std::string::npos,
+        "DFlash decode must account for output extraction time and skipped raw-logit rows");
+    ok &= expect(context_cpp.find("raw_logits_skipped=") != std::string::npos &&
+                 context_cpp.find("raw_logits_skipped_bytes_est=") != std::string::npos,
+        "DFlash profile log must print skipped raw-logit rows and estimated bytes");
+    ok &= expect(server_context.find("dflash_log_reduced_verify_decision") != std::string::npos &&
+                 server_context.find("dflash reduced verifier decision:") != std::string::npos,
+        "server must log one reduced-verifier batch decision behind GGML_DFLASH_PROFILE");
+    ok &= expect(server_context.find("dflash compact-output mismatch:") != std::string::npos,
+        "server must log reduced verifier compact-output mismatches behind GGML_DFLASH_PROFILE");
+    ok &= expect(server_context.find("dflash_slot_in_view") != std::string::npos,
+        "server must share DFlash slot-in-view detection between per-view scans");
+    {
+        const size_t helper_pos = server_context.find("static bool dflash_view_has_unexpected_prompt_logits");
+        const size_t helper_end = helper_pos == std::string::npos ? std::string::npos :
+            server_context.find("static ", helper_pos + 1);
+        const std::string helper = helper_pos == std::string::npos || helper_end == std::string::npos
+            ? std::string()
+            : server_context.substr(helper_pos, helper_end - helper_pos);
+        ok &= expect(!helper.empty() &&
+                     helper.find("need_sampling()") != std::string::npos &&
+                     helper.find("need_embd()") == std::string::npos,
+            "DFlash prompt/prefill raw-logit diagnostic must be based on sampling prompt state, not need_embd()");
+    }
     ok &= expect(speculative.find("n_target_features != n_embd * n_target_layers") != std::string::npos,
         "DFlash must validate n_target_features against n_embd * n_target_layers");
     ok &= expect(speculative.find("target_layer_ids contain duplicates") != std::string::npos,
@@ -365,6 +410,24 @@ int main(int argc, char ** argv) {
         "DFlash must validate target_layer_ids against target model layer range");
     ok &= expect(speculative.find("dflash: contract ok:") != std::string::npos,
         "DFlash must log validated drafter/target contract");
+    ok &= expect(speculative.find("!common_speculative_are_compatible(model_tgt, model_dft_)") != std::string::npos &&
+                 speculative.find("dflash: target and drafter vocab are incompatible") != std::string::npos,
+        "DFlash must fail closed on incompatible target/drafter vocabs");
+    ok &= expect(count_occurrences(speculative, "result.size() >= params.n_min") >= 2,
+        "DFlash GPU argmax p_min discard must respect n_min on both single and batched draft paths");
+    ok &= expect(download_h.find("std::string dflash_draft_path;") != std::string::npos &&
+                 download_h.find("bool download_dflash = false") != std::string::npos,
+        "download result/API must expose optional DFlash draft discovery");
+    ok &= expect(download_cpp.find("find_best_dflash") != std::string::npos &&
+                 download_cpp.find("\"dflash-\"") != std::string::npos &&
+                 download_cpp.find("\"draft-dflash-\"") != std::string::npos,
+        "download code must discover dflash- and draft-dflash- sibling GGUFs");
+    ok &= expect(download_cpp.find("filename.rfind(\"dflash-\", 0) != 0") != std::string::npos &&
+                 download_cpp.find("filename.rfind(\"draft-dflash-\", 0) != 0") != std::string::npos,
+        "download code must exclude DFlash drafts from primary model selection");
+    ok &= expect(arg_cpp.find("found_dflash") != std::string::npos &&
+                 arg_cpp.find("params.speculative.draft.mparams.path = res.dflash.path") != std::string::npos,
+        "arg handling must auto-fill DFlash draft path only after primary model handling");
     ok &= expect(dflash_draft.find("n_feat != target_hidden->ne[0]") != std::string::npos,
         "DFlash drafter input must reject cross feature-size mismatches");
     ok &= expect(dflash_draft.find("ggml_backend_tensor_memset(target_hidden, 0, 0, tensor_bytes)") != std::string::npos,
@@ -488,7 +551,10 @@ int main(int argc, char ** argv) {
         "graph reuse must not key on eval callback user data runtime state");
     ok &= expect(graph_h.find("cparams.hidden_gpu_n_seqs") != std::string::npos, "graph reuse must key on GPU hidden capture topology");
     ok &= expect(graph_h.find("cparams.tape_gpu             == other.cparams.tape_gpu") != std::string::npos, "graph reuse must key on GPU tape topology");
-    ok &= expect(context_cpp.find("!dflash_reduced_consumed && needs_raw_logits") != std::string::npos, "raw logits must still be copied for fallback views when stable top-K is present");
+    ok &= expect(context_cpp.find("raw_logits_needed") != std::string::npos &&
+                 context_cpp.find("needs_raw_logits(ubatch, sampling.samplers)") != std::string::npos &&
+                 context_cpp.find("raw_logits_needed && !dflash_reduced_consumed") != std::string::npos,
+        "raw logits must still be copied for fallback views when stable top-K is present");
     ok &= expect(server_context.find("dflash profile: accept n_draft=%zu ids=%zu") != std::string::npos, "server must profile DFlash accept subphases");
     ok &= expect(server_context.find("dflash_sample_reduced_verify") != std::string::npos, "server must consume reduced verifier logits");
     ok &= expect(server_context.find("falling back is unsafe because raw logits were not copied") != std::string::npos, "server must not silently fall back after reduced raw-logit skip");
