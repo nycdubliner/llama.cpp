@@ -4796,18 +4796,21 @@ extern "C" bool dflash_cuda_backend_wait_for_stream(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
 
-    cudaEvent_t event = nullptr;
-    cudaError_t err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
-    if (err != cudaSuccess) {
-        return false;
+    static thread_local cudaEvent_t dflash_wait_events[GGML_CUDA_MAX_DEVICES] = {};
+    cudaEvent_t & event = dflash_wait_events[cuda_ctx->device];
+    if (event == nullptr) {
+        cudaError_t err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        if (err != cudaSuccess) {
+            event = nullptr;
+            return false;
+        }
     }
 
-    err = cudaEventRecord(event, cuda_ctx->stream());
+    cudaError_t err = cudaEventRecord(event, cuda_ctx->stream());
     if (err == cudaSuccess) {
         err = cudaStreamWaitEvent(cudaStreamPerThread, event, 0);
     }
 
-    cudaEventDestroy(event);
     return err == cudaSuccess;
 }
 

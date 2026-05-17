@@ -105,6 +105,8 @@ int main(int argc, char ** argv) {
         "process_ubatch must refresh the scheduler eval callback before every compute, including graph reuse");
     ok &= expect(cuda_cpp.find("dflash_cuda_backend_wait_for_stream") != std::string::npos,
         "CUDA backend must expose an event wait from GGML compute stream to DFlash per-thread stream");
+    ok &= expect(cuda_cpp.find("thread_local cudaEvent_t dflash_wait_events") != std::string::npos,
+        "DFlash CUDA stream wait helper must reuse per-thread events instead of allocating on every decode");
     ok &= expect(context_h.find("fn_sync_backend_to_stream") != std::string::npos,
         "DFlash capture state must cache the CUDA stream ordering helper");
     ok &= expect(context_cpp.find("dflash_wait_for_gpu_capture_stream()") != std::string::npos,
