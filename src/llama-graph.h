@@ -689,20 +689,27 @@ struct llm_graph_params {
             }
         }
 
+        for (size_t i = 0; i < sizeof(cparams.hidden_gpu_seqs)/sizeof(cparams.hidden_gpu_seqs[0]); ++i) {
+            if (cparams.hidden_gpu_seqs[i] != other.cparams.hidden_gpu_seqs[i] ||
+                cparams.prefill_gpu_seqs[i] != other.cparams.prefill_gpu_seqs[i] ||
+                cparams.tape_gpu_seqs[i] != other.cparams.tape_gpu_seqs[i]) {
+                return false;
+            }
+        }
+
         return
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.causal_attn == other.cparams.causal_attn &&
             cparams.dflash_verify_logits == other.cparams.dflash_verify_logits &&
             cparams.dflash_verify_topk   == other.cparams.dflash_verify_topk &&
-            cparams.cb_eval              == other.cparams.cb_eval &&
-            cparams.cb_eval_user_data    == other.cparams.cb_eval_user_data &&
             cparams.hidden_gpu_n_seqs    == other.cparams.hidden_gpu_n_seqs &&
             cparams.prefill_gpu_n_seqs   == other.cparams.prefill_gpu_n_seqs &&
+            cparams.tape_gpu             == other.cparams.tape_gpu &&
+            cparams.tape_gpu_n_seqs      == other.cparams.tape_gpu_n_seqs &&
             cparams.dflash_prefill_capture_active == other.cparams.dflash_prefill_capture_active &&
             cparams.dflash_prefill_src_offset     == other.cparams.dflash_prefill_src_offset &&
             cparams.dflash_prefill_dst_offset     == other.cparams.dflash_prefill_dst_offset &&
             cparams.dflash_prefill_n_tokens       == other.cparams.dflash_prefill_n_tokens &&
-            (cparams.tape_gpu != nullptr) == (other.cparams.tape_gpu != nullptr) &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

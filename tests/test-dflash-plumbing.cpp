@@ -68,7 +68,15 @@ int main(int argc, char ** argv) {
     const std::string cuda_reg = read_file(root + "/ggml/src/ggml-cuda/ggml-cuda.cu");
     const std::string cuda_fattn = read_file(root + "/ggml/src/ggml-cuda/fattn.cu");
     const std::string cuda_fattn_vec_q4_0_q4_0 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu");
+    const std::string cuda_fattn_vec_q4_1_q4_1 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_1-q4_1.cu");
+    const std::string cuda_fattn_vec_q5_0_q5_0 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_0-q5_0.cu");
     const std::string cuda_fattn_vec_q5_0_q5_1 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_0-q5_1.cu");
+    const std::string cuda_fattn_vec_q5_1_q5_1 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_1-q5_1.cu");
+    const std::string cuda_fattn_vec_q8_0_q8_0 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu");
+    const std::string cuda_fattn_vec_bf16_bf16 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu");
+    const std::string cuda_fattn_vec_q8_0_turbo3_tcq = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo3_tcq.cu");
+    const std::string cuda_fattn_vec_turbo3_tcq_q8_0 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-turbo3_tcq-q8_0.cu");
+    const std::string cuda_fattn_vec_turbo3_tcq_turbo3_tcq = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-turbo3_tcq-turbo3_tcq.cu");
     const std::string cuda_template_generator = read_file(root + "/ggml/src/ggml-cuda/template-instances/generate_cu_files.py");
 
     const size_t pretranspose = qwen35moe.find("\"qkv_mixed_pretranspose\"");
@@ -91,15 +99,54 @@ int main(int argc, char ** argv) {
     ok &= expect(graph_cpp.find("t_logits_argmax = nullptr;") != std::string::npos, "graph reset must clear reduced logits output pointer");
     ok &= expect(context_cpp.find("logits_argmax_buf.clear();") != std::string::npos, "decode must clear stale reduced logits ids");
     ok &= expect(context_cpp.find("logits_argmax_prob_buf.clear();") != std::string::npos, "decode must clear stale reduced logits probabilities");
+    ok &= expect(graph_h.find("cparams.cb_eval              == other.cparams.cb_eval") == std::string::npos,
+        "graph reuse must not treat eval callback changes as topology changes");
+    ok &= expect(context_cpp.find("ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);\n\n    // set the input data") != std::string::npos,
+        "process_ubatch must refresh the scheduler eval callback before every compute, including graph reuse");
+    ok &= expect(graph_h.find("cparams.hidden_gpu_seqs[i] != other.cparams.hidden_gpu_seqs[i]") != std::string::npos,
+        "graph reuse must invalidate when DFlash hidden GPU graph-copy destinations change");
+    ok &= expect(graph_h.find("cparams.prefill_gpu_seqs[i] != other.cparams.prefill_gpu_seqs[i]") != std::string::npos,
+        "graph reuse must invalidate when DFlash prefill GPU graph-copy destinations change");
+    ok &= expect(graph_h.find("cparams.tape_gpu_seqs[i] != other.cparams.tape_gpu_seqs[i]") != std::string::npos,
+        "graph reuse must invalidate when DFlash tape graph-copy destinations change");
     ok &= expect(context_cpp.find("const int64_t step = 128;") != std::string::npos, "DFlash cross buckets must avoid the 513-to-1024 latency cliff");
     ok &= expect(cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)") != std::string::npos,
         "CUDA FlashAttention must dispatch q4_0/q4_0 D=512 for Gemma4 non-SWA KV cache");
+    ok &= expect(cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q4_1, GGML_TYPE_Q4_1)") != std::string::npos,
+        "CUDA FlashAttention all-quant dispatch must include D=512 q4_1 K/V cache pairs");
+    ok &= expect(cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q5_0, GGML_TYPE_Q5_0)") != std::string::npos,
+        "CUDA FlashAttention all-quant dispatch must include D=512 q5_0 K/V cache pairs");
     ok &= expect(cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q5_0, GGML_TYPE_Q5_1)") != std::string::npos,
         "CUDA FlashAttention all-quant dispatch must include D=512 q5 K/V cache pairs");
+    ok &= expect(cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q5_1, GGML_TYPE_Q5_1)") != std::string::npos,
+        "CUDA FlashAttention all-quant dispatch must include D=512 q5_1 K/V cache pairs");
+    ok &= expect(cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)") != std::string::npos,
+        "CUDA FlashAttention all-quant dispatch must include D=512 q8_0 K/V cache pairs");
+    ok &= expect(cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_BF16, GGML_TYPE_BF16)") != std::string::npos,
+        "CUDA FlashAttention all-quant dispatch must include D=512 bf16 K/V cache pairs");
+    ok &= expect(cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q8_0,       GGML_TYPE_TURBO3_TCQ)") != std::string::npos &&
+                 cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_Q8_0)") != std::string::npos,
+        "CUDA FlashAttention all-quant dispatch must include D=512 TCQ mixed q8/turbo3 pairs");
     ok &= expect(cuda_fattn_vec_q4_0_q4_0.find("DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0);") != std::string::npos,
         "q4_0/q4_0 FlashAttention template instance must include D=512");
+    ok &= expect(cuda_fattn_vec_q4_1_q4_1.find("DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q4_1, GGML_TYPE_Q4_1);") != std::string::npos,
+        "q4_1/q4_1 FlashAttention template instance must include D=512");
+    ok &= expect(cuda_fattn_vec_q5_0_q5_0.find("DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0);") != std::string::npos,
+        "q5_0/q5_0 FlashAttention template instance must include D=512");
     ok &= expect(cuda_fattn_vec_q5_0_q5_1.find("DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1);") != std::string::npos,
         "q5_0/q5_1 FlashAttention template instance must include D=512");
+    ok &= expect(cuda_fattn_vec_q5_1_q5_1.find("DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1);") != std::string::npos,
+        "q5_1/q5_1 FlashAttention template instance must include D=512");
+    ok &= expect(cuda_fattn_vec_q8_0_q8_0.find("DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);") != std::string::npos,
+        "q8_0/q8_0 FlashAttention template instance must include D=512");
+    ok &= expect(cuda_fattn_vec_bf16_bf16.find("DECL_FATTN_VEC_CASE(512, GGML_TYPE_BF16, GGML_TYPE_BF16);") != std::string::npos,
+        "bf16/bf16 FlashAttention template instance must include D=512");
+    ok &= expect(cuda_fattn_vec_q8_0_turbo3_tcq.find("DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_TCQ);") != std::string::npos,
+        "q8_0/turbo3_tcq FlashAttention template instance must include D=512");
+    ok &= expect(cuda_fattn_vec_turbo3_tcq_q8_0.find("DECL_FATTN_VEC_CASE(512, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_Q8_0);") != std::string::npos,
+        "turbo3_tcq/q8_0 FlashAttention template instance must include D=512");
+    ok &= expect(cuda_fattn_vec_turbo3_tcq_turbo3_tcq.find("DECL_FATTN_VEC_CASE(512, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ);") != std::string::npos,
+        "turbo3_tcq/turbo3_tcq FlashAttention template instance must include D=512");
     ok &= expect(cuda_template_generator.find("DECL_FATTN_VEC_CASE(512, {type_k}, {type_v});") != std::string::npos,
         "CUDA template generator must preserve D=512 quantized FlashAttention vector instances");
     ok &= expect(dflash_draft.find("bool can_reuse(const llm_graph_params & params) override") != std::string::npos, "DFlash drafter graph input must opt into graph reuse");
@@ -392,10 +439,12 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("dflash_profit_controller") == std::string::npos, "DFlash profit controller must use the normal adaptive depth probe path");
     ok &= expect(server_context.find("dflash_fixed_verify_shape") == std::string::npos, "DFlash profit controller must not override adaptive depth decisions");
     ok &= expect(server_context.find("continuing would corrupt recurrent replay") != std::string::npos, "server must abort instead of continuing after recurrent backup expansion failure");
-    ok &= expect(graph_h.find("cparams.cb_eval") != std::string::npos, "graph reuse must key on eval callback topology");
-    ok &= expect(graph_h.find("cparams.cb_eval_user_data") != std::string::npos, "graph reuse must key on eval callback user data");
+    ok &= expect(graph_h.find("cparams.cb_eval              == other.cparams.cb_eval") == std::string::npos,
+        "graph reuse must not key on eval callback runtime state");
+    ok &= expect(graph_h.find("cparams.cb_eval_user_data    == other.cparams.cb_eval_user_data") == std::string::npos,
+        "graph reuse must not key on eval callback user data runtime state");
     ok &= expect(graph_h.find("cparams.hidden_gpu_n_seqs") != std::string::npos, "graph reuse must key on GPU hidden capture topology");
-    ok &= expect(graph_h.find("cparams.tape_gpu != nullptr") != std::string::npos, "graph reuse must key on GPU tape topology");
+    ok &= expect(graph_h.find("cparams.tape_gpu             == other.cparams.tape_gpu") != std::string::npos, "graph reuse must key on GPU tape topology");
     ok &= expect(context_cpp.find("!dflash_reduced_consumed && needs_raw_logits") != std::string::npos, "raw logits must still be copied for fallback views when stable top-K is present");
     ok &= expect(server_context.find("dflash profile: accept n_draft=%zu ids=%zu") != std::string::npos, "server must profile DFlash accept subphases");
     ok &= expect(server_context.find("dflash_sample_reduced_verify") != std::string::npos, "server must consume reduced verifier logits");
