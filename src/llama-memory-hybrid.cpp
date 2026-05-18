@@ -155,6 +155,14 @@ void llama_memory_hybrid::seq_cp_recurrent(llama_seq_id seq_id_src, llama_seq_id
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
+void llama_memory_hybrid::recurrent_copy_profile_reset() {
+    mem_recr->recurrent_copy_profile_reset();
+}
+
+llama_memory_recurrent_copy_profile llama_memory_hybrid::recurrent_copy_profile() const {
+    return mem_recr->recurrent_copy_profile();
+}
+
 void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
     mem_attn->seq_keep(seq_id);
     mem_recr->seq_keep(seq_id);

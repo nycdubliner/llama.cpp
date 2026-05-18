@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-memory.h"
 
+#include <cstddef>
 #include <map>
 #include <set>
 #include <vector>
@@ -52,6 +53,8 @@ public:
         seq_cp(seq_id_src, seq_id_dst, p0, p1);
     }
     void seq_cp_recurrent_no_sync(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
+    void recurrent_copy_profile_reset() override;
+    llama_memory_recurrent_copy_profile recurrent_copy_profile() const override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
@@ -141,6 +144,29 @@ private:
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+
+    using dflash_cuda_copy_d2d_fn_t = bool (*)(void *, const void *, size_t);
+    using dflash_cuda_ptr_device_fn_t = bool (*)(const void *, int *);
+    using dflash_cuda_set_device_fn_t = bool (*)(int);
+    using dflash_cuda_sync_device_fn_t = bool (*)(int);
+
+    struct recurrent_copy_plan_entry {
+        ggml_tensor * tensor = nullptr;
+        size_t row_bytes = 0;
+    };
+
+    bool build_recurrent_copy_plan();
+    void invalidate_recurrent_copy_plan();
+    void add_recurrent_copy_profile(const llama_memory_recurrent_copy_profile & profile);
+
+    bool copy_plan_valid = false;
+    bool copy_plan_cuda_fast = false;
+    int copy_plan_device = -1;
+    std::vector<recurrent_copy_plan_entry> copy_plan_entries;
+    dflash_cuda_copy_d2d_fn_t copy_plan_fn_copy = nullptr;
+    dflash_cuda_set_device_fn_t copy_plan_fn_set_device = nullptr;
+    dflash_cuda_sync_device_fn_t copy_plan_fn_sync_device = nullptr;
+    llama_memory_recurrent_copy_profile copy_profile;
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {

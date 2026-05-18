@@ -2,6 +2,7 @@
 
 #include "llama.h"
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <functional>
@@ -35,6 +36,15 @@ llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_me
 
 // helper function for checking if a memory status indicates a failure
 bool llama_memory_status_is_fail(llama_memory_status status);
+
+struct llama_memory_recurrent_copy_profile {
+    uint64_t layers_scanned = 0;
+    uint64_t tensors_copied = 0;
+    uint64_t cuda_d2d_queued = 0;
+    uint64_t fallback_copies = 0;
+    uint64_t enqueue_us = 0;
+    uint64_t sync_us = 0;
+};
 
 // the interface for managing the memory context during batch processing
 // this interface is implemented per memory type. see:
@@ -119,6 +129,8 @@ struct llama_memory_i {
     // where KV backup is unnecessary — flat mode rollback trims rejected positions
     // without needing a full KV restore.
     virtual void seq_cp_recurrent(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
+    virtual void recurrent_copy_profile_reset() {}
+    virtual llama_memory_recurrent_copy_profile recurrent_copy_profile() const { return {}; }
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;

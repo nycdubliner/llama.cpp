@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -21,6 +22,14 @@ struct ggml_backend_buft_comparator {
         return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
     }
 };
+
+static bool dflash_recurrent_profile_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_DFLASH_PROFILE");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
 } // namespace
 
 //
@@ -316,6 +325,14 @@ void llama_memory_recurrent::seq_cp_recurrent_no_sync(llama_seq_id seq_id_src, l
     copy_cell_synchronize = copy_cell_synchronize_prev;
 }
 
+void llama_memory_recurrent::recurrent_copy_profile_reset() {
+    copy_profile = {};
+}
+
+llama_memory_recurrent_copy_profile llama_memory_recurrent::recurrent_copy_profile() const {
+    return copy_profile;
+}
+
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     uint32_t new_head = size;
 
@@ -436,79 +453,156 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     return result;
 }
 
+bool llama_memory_recurrent::build_recurrent_copy_plan() {
+    copy_plan_valid = true;
+    copy_plan_cuda_fast = false;
+    copy_plan_device = -1;
+    copy_plan_entries.clear();
+    copy_plan_fn_copy = nullptr;
+    copy_plan_fn_set_device = nullptr;
+    copy_plan_fn_sync_device = nullptr;
+
+    ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
+    auto fn_ptr_device = cuda_reg
+        ? (dflash_cuda_ptr_device_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_ptr_device")
+        : nullptr;
+    auto fn_copy = cuda_reg
+        ? (dflash_cuda_copy_d2d_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_copy_d2d_no_check")
+        : nullptr;
+    auto fn_set_device = cuda_reg
+        ? (dflash_cuda_set_device_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_set_device")
+        : nullptr;
+    auto fn_sync_device = cuda_reg
+        ? (dflash_cuda_sync_device_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_synchronize_device")
+        : nullptr;
+
+    if (!fn_ptr_device || !fn_copy || !fn_set_device || !fn_sync_device) {
+        return false;
+    }
+
+    auto add_tensor = [&](ggml_tensor * tensor, uint32_t n_embd) {
+        if (!tensor || !tensor->data) {
+            return true;
+        }
+
+        const char * buffer_name = tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : nullptr;
+        if (!buffer_name || std::strncmp(buffer_name, "CUDA", 4) != 0) {
+            return false;
+        }
+
+        int tensor_device = -1;
+        if (!fn_ptr_device(tensor->data, &tensor_device)) {
+            return false;
+        }
+        if (copy_plan_device < 0) {
+            copy_plan_device = tensor_device;
+        } else if (copy_plan_device != tensor_device) {
+            return false;
+        }
+
+        copy_plan_entries.push_back({ tensor, ggml_row_size(tensor->type, n_embd) });
+        return true;
+    };
+
+    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        if (!add_tensor(r_l[il], hparams.n_embd_r()) ||
+            !add_tensor(s_l[il], hparams.n_embd_s())) {
+            copy_plan_entries.clear();
+            copy_plan_device = -1;
+            return false;
+        }
+    }
+
+    if (copy_plan_entries.empty() || copy_plan_device < 0) {
+        return false;
+    }
+
+    copy_plan_fn_copy = fn_copy;
+    copy_plan_fn_set_device = fn_set_device;
+    copy_plan_fn_sync_device = fn_sync_device;
+    copy_plan_cuda_fast = true;
+    return true;
+}
+
+void llama_memory_recurrent::invalidate_recurrent_copy_plan() {
+    copy_plan_valid = false;
+    copy_plan_cuda_fast = false;
+    copy_plan_device = -1;
+    copy_plan_entries.clear();
+    copy_plan_fn_copy = nullptr;
+    copy_plan_fn_set_device = nullptr;
+    copy_plan_fn_sync_device = nullptr;
+}
+
+void llama_memory_recurrent::add_recurrent_copy_profile(const llama_memory_recurrent_copy_profile & profile) {
+    copy_profile.layers_scanned += profile.layers_scanned;
+    copy_profile.tensors_copied += profile.tensors_copied;
+    copy_profile.cuda_d2d_queued += profile.cuda_d2d_queued;
+    copy_profile.fallback_copies += profile.fallback_copies;
+    copy_profile.enqueue_us += profile.enqueue_us;
+    copy_profile.sync_us += profile.sync_us;
+}
+
 void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
     if (i_src == i_dst || i_src < 0 || i_dst < 0) {
         return;
     }
 
+    llama_memory_recurrent_copy_profile profile;
+    profile.layers_scanned = hparams.n_layer;
+    const bool profile_timing = dflash_recurrent_profile_enabled();
+
     // CUDA's generic buffer copy path synchronizes every tensor copy. DFlash
-    // rollback copies both recurrent states across many layers, so enqueue all
-    // D2D copies first and synchronize once when CUDA pointers are available.
-    {
-        using copy_d2d_fn_t = bool (*)(void *, const void *, size_t);
-        using prepare_ptr_fn_t = bool (*)(const void *);
-        using sync_ptr_fn_t = bool (*)(const void *);
-        ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
-        auto fn_prepare = cuda_reg
-            ? (prepare_ptr_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_prepare_ptr")
-            : nullptr;
-        auto fn_copy = cuda_reg
-            ? (copy_d2d_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_copy_d2d_no_check")
-            : nullptr;
-        auto fn_sync = cuda_reg
-            ? (sync_ptr_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_synchronize_ptr")
-            : nullptr;
+    // backup/rollback copies both recurrent states across many layers, so cache
+    // the tensor layout and CUDA device once, enqueue all D2D copies, then sync
+    // once only when the caller requires a visible checkpoint.
+    if (!copy_plan_valid) {
+        build_recurrent_copy_plan();
+    }
+    if (copy_plan_cuda_fast) {
+        bool all_queued = copy_plan_fn_set_device && copy_plan_fn_set_device(copy_plan_device);
+        bool any_queued = false;
+        const int64_t t_enqueue_start = profile_timing ? ggml_time_us() : 0;
 
-        if (fn_prepare && fn_copy && fn_sync) {
-            bool any_queued = false;
-            bool all_queued = true;
-            std::vector<const void *> sync_ptrs;
-
-            auto enqueue_copy = [&](ggml_tensor * tensor, uint32_t n_embd) {
-                if (!tensor || !tensor->data) {
-                    return true;
-                }
-                const char * buffer_name = tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : nullptr;
-                if (!buffer_name || std::strncmp(buffer_name, "CUDA", 4) != 0) {
-                    return false;
-                }
-
-                const size_t row_bytes = ggml_row_size(tensor->type, n_embd);
-                const char * src = (const char *) tensor->data + (size_t) i_src * row_bytes;
-                char * dst = (char *) tensor->data + (size_t) i_dst * row_bytes;
-                if (!fn_prepare(dst)) {
-                    return false;
-                }
-                if (!fn_copy(dst, src, row_bytes)) {
-                    return false;
-                }
-
-                any_queued = true;
-                sync_ptrs.push_back(dst);
-                return true;
-            };
-
-            for (uint32_t il = 0; il < hparams.n_layer; ++il) {
-                all_queued = all_queued && enqueue_copy(r_l[il], hparams.n_embd_r());
-                all_queued = all_queued && enqueue_copy(s_l[il], hparams.n_embd_s());
-                if (!all_queued) {
+        if (all_queued) {
+            for (const recurrent_copy_plan_entry & entry : copy_plan_entries) {
+                const char * src = (const char *) entry.tensor->data + (size_t) i_src * entry.row_bytes;
+                char * dst = (char *) entry.tensor->data + (size_t) i_dst * entry.row_bytes;
+                if (!copy_plan_fn_copy(dst, src, entry.row_bytes)) {
+                    all_queued = false;
                     break;
                 }
+                any_queued = true;
+                profile.tensors_copied++;
+                profile.cuda_d2d_queued++;
             }
+        }
 
-            if (any_queued && !copy_cell_synchronize && all_queued) {
-                return;
-            }
+        if (t_enqueue_start != 0) {
+            profile.enqueue_us += ggml_time_us() - t_enqueue_start;
+        }
 
-            if (any_queued) {
-                bool all_synced = true;
-                for (const void * ptr : sync_ptrs) {
-                    all_synced = fn_sync(ptr) && all_synced;
-                }
-                if (all_queued && all_synced) {
-                    return;
-                }
+        if (any_queued && !copy_cell_synchronize && all_queued) {
+            add_recurrent_copy_profile(profile);
+            return;
+        }
+
+        bool synced = false;
+        if (any_queued && copy_plan_fn_sync_device) {
+            const int64_t t_sync_start = profile_timing ? ggml_time_us() : 0;
+            synced = copy_plan_fn_sync_device(copy_plan_device);
+            if (t_sync_start != 0) {
+                profile.sync_us += ggml_time_us() - t_sync_start;
             }
+        }
+
+        if (all_queued && synced) {
+            add_recurrent_copy_profile(profile);
+            return;
+        }
+
+        if (!all_queued || (any_queued && !synced)) {
+            copy_plan_cuda_fast = false;
         }
     }
 
@@ -530,6 +624,8 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
             src_v->buffer = r_l[il]->buffer;
             dst_v->buffer = r_l[il]->buffer;
             ggml_backend_tensor_copy(src_v, dst_v);
+            profile.tensors_copied++;
+            profile.fallback_copies++;
         }
         if (s_l[il]) {
             const uint32_t n_embd = hparams.n_embd_s();
@@ -539,10 +635,13 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
             src_v->buffer = s_l[il]->buffer;
             dst_v->buffer = s_l[il]->buffer;
             ggml_backend_tensor_copy(src_v, dst_v);
+            profile.tensors_copied++;
+            profile.fallback_copies++;
         }
     }
 
     ggml_free(ctx);
+    add_recurrent_copy_profile(profile);
 }
 
 int llama_memory_recurrent::get_cell_count(llama_seq_id seq_id) const {
@@ -653,6 +752,7 @@ bool llama_memory_recurrent::resize(uint32_t new_mem_size) {
     ctxs_bufs = std::move(new_ctxs_bufs);
     cells.resize(new_mem_size);
     size = new_mem_size;
+    invalidate_recurrent_copy_plan();
 
     const size_t memory_size_r = size_r_bytes();
     const size_t memory_size_s = size_s_bytes();
