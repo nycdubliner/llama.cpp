@@ -1143,6 +1143,15 @@ static void dflash_profile_reset(dflash_capture_data & cap) {
     cap.profile_cb_tape_read = 0;
     cap.profile_cb_qkv_read = 0;
     cap.profile_replay_wait_us = 0;
+    cap.profile_replay_gdn_enqueue_us = 0;
+    cap.profile_replay_gdn_wait_us = 0;
+    cap.profile_replay_conv_enqueue_us = 0;
+    cap.profile_replay_conv_wait_us = 0;
+    cap.profile_replay_layers = 0;
+    cap.profile_replay_sync_calls = 0;
+    cap.profile_replay_direct_gpu = 0;
+    cap.profile_replay_ggml_gpu = 0;
+    cap.profile_replay_cpu_fallback = 0;
     cap.profile_conv_gpu_us = 0;
     cap.profile_conv_read_wait_us = 0;
     cap.profile_conv_cpu_us = 0;
@@ -1190,17 +1199,33 @@ static void dflash_profile_log(const dflash_capture_data & cap, const char * fun
         cap.profile_cb_tape_read,
         cap.profile_cb_qkv_read);
 
-    if (cap.profile_replay_wait_us || cap.profile_conv_gpu_us || cap.profile_conv_read_wait_us ||
-        cap.profile_conv_cpu_us || cap.profile_conv_write_wait_us) {
+    if (cap.profile_replay_wait_us || cap.profile_replay_gdn_enqueue_us || cap.profile_replay_gdn_wait_us ||
+        cap.profile_replay_conv_enqueue_us || cap.profile_replay_conv_wait_us ||
+        cap.profile_conv_gpu_us || cap.profile_conv_read_wait_us ||
+        cap.profile_conv_cpu_us || cap.profile_conv_write_wait_us ||
+        cap.profile_replay_layers || cap.profile_replay_sync_calls ||
+        cap.profile_replay_direct_gpu || cap.profile_replay_ggml_gpu || cap.profile_replay_cpu_fallback) {
         LLAMA_LOG_INFO(
-            "%s: dflash profile: replay_wait=%.3f ms conv_gpu_enqueue=%.3f ms conv_read_wait=%.3f ms "
-            "conv_cpu=%.3f ms conv_write_wait=%.3f ms\n",
+            "%s: dflash profile: replay_path=direct-gpu:%" PRIu64 " replay_path=ggml-gpu:%" PRIu64
+            " replay_path=cpu-fallback:%" PRIu64 " replay_layers=%" PRIu64 " replay_sync_calls=%" PRIu64
+            " gdn_enqueue=%.3f ms gdn_wait=%.3f ms conv_enqueue=%.3f ms conv_wait=%.3f ms "
+            "legacy_replay_wait=%.3f ms legacy_conv_gpu_enqueue=%.3f ms "
+            "legacy_conv_read_wait=%.3f ms legacy_conv_write_wait=%.3f ms conv_cpu=%.3f ms\n",
             func,
+            cap.profile_replay_direct_gpu,
+            cap.profile_replay_ggml_gpu,
+            cap.profile_replay_cpu_fallback,
+            cap.profile_replay_layers,
+            cap.profile_replay_sync_calls,
+            cap.profile_replay_gdn_enqueue_us / 1000.0,
+            cap.profile_replay_gdn_wait_us / 1000.0,
+            cap.profile_replay_conv_enqueue_us / 1000.0,
+            cap.profile_replay_conv_wait_us / 1000.0,
             cap.profile_replay_wait_us / 1000.0,
             cap.profile_conv_gpu_us / 1000.0,
             cap.profile_conv_read_wait_us / 1000.0,
-            cap.profile_conv_cpu_us / 1000.0,
-            cap.profile_conv_write_wait_us / 1000.0);
+            cap.profile_conv_write_wait_us / 1000.0,
+            cap.profile_conv_cpu_us / 1000.0);
     }
 
     if (!cap.profile_cb_names.empty()) {
@@ -2045,6 +2070,50 @@ bool llama_context::dflash_wait_for_gpu_capture_stream() {
     return fn && backend && fn(backend);
 }
 
+bool llama_context::dflash_memory_seq_cp_recurrent_ordered(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        llama_pos    p0,
+        llama_pos    p1) {
+    if (model.n_devices() > 1) {
+        return false;
+    }
+
+    llama_memory_recurrent * mem_recr = get_recurrent_mem(get_memory());
+    if (!mem_recr) {
+        return false;
+    }
+
+    ggml_backend_t gpu_backend = nullptr;
+    ggml_backend_reg_t cuda_reg = nullptr;
+    for (auto & backend : backends) {
+        auto * dev = ggml_backend_get_device(backend.get());
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu_backend = backend.get();
+            cuda_reg = ggml_backend_dev_backend_reg(dev);
+            break;
+        }
+    }
+    if (!gpu_backend || !cuda_reg) {
+        return false;
+    }
+
+    using sync_dflash_stream_to_backend_fn_t = bool (*)(ggml_backend_t);
+    auto fn_wait_backend = (sync_dflash_stream_to_backend_fn_t)
+        ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_backend_wait_for_dflash_stream");
+    if (!fn_wait_backend) {
+        return false;
+    }
+
+    mem_recr->seq_cp_recurrent_no_sync(seq_id_src, seq_id_dst, p0, p1);
+    if (!fn_wait_backend(gpu_backend)) {
+        LLAMA_LOG_ERROR("%s: failed to order DFlash recurrent backup stream before verifier compute\n", __func__);
+        GGML_ABORT("failed to order DFlash recurrent backup stream before verifier compute");
+    }
+
+    return true;
+}
+
 void llama_context::dflash_prefill_capture_begin(llama_seq_id seq_id, int32_t capture_begin, int32_t capture_end) {
     if (!dflash_capture) {
         return;
@@ -2421,6 +2490,7 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         }
 
         // compute: launch GDN ops + state copies on GPU (async — overlap with next draft)
+        const int64_t t_replay_enqueue_us = dflash_capture->profile ? ggml_time_us() : 0;
         const ggml_status replay_status = ggml_backend_graph_compute_async(gpu_backend, graph);
         if (replay_status != GGML_STATUS_SUCCESS) {
             LLAMA_LOG_WARN("%s: GPU DFlash recurrent replay graph failed with status %d; %s\n",
@@ -2433,11 +2503,20 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
             }
             return;
         }
+        if (dflash_capture->profile) {
+            const uint64_t elapsed = ggml_time_us() - t_replay_enqueue_us;
+            dflash_capture->profile_replay_gdn_enqueue_us += elapsed;
+            dflash_capture->profile_conv_gpu_us += elapsed;
+            dflash_capture->profile_replay_ggml_gpu += 1;
+            dflash_capture->profile_replay_layers += inputs.size();
+        }
 
         // save deferred state for async completion
         dflash_capture->replay_pending = true;
         dflash_capture->replay_gpu_backend = gpu_backend;
         dflash_capture->replay_graph_ctx = ctx; // freed in tape_replay_sync
+        dflash_capture->replay_direct_gpu = false;
+        dflash_capture->replay_sync_device = -1;
         dflash_capture->replay_n_accepted = n_accepted;
         dflash_capture->replay_cell_idx = cell_idx;
         dflash_capture->replay_seq_id = seq_id;
@@ -2458,11 +2537,11 @@ bool llama_context::tape_replay_gdn_direct_gpu(llama_memory_recurrent * mem_recu
     if (!cuda_reg) {
         return false;
     }
-    using prepare_ptr_fn_t = bool (*)(const void *);
+    using ptr_device_fn_t = bool (*)(const void *, int *);
     using replay_fn_t = bool (*)(void *, const void *, const void *, const void *, const void *, int, int, int, int);
-    auto fn_prepare = (prepare_ptr_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_prepare_ptr");
+    auto fn_ptr_device = (ptr_device_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_ptr_device");
     auto fn_replay = (replay_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_replay_gdn_state_no_check");
-    if (!fn_prepare || !fn_replay) {
+    if (!fn_ptr_device || !fn_replay) {
         return false;
     }
 
@@ -2482,6 +2561,7 @@ bool llama_context::tape_replay_gdn_direct_gpu(llama_memory_recurrent * mem_recu
         int S;
         int H_k;
         int H_v;
+        int device;
     };
     std::vector<replay_launch> launches;
     launches.reserve(rec_ids.size());
@@ -2532,30 +2612,42 @@ bool llama_context::tape_replay_gdn_direct_gpu(llama_memory_recurrent * mem_recu
             (int) S_i64,
             (int) H_k_i64,
             (int) H_v_i64,
+            -1,
         });
     }
 
     if (launches.empty()) {
         return false;
     }
-    for (const auto & launch : launches) {
-        if (!fn_prepare(launch.state)) {
+    int replay_device = -1;
+    for (auto & launch : launches) {
+        int device = -1;
+        if (!fn_ptr_device(launch.state, &device)) {
             return false;
         }
+        if (replay_device < 0) {
+            replay_device = device;
+        } else if (device != replay_device) {
+            return false;
+        }
+        launch.device = device;
     }
 
     const int64_t t_start_us = dflash_capture->profile ? ggml_time_us() : 0;
     dflash_capture->replay_sync_ptrs.clear();
+    dflash_capture->replay_sync_device = replay_device;
     for (const auto & launch : launches) {
-        if (!fn_prepare(launch.state) ||
-                !fn_replay(launch.state, launch.k, launch.v, launch.gate, launch.beta,
+        if (!fn_replay(launch.state, launch.k, launch.v, launch.gate, launch.beta,
                     n_accepted, launch.S, launch.H_k, launch.H_v)) {
             GGML_ABORT("DFlash direct GPU GDN replay launch failed after validation\n");
         }
-        dflash_capture->replay_sync_ptrs.push_back(launch.state);
     }
     if (dflash_capture->profile) {
-        dflash_capture->profile_conv_gpu_us += ggml_time_us() - t_start_us;
+        const uint64_t elapsed = ggml_time_us() - t_start_us;
+        dflash_capture->profile_replay_gdn_enqueue_us += elapsed;
+        dflash_capture->profile_conv_gpu_us += elapsed;
+        dflash_capture->profile_replay_direct_gpu += 1;
+        dflash_capture->profile_replay_layers += launches.size();
     }
     dflash_capture->replay_sync_ptr = launches.back().state;
     return true;
@@ -2825,7 +2917,9 @@ bool llama_context::tape_replay_conv_gpu(llama_memory_recurrent * mem_recurrent,
         }
     }
     if (dflash_capture->profile) {
-        dflash_capture->profile_conv_gpu_us += ggml_time_us() - t_gpu_start_us;
+        const uint64_t elapsed = ggml_time_us() - t_gpu_start_us;
+        dflash_capture->profile_replay_conv_enqueue_us += elapsed;
+        dflash_capture->profile_conv_gpu_us += elapsed;
     }
 
     if (advance_pos) {
@@ -3127,7 +3221,9 @@ void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int
         const int64_t t_start_us = dflash_capture->profile ? ggml_time_us() : 0;
         ggml_backend_synchronize(gpu_backend);
         if (dflash_capture->profile) {
-            dflash_capture->profile_conv_read_wait_us += ggml_time_us() - t_start_us;
+            const uint64_t elapsed = ggml_time_us() - t_start_us;
+            dflash_capture->profile_conv_read_wait_us += elapsed;
+            dflash_capture->profile_replay_conv_wait_us += elapsed;
         }
     }
 
@@ -3159,7 +3255,9 @@ void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int
         const int64_t t_start_us = dflash_capture->profile ? ggml_time_us() : 0;
         ggml_backend_synchronize(gpu_backend);
         if (dflash_capture->profile) {
-            dflash_capture->profile_conv_write_wait_us += ggml_time_us() - t_start_us;
+            const uint64_t elapsed = ggml_time_us() - t_start_us;
+            dflash_capture->profile_conv_write_wait_us += elapsed;
+            dflash_capture->profile_replay_conv_wait_us += elapsed;
         }
     }
 
@@ -3188,31 +3286,50 @@ void llama_context::tape_replay_sync() {
             ggml_backend_synchronize(backend);
         }
         if (dflash_capture->profile) {
-            dflash_capture->profile_replay_wait_us += ggml_time_us() - t_start_us;
+            const uint64_t elapsed = ggml_time_us() - t_start_us;
+            dflash_capture->profile_replay_wait_us += elapsed;
+            dflash_capture->profile_replay_gdn_wait_us += elapsed;
+            dflash_capture->profile_replay_sync_calls += 1;
         }
     } else if (dflash_capture->replay_direct_gpu &&
             (!dflash_capture->replay_sync_ptrs.empty() || dflash_capture->replay_sync_ptr)) {
         const int64_t t_start_us = dflash_capture->profile ? ggml_time_us() : 0;
         ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
         using sync_ptr_fn_t = bool (*)(const void *);
-        auto fn_sync = cuda_reg
+        using sync_device_fn_t = bool (*)(int);
+        auto fn_sync_ptr = cuda_reg
             ? (sync_ptr_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_synchronize_ptr")
             : nullptr;
-        bool synced = fn_sync != nullptr;
-        if (fn_sync) {
-            if (!dflash_capture->replay_sync_ptrs.empty()) {
+        auto fn_sync_device = cuda_reg
+            ? (sync_device_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_synchronize_device")
+            : nullptr;
+        bool synced = false;
+        uint64_t sync_calls = 0;
+        if (fn_sync_device && dflash_capture->replay_sync_device >= 0) {
+            synced = fn_sync_device(dflash_capture->replay_sync_device);
+            sync_calls = 1;
+        } else if (fn_sync_ptr) {
+            if (dflash_capture->replay_sync_ptr) {
+                synced = fn_sync_ptr(dflash_capture->replay_sync_ptr);
+                sync_calls = 1;
+            } else if (!dflash_capture->replay_sync_ptrs.empty()) {
+                synced = true;
                 for (const void * ptr : dflash_capture->replay_sync_ptrs) {
-                    synced = fn_sync(ptr) && synced;
+                    synced = fn_sync_ptr(ptr) && synced;
+                    sync_calls++;
                 }
             } else {
-                synced = fn_sync(dflash_capture->replay_sync_ptr);
+                synced = false;
             }
         }
         if (!synced) {
             LLAMA_LOG_WARN("%s: direct GPU tape replay sync failed\n", __func__);
         }
         if (dflash_capture->profile) {
-            dflash_capture->profile_replay_wait_us += ggml_time_us() - t_start_us;
+            const uint64_t elapsed = ggml_time_us() - t_start_us;
+            dflash_capture->profile_replay_wait_us += elapsed;
+            dflash_capture->profile_replay_gdn_wait_us += elapsed;
+            dflash_capture->profile_replay_sync_calls += sync_calls;
         }
     }
 
@@ -3231,20 +3348,33 @@ void llama_context::tape_replay_sync() {
 
     if (dflash_capture->profile) {
         LLAMA_LOG_INFO(
-            "%s: dflash profile: replay_wait=%.3f ms conv_gpu_enqueue=%.3f ms conv_read_wait=%.3f ms "
-            "conv_cpu=%.3f ms conv_write_wait=%.3f ms\n",
+            "%s: dflash profile: replay_path=direct-gpu:%" PRIu64 " replay_path=ggml-gpu:%" PRIu64
+            " replay_path=cpu-fallback:%" PRIu64 " replay_layers=%" PRIu64 " replay_sync_calls=%" PRIu64
+            " gdn_enqueue=%.3f ms gdn_wait=%.3f ms conv_enqueue=%.3f ms conv_wait=%.3f ms "
+            "legacy_replay_wait=%.3f ms legacy_conv_gpu_enqueue=%.3f ms "
+            "legacy_conv_read_wait=%.3f ms legacy_conv_write_wait=%.3f ms conv_cpu=%.3f ms\n",
             __func__,
+            dflash_capture->profile_replay_direct_gpu,
+            dflash_capture->profile_replay_ggml_gpu,
+            dflash_capture->profile_replay_cpu_fallback,
+            dflash_capture->profile_replay_layers,
+            dflash_capture->profile_replay_sync_calls,
+            dflash_capture->profile_replay_gdn_enqueue_us / 1000.0,
+            dflash_capture->profile_replay_gdn_wait_us / 1000.0,
+            dflash_capture->profile_replay_conv_enqueue_us / 1000.0,
+            dflash_capture->profile_replay_conv_wait_us / 1000.0,
             dflash_capture->profile_replay_wait_us / 1000.0,
             dflash_capture->profile_conv_gpu_us / 1000.0,
             dflash_capture->profile_conv_read_wait_us / 1000.0,
-            dflash_capture->profile_conv_cpu_us / 1000.0,
-            dflash_capture->profile_conv_write_wait_us / 1000.0);
+            dflash_capture->profile_conv_write_wait_us / 1000.0,
+            dflash_capture->profile_conv_cpu_us / 1000.0);
     }
 
     dflash_capture->replay_pending = false;
     dflash_capture->replay_direct_gpu = false;
     dflash_capture->replay_sync_ptr = nullptr;
     dflash_capture->replay_sync_ptrs.clear();
+    dflash_capture->replay_sync_device = -1;
 }
 
 // CPU fallback for tape replay (used when no GPU backend available)
@@ -3253,6 +3383,10 @@ void llama_context::tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int3
     const auto & rec_ids = dflash_capture->recurrent_layer_ids;
     auto & tape_layers   = dflash_capture->tape_layers;
     const uint32_t n_embd_s = hparams.n_embd_s();
+    if (dflash_capture->profile) {
+        dflash_capture->profile_replay_cpu_fallback += 1;
+        dflash_capture->profile_replay_layers += rec_ids.size();
+    }
 
     for (size_t li = 0; li < rec_ids.size(); ++li) {
         int il = rec_ids[li];
@@ -3316,6 +3450,7 @@ void llama_context::dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup
     int64_t attn_us = 0;
     int64_t recurrent_restore_us = 0;
     int64_t tape_launch_us = 0;
+    llama_memory_recurrent_copy_profile recurrent_restore_profile = {};
     auto profile_lap = [&](int64_t & dst) {
         if (!profile) {
             return;
@@ -3344,7 +3479,13 @@ void llama_context::dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup
 
     // Recurrent state: restore from backup, then tape replay
     mem_recr->seq_rm(seq_id, -1, -1);
+    if (profile) {
+        mem_recr->recurrent_copy_profile_reset();
+    }
     mem_recr->seq_cp_recurrent_no_sync(seq_backup, seq_id, -1, -1);
+    if (profile) {
+        recurrent_restore_profile = mem_recr->recurrent_copy_profile();
+    }
     mem_recr->seq_rm(seq_backup, -1, -1);
     profile_lap(recurrent_restore_us);
 
@@ -3355,10 +3496,19 @@ void llama_context::dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup
     if (profile) {
         LLAMA_LOG_INFO(
             "%s: dflash profile: rollback accepted=%d attn=%.3f ms recurrent_restore=%.3f ms "
-            "tape_launch=%.3f ms total=%.3f ms\n",
+            "rollback_restore_enqueue=%.3f ms rollback_restore_sync=%.3f ms "
+            "rollback_restore_layers=%" PRIu64 " rollback_restore_tensors=%" PRIu64
+            " rollback_restore_cuda_d2d=%" PRIu64 " rollback_restore_fallback=%" PRIu64
+            " tape_launch=%.3f ms total=%.3f ms\n",
             __func__, n_accepted,
             attn_us / 1e3,
             recurrent_restore_us / 1e3,
+            recurrent_restore_profile.enqueue_us / 1e3,
+            recurrent_restore_profile.sync_us / 1e3,
+            recurrent_restore_profile.layers_scanned,
+            recurrent_restore_profile.tensors_copied,
+            recurrent_restore_profile.cuda_d2d_queued,
+            recurrent_restore_profile.fallback_copies,
             tape_launch_us / 1e3,
             (ggml_time_us() - t_start_us) / 1e3);
     }
@@ -3539,6 +3689,10 @@ bool llama_context::dflash_kv_cache_init(int ctx_size) {
         ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_prepare_ptr");
     auto fn_sync_ptr = (dflash_kv_cache_data::sync_ptr_fn_t)
         ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_synchronize_ptr");
+    auto fn_wait_backend_stream = (dflash_kv_cache_data::sync_backend_stream_fn_t)
+        ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_backend_wait_for_stream");
+    auto fn_wait_dflash_stream = (dflash_kv_cache_data::sync_backend_stream_fn_t)
+        ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_backend_wait_for_dflash_stream");
     auto fn_interleave = (dflash_kv_cache_data::interleave_fn_t)
         ggml_backend_reg_get_proc_address(cuda_reg, "dflash_kv_cache_interleave");
     if (!fn_write_d2d || !fn_append_d2d || !fn_interleave) {
@@ -3569,6 +3723,8 @@ bool llama_context::dflash_kv_cache_init(int ctx_size) {
     cache->fn_append_d2d_no_check = fn_append_d2d_no_check;
     cache->fn_prepare_ptr = fn_prepare_ptr;
     cache->fn_sync_ptr = fn_sync_ptr;
+    cache->fn_wait_backend_stream = fn_wait_backend_stream;
+    cache->fn_wait_dflash_stream = fn_wait_dflash_stream;
     cache->fn_interleave = fn_interleave;
     cache->view.n_layers = n_layers;
     cache->view.n_embd_head = n_embd_head;
@@ -3706,7 +3862,10 @@ bool llama_context::dflash_kv_cache_update(int n_tokens) {
     if (status != GGML_STATUS_SUCCESS) {
         return false;
     }
-    ggml_backend_synchronize(gpu_backend);
+    if (!dflash_kv_cache->fn_wait_backend_stream ||
+            !dflash_kv_cache->fn_wait_backend_stream(gpu_backend)) {
+        ggml_backend_synchronize(gpu_backend);
+    }
 
     const int n_layers = dflash_kv_cache->view.n_layers;
     if ((int) res->dflash_k_update.size() < n_layers || (int) res->dflash_v_update.size() < n_layers) {
@@ -3717,7 +3876,6 @@ bool llama_context::dflash_kv_cache_update(int n_tokens) {
     const bool fast_append =
         dflash_kv_cache->fn_append_d2d_no_check &&
         dflash_kv_cache->fn_prepare_ptr &&
-        dflash_kv_cache->fn_sync_ptr &&
         !dflash_kv_cache->k_ring.empty() &&
         dflash_kv_cache->fn_prepare_ptr(dflash_kv_cache->k_ring[0]->data);
     const auto fn_append = fast_append ? dflash_kv_cache->fn_append_d2d_no_check
@@ -3743,8 +3901,14 @@ bool llama_context::dflash_kv_cache_update(int n_tokens) {
         }
     }
 
-    if (fast_append && !dflash_kv_cache->fn_sync_ptr(dflash_kv_cache->k_ring[0]->data)) {
-        return false;
+    if (fast_append) {
+        if (dflash_kv_cache->fn_wait_dflash_stream) {
+            if (!dflash_kv_cache->fn_wait_dflash_stream(gpu_backend)) {
+                return false;
+            }
+        } else if (!dflash_kv_cache->fn_sync_ptr || !dflash_kv_cache->fn_sync_ptr(dflash_kv_cache->k_ring[0]->data)) {
+            return false;
+        }
     }
 
     dflash_kv_cache->write_pos = 0;
@@ -7048,6 +7212,15 @@ void llama_tape_replay(llama_context * ctx, llama_seq_id seq_id, int n_accepted)
 
 void llama_tape_replay_sync(llama_context * ctx) {
     ctx->tape_replay_sync();
+}
+
+bool llama_dflash_memory_seq_cp_recurrent_ordered(
+        llama_context * ctx,
+        llama_seq_id   seq_id_src,
+        llama_seq_id   seq_id_dst,
+        llama_pos      p0,
+        llama_pos      p1) {
+    return ctx ? ctx->dflash_memory_seq_cp_recurrent_ordered(seq_id_src, seq_id_dst, p0, p1) : false;
 }
 
 void llama_dflash_rollback(llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted) {

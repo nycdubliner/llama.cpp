@@ -67,6 +67,11 @@ int main(int argc, char ** argv) {
     const std::string download_cpp = read_file(root + "/common/download.cpp");
     const std::string arg_cpp = read_file(root + "/common/arg.cpp");
     const std::string dflash_draft = read_file(root + "/src/models/dflash_draft.cpp");
+    const std::string memory_h = read_file(root + "/src/llama-memory.h");
+    const std::string memory_hybrid_h = read_file(root + "/src/llama-memory-hybrid.h");
+    const std::string memory_hybrid = read_file(root + "/src/llama-memory-hybrid.cpp");
+    const std::string memory_hybrid_iswa_h = read_file(root + "/src/llama-memory-hybrid-iswa.h");
+    const std::string memory_hybrid_iswa = read_file(root + "/src/llama-memory-hybrid-iswa.cpp");
     const std::string memory_recurrent = read_file(root + "/src/llama-memory-recurrent.cpp");
     const std::string qwen35 = read_file(root + "/src/models/qwen35.cpp");
     const std::string qwen35moe = read_file(root + "/src/models/qwen35moe.cpp");
@@ -216,7 +221,10 @@ int main(int argc, char ** argv) {
     ok &= expect(context_h.find("fn_append_d2d_no_check") != std::string::npos, "DFlash K/V cache must track hot-loop append helper");
     ok &= expect(context_h.find("fn_sync_ptr") != std::string::npos, "DFlash K/V cache no-sync appends must have a batched stream-sync helper");
     ok &= expect(context_cpp.find("fn_append_d2d_no_check") != std::string::npos, "DFlash K/V cache update must prefer no-sync hot-loop append helper");
-    ok &= expect(context_cpp.find("fast_append && !dflash_kv_cache->fn_sync_ptr") != std::string::npos, "DFlash K/V cache no-sync appends must synchronize before the drafter graph reads cached K/V");
+    ok &= expect(context_cpp.find("if (fast_append)") != std::string::npos &&
+                 context_cpp.find("dflash_kv_cache->fn_wait_dflash_stream(gpu_backend)") != std::string::npos &&
+                 context_cpp.find("dflash_kv_cache->fn_sync_ptr(dflash_kv_cache->k_ring[0]->data)") != std::string::npos,
+        "DFlash K/V cache no-sync appends must synchronize or stream-order before the drafter graph reads cached K/V");
     ok &= expect(cuda_ring.find("dflash_kv_cache_append_d2d_no_check") != std::string::npos, "CUDA backend must provide no-sync DFlash K/V cache appends");
     ok &= expect(cuda_reg.find("\"dflash_kv_cache_append_d2d_no_check\"") != std::string::npos, "CUDA backend registry must publish no-sync DFlash K/V cache appends");
     ok &= expect(speculative.find("common_batch_add(batch_dft, id_last, cross_len, { seq_id }, true);") != std::string::npos, "DFlash flat/tree drafts must preserve seed-token logits for row alignment");
@@ -309,8 +317,10 @@ int main(int argc, char ** argv) {
     ok &= expect(context_cpp.find("tape_replay_conv_gpu_from_cpu_tape(mem_recurrent, cell_idx, n_accepted, seq_id)") != std::string::npos, "split-device DFlash conv rebuild must try CUDA rebuild from CPU tape before CPU fallback");
     ok &= expect(context_cpp.find("const int64_t hk = hv % H_k;") != std::string::npos, "CPU DFlash GDN replay fallback must match CUDA head mapping");
     ok &= expect(context_cpp.find("hv / head_ratio") == std::string::npos, "CPU DFlash GDN replay must not use grouped value-to-key head mapping");
-    ok &= expect(context_cpp.find("fn_prepare(launch.state)") != std::string::npos, "direct DFlash GPU replay must set the current CUDA device per recurrent layer");
-    ok &= expect(context_cpp.find("for (const void * ptr : dflash_capture->replay_sync_ptrs)") != std::string::npos, "direct DFlash GPU replay sync must wait on every touched CUDA device");
+    ok &= expect(context_cpp.find("fn_ptr_device(launch.state, &device)") != std::string::npos,
+        "direct DFlash GPU replay must resolve the CUDA device while validating recurrent state pointers");
+    ok &= expect(context_cpp.find("fn_sync_device(dflash_capture->replay_sync_device)") != std::string::npos,
+        "direct DFlash GPU replay sync must wait once on the validated replay CUDA device");
     ok &= expect(context_cpp.find("const ggml_status replay_status = ggml_backend_graph_compute_async(gpu_backend, graph);") != std::string::npos, "DFlash GPU replay graph launch status must be checked");
     ok &= expect(context_cpp.find("GPU DFlash recurrent replay graph failed") != std::string::npos, "DFlash GPU replay graph failure must fall back instead of leaving pending replay state");
     ok &= expect(context_cpp.find("dflash_replay_gdn_state_no_check") != std::string::npos, "DFlash direct replay must call CUDA GDN replay helper");
@@ -324,11 +334,46 @@ int main(int argc, char ** argv) {
     ok &= expect(cuda_ring.find("dflash_cuda_copy_d2d_no_check") != std::string::npos, "CUDA ring source must provide hot-loop D2D copy helper without per-copy pointer validation");
     ok &= expect(cuda_reg.find("\"dflash_cuda_copy_d2d_no_check\"") != std::string::npos, "CUDA backend registry must publish hot-loop D2D copy helper");
     ok &= expect(memory_recurrent.find("dflash_cuda_copy_d2d_no_check") != std::string::npos, "recurrent rollback copy must use the batched D2D helper");
-    ok &= expect(memory_recurrent.find("fn_prepare(dst)") != std::string::npos, "split recurrent rollback copy must prepare the CUDA device for each destination tensor");
-    ok &= expect(memory_recurrent.find("sync_ptrs.push_back(dst)") != std::string::npos, "split recurrent rollback copy must remember every device stream that may need synchronization");
+    ok &= expect(cuda_ring.find("dflash_cuda_set_device") != std::string::npos &&
+                 cuda_reg.find("\"dflash_cuda_set_device\"") != std::string::npos,
+        "CUDA backend must expose a DFlash set-device helper for prevalidated hot-loop copies");
+    ok &= expect(memory_recurrent.find("dflash_cuda_ptr_device") != std::string::npos,
+        "recurrent copy plan must validate CUDA device pointers when the plan is built");
+    ok &= expect(memory_recurrent.find("dflash_cuda_set_device") != std::string::npos,
+        "recurrent copy hot path must set the cached CUDA device without per-tensor pointer validation");
+    ok &= expect(memory_recurrent.find("dflash_cuda_synchronize_device") != std::string::npos,
+        "recurrent backup copy must synchronize once on the cached CUDA device");
+    ok &= expect(memory_recurrent.find("fn_prepare(dst)") == std::string::npos,
+        "recurrent copy hot path must not prepare every destination tensor");
+    ok &= expect(memory_recurrent.find("sync_ptrs.push_back(dst)") == std::string::npos,
+        "recurrent backup copy must not retain one sync pointer per recurrent tensor");
+    ok &= expect(memory_recurrent.find("build_recurrent_copy_plan") != std::string::npos &&
+                 memory_recurrent.find("copy_plan_valid = false") != std::string::npos,
+        "recurrent memory must cache and invalidate its CUDA copy plan");
     ok &= expect(memory_recurrent.find("seq_cp_recurrent_no_sync") != std::string::npos, "recurrent memory must expose DFlash no-sync restore");
     ok &= expect(context_cpp.find("seq_cp_recurrent_no_sync(seq_backup, seq_id") != std::string::npos, "DFlash rollback must avoid synchronous recurrent restore before replay");
     ok &= expect(context_cpp.find("recurrent_restore=%.3f ms") != std::string::npos, "DFlash rollback profiling must expose recurrent restore cost");
+    ok &= expect(context_cpp.find("rollback_restore_enqueue=") != std::string::npos &&
+                 context_cpp.find("rollback_restore_sync=") != std::string::npos &&
+                 context_cpp.find("rollback_restore_fallback=") != std::string::npos,
+        "DFlash rollback profiling must expose recurrent restore enqueue/sync/fallback counters");
+    ok &= expect(memory_h.find("llama_memory_recurrent_copy_profile") != std::string::npos &&
+                 memory_h.find("layers_scanned") != std::string::npos &&
+                 memory_h.find("cuda_d2d_queued") != std::string::npos &&
+                 memory_h.find("fallback_copies") != std::string::npos,
+        "recurrent memory must expose copy profile counters for DFlash CPU-bubble diagnostics");
+    ok &= expect(memory_hybrid_h.find("recurrent_copy_profile_reset() override") != std::string::npos &&
+                 memory_hybrid.find("mem_recr->recurrent_copy_profile_reset()") != std::string::npos &&
+                 memory_hybrid.find("return mem_recr->recurrent_copy_profile()") != std::string::npos,
+        "hybrid memory must forward recurrent copy profile counters from the recurrent cache");
+    ok &= expect(memory_hybrid_iswa_h.find("recurrent_copy_profile_reset() override") != std::string::npos &&
+                 memory_hybrid_iswa.find("mem_recr->recurrent_copy_profile_reset()") != std::string::npos &&
+                 memory_hybrid_iswa.find("return mem_recr->recurrent_copy_profile()") != std::string::npos,
+        "hybrid-ISWA memory must forward recurrent copy profile counters from the recurrent cache");
+    ok &= expect(server_context.find("backup_enqueue=") != std::string::npos &&
+                 server_context.find("backup_sync=") != std::string::npos &&
+                 server_context.find("backup_fallback=") != std::string::npos,
+        "server DFlash cycle log must surface recurrent backup enqueue/sync/fallback counters");
     ok &= expect(cuda_cpp.find("ggml_cuda_buffer_visible_to_backend(ggml_backend_cuda_context * cuda_ctx") != std::string::npos, "CUDA backend must centralize backend buffer visibility checks");
     ok &= expect(cuda_cpp.find("ggml_backend_cuda_buffer_matches_backend") != std::string::npos, "CUDA async tensor access must share backend/buffer ownership checks");
     ok &= expect(cuda_cpp.find("ggml_backend_tensor_get(tensor, data, offset, size);") != std::string::npos, "CUDA async tensor reads must fall back to the tensor's owning buffer instead of asserting on wrong-device buffers");
@@ -382,6 +427,52 @@ int main(int argc, char ** argv) {
     ok &= expect(context_cpp.find("raw_logits_skipped=") != std::string::npos &&
                  context_cpp.find("raw_logits_skipped_bytes_est=") != std::string::npos,
         "DFlash profile log must print skipped raw-logit rows and estimated bytes");
+    ok &= expect(context_h.find("profile_replay_gdn_enqueue_us") != std::string::npos &&
+                 context_h.find("profile_replay_gdn_wait_us") != std::string::npos &&
+                 context_h.find("profile_replay_conv_enqueue_us") != std::string::npos &&
+                 context_h.find("profile_replay_conv_wait_us") != std::string::npos,
+        "DFlash profile must split Qwen replay into GDN enqueue/wait and conv enqueue/wait substages");
+    ok &= expect(context_h.find("profile_replay_layers") != std::string::npos &&
+                 context_h.find("profile_replay_sync_calls") != std::string::npos,
+        "DFlash profile must count replayed recurrent layers and CUDA sync calls");
+    ok &= expect(context_cpp.find("replay_path=direct-gpu") != std::string::npos &&
+                 context_cpp.find("replay_path=ggml-gpu") != std::string::npos &&
+                 context_cpp.find("replay_path=cpu-fallback") != std::string::npos,
+        "DFlash profile log must name the replay backend path");
+    ok &= expect(cuda_ring.find("dflash_cuda_synchronize_device") != std::string::npos &&
+                 cuda_cpp.find("dflash_cuda_synchronize_device") != std::string::npos,
+        "CUDA backend must expose single-device DFlash stream synchronization");
+    ok &= expect(cuda_cpp.find("dflash_cuda_backend_wait_for_dflash_stream") != std::string::npos &&
+                 cuda_cpp.find("cudaEventRecord(event, cudaStreamPerThread)") != std::string::npos &&
+                 cuda_cpp.find("cudaStreamWaitEvent(cuda_ctx->stream(), event, 0)") != std::string::npos,
+        "CUDA backend must expose an event wait from the DFlash per-thread stream to the GGML compute stream");
+    ok &= expect(context_cpp.find("dflash_cuda_synchronize_device") != std::string::npos &&
+                 context_cpp.find("replay_sync_device") != std::string::npos,
+        "direct GPU tape replay must synchronize the relevant device once instead of per recurrent layer");
+    ok &= expect(context_h.find("dflash_memory_seq_cp_recurrent_ordered") != std::string::npos &&
+                 context_cpp.find("seq_cp_recurrent_no_sync(seq_id_src, seq_id_dst") != std::string::npos &&
+                 context_cpp.find("dflash_cuda_backend_wait_for_dflash_stream") != std::string::npos,
+        "DFlash recurrent backup must copy without host sync and order the verifier backend stream after the DFlash stream");
+    ok &= expect(llama_h.find("llama_dflash_memory_seq_cp_recurrent_ordered") != std::string::npos &&
+                 context_cpp.find("bool llama_dflash_memory_seq_cp_recurrent_ordered(") != std::string::npos,
+        "DFlash ordered recurrent backup must be exported through the C API for Windows DLL consumers");
+    ok &= expect(context_h.find("fn_wait_backend_stream") != std::string::npos &&
+                 context_h.find("fn_wait_dflash_stream") != std::string::npos &&
+                 context_cpp.find("dflash_cuda_backend_wait_for_stream") != std::string::npos &&
+                 context_cpp.find("dflash_kv_cache->fn_wait_backend_stream(gpu_backend)") != std::string::npos &&
+                 context_cpp.find("dflash_kv_cache->fn_wait_dflash_stream(gpu_backend)") != std::string::npos,
+        "DFlash drafter K/V cache update must use stream ordering around async append with host-sync fallback");
+    ok &= expect(server_context.find("dflash_backup_recurrent_state") != std::string::npos &&
+                 server_context.find("llama_dflash_memory_seq_cp_recurrent_ordered") != std::string::npos,
+        "server DFlash recurrent backup must use the ordered async backup path when available");
+    ok &= expect(server_context.find("t_replay_sync_total") != std::string::npos &&
+                 server_context.find("t_recurrent_backup_total") != std::string::npos &&
+                 server_context.find("t_tape_record_total") != std::string::npos,
+        "server DFlash profile must account for replay sync, recurrent backup, and tape-recording subcomponents");
+    ok &= expect(server_context.find("replay_sync=") != std::string::npos &&
+                 server_context.find("recurrent_backup=") != std::string::npos &&
+                 server_context.find("tape_record=") != std::string::npos,
+        "server speculative cycle log must print DFlash CPU-bubble subcomponents");
     ok &= expect(server_context.find("dflash_log_reduced_verify_decision") != std::string::npos &&
                  server_context.find("dflash reduced verifier decision:") != std::string::npos,
         "server must log one reduced-verifier batch decision behind GGML_DFLASH_PROFILE");

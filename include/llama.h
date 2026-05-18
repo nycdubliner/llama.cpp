@@ -1175,6 +1175,16 @@ extern "C" {
     // DFlash: wait for async tape replay to complete (must be called before next verify)
     LLAMA_API void llama_tape_replay_sync(struct llama_context * ctx);
 
+    // DFlash: recurrent-only backup copy with CUDA stream ordering when available.
+    // Returns false when the ordered async path is unavailable and the caller should
+    // use llama_memory_seq_cp_recurrent() as the synchronous fallback.
+    LLAMA_API bool llama_dflash_memory_seq_cp_recurrent_ordered(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id_src,
+            llama_seq_id           seq_id_dst,
+            llama_pos              p0,
+            llama_pos              p1);
+
     // DFlash: prepare DeltaNet state for branch verification (Phase 2 multi-pass)
     // Restores recurrent state from backup and tape-replays to given depth.
     // Does NOT touch attention KV cache or destroy the backup.

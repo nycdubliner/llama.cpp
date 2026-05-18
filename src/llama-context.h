@@ -222,6 +222,15 @@ struct dflash_capture_data {
     uint64_t profile_cb_tape_read = 0;
     uint64_t profile_cb_qkv_read = 0;
     uint64_t profile_replay_wait_us = 0;
+    uint64_t profile_replay_gdn_enqueue_us = 0;
+    uint64_t profile_replay_gdn_wait_us = 0;
+    uint64_t profile_replay_conv_enqueue_us = 0;
+    uint64_t profile_replay_conv_wait_us = 0;
+    uint64_t profile_replay_layers = 0;
+    uint64_t profile_replay_sync_calls = 0;
+    uint64_t profile_replay_direct_gpu = 0;
+    uint64_t profile_replay_ggml_gpu = 0;
+    uint64_t profile_replay_cpu_fallback = 0;
     uint64_t profile_conv_gpu_us = 0;
     uint64_t profile_conv_read_wait_us = 0;
     uint64_t profile_conv_cpu_us = 0;
@@ -301,6 +310,7 @@ struct dflash_capture_data {
     bool replay_direct_gpu = false;
     const void * replay_sync_ptr = nullptr;
     std::vector<const void *> replay_sync_ptrs;
+    int replay_sync_device = -1;
     int replay_n_accepted = 0;
     int32_t replay_cell_idx = -1;
     llama_seq_id replay_seq_id = 0;
@@ -339,12 +349,15 @@ struct dflash_kv_cache_data {
     using append_d2d_fn_t = bool (*)(void *, const void *, int, int, int, int);
     using prepare_ptr_fn_t = bool (*)(const void *);
     using sync_ptr_fn_t = bool (*)(const void *);
+    using sync_backend_stream_fn_t = bool (*)(ggml_backend_t);
     using interleave_fn_t = bool (*)(const void *, void *, int, int, int, int, int);
     write_d2d_fn_t fn_write_d2d = nullptr;
     append_d2d_fn_t fn_append_d2d = nullptr;
     append_d2d_fn_t fn_append_d2d_no_check = nullptr;
     prepare_ptr_fn_t fn_prepare_ptr = nullptr;
     sync_ptr_fn_t fn_sync_ptr = nullptr;
+    sync_backend_stream_fn_t fn_wait_backend_stream = nullptr;
+    sync_backend_stream_fn_t fn_wait_dflash_stream = nullptr;
     interleave_fn_t fn_interleave = nullptr;
 
     ~dflash_kv_cache_data() {
@@ -621,6 +634,7 @@ public:
     bool tape_replay_conv_gpu_from_cpu_tape(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id);
     void tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id = 0);
     void tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
+    bool dflash_memory_seq_cp_recurrent_ordered(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
 
     // DFlash: complete rollback for hybrid models (KV trim + recurrent restore + tape replay)
     void dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted);

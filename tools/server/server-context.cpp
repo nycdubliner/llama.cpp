@@ -16,6 +16,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "src/llama-memory.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -3473,6 +3474,51 @@ private:
         int64_t t_draft_total = 0;
         int64_t t_verify_total = 0;
         int64_t t_accept_total = 0;
+        int64_t t_replay_sync_total = 0;
+        int64_t t_recurrent_backup_total = 0;
+        int64_t t_tape_record_total = 0;
+        uint64_t recurrent_backup_layers = 0;
+        uint64_t recurrent_backup_tensors = 0;
+        uint64_t recurrent_backup_cuda_d2d = 0;
+        uint64_t recurrent_backup_fallback = 0;
+        uint64_t recurrent_backup_enqueue_us = 0;
+        uint64_t recurrent_backup_sync_us = 0;
+        const bool profile_dflash_cycle = dflash_server_profile_enabled();
+        auto dflash_profile_start = [&]() -> int64_t {
+            return profile_dflash_cycle ? ggml_time_us() : 0;
+        };
+        auto dflash_profile_add = [&](int64_t & total, int64_t start) {
+            if (start != 0) {
+                total += ggml_time_us() - start;
+            }
+        };
+        auto dflash_recurrent_profile_reset = [&](llama_memory_t mem) {
+            if (profile_dflash_cycle && mem) {
+                mem->recurrent_copy_profile_reset();
+            }
+        };
+        auto dflash_recurrent_profile_collect = [&](llama_memory_t mem) {
+            if (!profile_dflash_cycle || !mem) {
+                return;
+            }
+            const llama_memory_recurrent_copy_profile profile = mem->recurrent_copy_profile();
+            recurrent_backup_layers += profile.layers_scanned;
+            recurrent_backup_tensors += profile.tensors_copied;
+            recurrent_backup_cuda_d2d += profile.cuda_d2d_queued;
+            recurrent_backup_fallback += profile.fallback_copies;
+            recurrent_backup_enqueue_us += profile.enqueue_us;
+            recurrent_backup_sync_us += profile.sync_us;
+        };
+        auto dflash_backup_recurrent_state = [&](llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
+            auto * mem = llama_get_memory(ctx);
+            dflash_recurrent_profile_reset(mem);
+            const int64_t t_backup_start = dflash_profile_start();
+            if (!llama_dflash_memory_seq_cp_recurrent_ordered(ctx, seq_id_src, seq_id_dst, -1, -1)) {
+                llama_memory_seq_cp_recurrent(mem, seq_id_src, seq_id_dst, -1, -1);
+            }
+            dflash_profile_add(t_recurrent_backup_total, t_backup_start);
+            dflash_recurrent_profile_collect(mem);
+        };
         int n_slots_drafted = 0;
         server_slot * profit_baseline_slot = nullptr;
         int n_profit_baseline_slots = 0;
@@ -3606,7 +3652,9 @@ private:
                         slot.n_draft_total += tree.n_nodes;
 
                         if (needs_reeval) {
+                            const int64_t t_replay_sync_start = dflash_profile_start();
                             llama_tape_replay_sync(ctx);
+                            dflash_profile_add(t_replay_sync_total, t_replay_sync_start);
 
                             if (!recurrent_expanded) {
                                 if (llama_context_recurrent_expand(ctx, n_seq_max_full)) {
@@ -3630,7 +3678,7 @@ private:
                             if (n_branches > 0) {
                                 llama_memory_seq_cp(mem, slot.id, seq_backup, -1, -1);
                             } else {
-                                llama_memory_seq_cp_recurrent(mem, slot.id, seq_backup, -1, -1);
+                                dflash_backup_recurrent_state(slot.id, seq_backup);
                             }
                             slot.has_draft_backup = true;
                             slot.has_recurrent_only_backup = (n_branches == 0);
@@ -3697,7 +3745,9 @@ private:
                     if (needs_reeval) {
                         // DFlash: sync previous tape replay
                         if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                            const int64_t t_replay_sync_start = dflash_profile_start();
                             llama_tape_replay_sync(ctx);
+                            dflash_profile_add(t_replay_sync_total, t_replay_sync_start);
                             // Only set tree parent IDs when tree budget > 0.
                             // Flat mode uses standard (non-tree) kernels to avoid
                             // tree-aware kernel divergence on hidden states.
@@ -3724,7 +3774,7 @@ private:
                         const llama_seq_id seq_backup = slot.id + n_parallel_user;
                         auto * mem = llama_get_memory(ctx);
                         llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                        llama_memory_seq_cp_recurrent(mem, slot.id, seq_backup, -1, -1);
+                        dflash_backup_recurrent_state(slot.id, seq_backup);
                         slot.has_draft_backup = true;
                         slot.has_recurrent_only_backup = true;
                     }
@@ -4379,7 +4429,9 @@ private:
             && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH
             && std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.has_draft_backup; });
         if (dflash_tape_active) {
+            const int64_t t_tape_record_start = dflash_profile_start();
             llama_set_tape_recording(ctx, true);
+            dflash_profile_add(t_tape_record_total, t_tape_record_start);
         }
 
         int32_t i_next = 0;
@@ -5478,23 +5530,36 @@ private:
             apply_profit_decision(*profit_baseline_slot);
         }
 
+        // turn off DFlash tape recording after all sub-batches. This stays outside
+        // the sub-batch loop so recording spans multi-ubatch verify batches.
+        if (dflash_tape_active) {
+            const int64_t t_tape_record_start = dflash_profile_start();
+            llama_set_tape_recording(ctx, false);
+            dflash_profile_add(t_tape_record_total, t_tape_record_start);
+        }
+
         // --- profiling: log per-cycle breakdown ---
         if (n_slots_drafted > 0) {
             const int64_t t_cycle_total = ggml_time_us() - t_cycle_start;
             const int64_t t_other = t_cycle_total - t_draft_total - t_verify_total - t_accept_total;
-            SRV_INF("spec cycle (%d slots): draft=%.1fms verify=%.1fms accept=%.1fms other=%.1fms total=%.1fms\n",
-                    n_slots_drafted,
-                    t_draft_total / 1e3, t_verify_total / 1e3, t_accept_total / 1e3,
-                    t_other / 1e3, t_cycle_total / 1e3);
-        }
-
-        // turn off DFlash tape recording after all sub-batches — was turned on
-        // before the sub-batch for loop. Placing it outside the loop (vs inside,
-        // after the first decode) keeps recording active across all sub-batches,
-        // which matters when multiple slots share one pass and the combined
-        // verify batch spans more than one ubatch.
-        if (dflash_tape_active) {
-            llama_set_tape_recording(ctx, false);
+            if (profile_dflash_cycle) {
+                SRV_INF("spec cycle (%d slots): draft=%.1fms verify=%.1fms accept=%.1fms "
+                        "other=%.1fms replay_sync=%.1fms recurrent_backup=%.1fms "
+                        "backup_enqueue=%.1fms backup_sync=%.1fms backup_layers=%" PRIu64
+                        " backup_tensors=%" PRIu64 " backup_cuda_d2d=%" PRIu64
+                        " backup_fallback=%" PRIu64 " tape_record=%.1fms total=%.1fms\n",
+                        n_slots_drafted,
+                        t_draft_total / 1e3, t_verify_total / 1e3, t_accept_total / 1e3,
+                        t_other / 1e3, t_replay_sync_total / 1e3, t_recurrent_backup_total / 1e3,
+                        recurrent_backup_enqueue_us / 1e3, recurrent_backup_sync_us / 1e3,
+                        recurrent_backup_layers, recurrent_backup_tensors, recurrent_backup_cuda_d2d,
+                        recurrent_backup_fallback, t_tape_record_total / 1e3, t_cycle_total / 1e3);
+            } else {
+                SRV_INF("spec cycle (%d slots): draft=%.1fms verify=%.1fms accept=%.1fms other=%.1fms total=%.1fms\n",
+                        n_slots_drafted,
+                        t_draft_total / 1e3, t_verify_total / 1e3, t_accept_total / 1e3,
+                        t_other / 1e3, t_cycle_total / 1e3);
+            }
         }
 
         // restore force_split_seq for the next cycle (prompt batches need it)
