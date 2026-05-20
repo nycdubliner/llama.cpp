@@ -67,6 +67,7 @@ int main(int argc, char ** argv) {
     const std::string download_h = read_file(root + "/common/download.h");
     const std::string download_cpp = read_file(root + "/common/download.cpp");
     const std::string arg_cpp = read_file(root + "/common/arg.cpp");
+    const std::string common_h = read_file(root + "/common/common.h");
     const std::string dflash_draft = read_file(root + "/src/models/dflash_draft.cpp");
     const std::string arch_cpp = read_file(root + "/src/llama-arch.cpp");
     const std::string memory_h = read_file(root + "/src/llama-memory.h");
@@ -150,7 +151,8 @@ int main(int argc, char ** argv) {
         "DFlash capture state must cache the CUDA stream ordering helper");
     ok &= expect(context_cpp.find("dflash_wait_for_gpu_capture_stream()") != std::string::npos,
         "decode must use fine-grained CUDA stream ordering for graph-copied DFlash hidden tensors");
-    ok &= expect(context_cpp.find("if (dflash_capture && !dflash_wait_for_gpu_capture_stream())") != std::string::npos,
+    ok &= expect(context_cpp.find("const bool dflash_gpu_capture_stream_ready") != std::string::npos &&
+                 context_cpp.find("if (dflash_capture && !dflash_gpu_capture_stream_ready)") != std::string::npos,
         "decode must only fall back to full scheduler synchronization when CUDA stream ordering is unavailable");
     ok &= expect(graph_h.find("cparams.hidden_gpu_seqs[i] != other.cparams.hidden_gpu_seqs[i]") != std::string::npos,
         "graph reuse must invalidate when DFlash hidden GPU graph-copy destinations change");
@@ -719,10 +721,13 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("dflash_sample_reduced_verify") != std::string::npos, "server must consume reduced verifier logits");
     ok &= expect(server_context.find("falling back is unsafe because raw logits were not copied") != std::string::npos, "server must not silently fall back after reduced raw-logit skip");
     ok &= expect(server_context.find("spec_pad_i_batch") != std::string::npos, "server must track DFlash verifier padding rows separately from real draft rows");
-    ok &= expect(server_context.find("padded DFlash verifier batch") != std::string::npos, "server must pad short flat DFlash verify batches to stabilize target graph shape");
-    ok &= expect(server_context.find("active_verify_draft_max") != std::string::npos, "server must pad reduced verifier batches only to the active adaptive draft depth");
+    ok &= expect(server_context.find("GGML_DFLASH_VERIFY_PAD") != std::string::npos &&
+                 server_context.find("dflash_verify_padding_enabled()") != std::string::npos,
+        "server must keep DFlash verifier padding behind an explicit diagnostic env toggle");
+    ok &= expect(server_context.find("padded DFlash verifier batch") != std::string::npos, "server must still log diagnostic DFlash verifier padding when explicitly enabled");
+    ok &= expect(server_context.find("active_verify_draft_max") != std::string::npos, "server diagnostic padding must only pad to the active adaptive draft depth");
     ok &= expect(server_context.find("std::max(n_draft_max, original_n_max)") == std::string::npos, "DFlash verifier padding must not force adaptive depth to pay for configured max depth");
-    ok &= expect(server_context.find("rows_available") != std::string::npos, "server DFlash verifier padding must respect batch and ubatch capacity");
+    ok &= expect(server_context.find("rows_available") != std::string::npos, "server diagnostic DFlash verifier padding must respect batch and ubatch capacity");
     ok &= expect(server_context.find("for (int idx : slot.spec_pad_i_batch)") != std::string::npos, "reduced verifier coverage must account for explicit padding rows");
     ok &= expect(server_context.find("const bool had_dflash_padding = !slot.spec_pad_i_batch.empty()") != std::string::npos, "server must remember verifier padding through accept bookkeeping");
     ok &= expect(server_context.find("const bool all_accepted_flat = (n_accepted_draft == (int) n_draft) && !had_dflash_padding") != std::string::npos, "DFlash verifier padding must force rollback even when all real draft tokens were accepted");
@@ -1120,10 +1125,20 @@ int main(int argc, char ** argv) {
     ok &= expect(!common_dflash_cpu_ring_valid_after_write_for_test(true,  true,  true,  false),
         "CPU-tracked path with incomplete layer copy must remain invalid");
 
-    // ring_state_save must guard against stale CPU ring
-    ok &= expect(speculative.find("ring_state_save") != std::string::npos
-                  && speculative.find("if (!cpu_ring_valid)") != std::string::npos,
-        "ring_state_save must guard against stale CPU ring data");
+    // ring_state_save must not serialize stale CPU ring data; GPU-only rings
+    // must be checkpointed through a D2H snapshot instead.
+    ok &= expect(speculative.find("llama_dflash_cross_ring_gpu_snapshot") != std::string::npos &&
+                 speculative.find("compact_gpu_snapshot") != std::string::npos,
+        "GPU-only DFlash ring checkpoints must snapshot the GPU ring instead of saving stale CPU data");
+    ok &= expect(llama_h.find("llama_dflash_cross_ring_gpu_snapshot") != std::string::npos &&
+                 context_cpp.find("fn_snapshot") != std::string::npos &&
+                 cuda_ring.find("dflash_cross_ring_gpu_snapshot") != std::string::npos &&
+                 cuda_reg.find("\"dflash_cross_ring_gpu_snapshot\"") != std::string::npos,
+        "GPU ring snapshot API must be wired through llama.h, context, CUDA ring, and CUDA proc lookup");
+
+    ok &= expect(speculative_h.find("bool   common_speculative_ring_state_save") != std::string::npos &&
+                 server_context.find("ring_saved = common_speculative_ring_state_save") != std::string::npos,
+        "DFlash checkpoint save must report snapshot failure instead of logging non-empty bytes as saved");
 
     // build_cross_data must refuse stale CPU ring
     ok &= expect(speculative.find("CPU cross ring is stale") != std::string::npos,
@@ -1261,6 +1276,41 @@ int main(int argc, char ** argv) {
         "CPU hidden available: indexed writer can proceed");
     ok &= expect(!common_dflash_tree_update_requires_cpu_hidden_for_test(false, false),
         "No GPU ring: CPU fallback world, not the GPU-only hazard");
+
+    // DFlash draft depth must have one source of truth: server adaptive DM.
+    ok &= expect(arg_cpp.find("--spec-dflash-fixed-depth") == std::string::npos &&
+                 arg_cpp.find("--spec-dflash-disable-accept-shrink") == std::string::npos &&
+                 common_h.find("dflash_fixed_depth") == std::string::npos &&
+                 common_h.find("dflash_disable_accept_shrink") == std::string::npos,
+        "DFlash must not expose extra fixed-depth or accept-shrink controls");
+    ok &= expect(speculative.find("adaptive_n_draft") == std::string::npos &&
+                 speculative.find("n_low_accept") == std::string::npos &&
+                 speculative.find("GGML_DFLASH_DISABLE_ACCEPT_SHRINK") == std::string::npos &&
+                 server_context.find("int n_draft_max = (dm_adaptive && adaptive_n_max >= 0) ? adaptive_n_max : base_n_max") != std::string::npos &&
+                 server_context.find("else if (dm_adaptive && adaptive_n_max == 0)") != std::string::npos,
+        "DFlash-local accept shrink must be removed and non-adaptive mode must ignore adaptive state");
+    ok &= expect(context_h.find("profile_reduced_logits_ids_us") != std::string::npos &&
+                 context_cpp.find("GGML_DFLASH_PROFILE_SYNC_SPLIT") != std::string::npos &&
+                 context_cpp.find("reduced_logits_ids=") != std::string::npos &&
+                 context_cpp.find("verify_sync_split=") != std::string::npos,
+        "DFlash verifier profiling must split decode sync and compact logits copies");
+    ok &= expect(cuda_argmax.find("GGML_CUDA_DFLASH_CUB_TOP_K") != std::string::npos &&
+                 cuda_argmax.find("GGML_DFLASH_ARGMAX_PROFILE") != std::string::npos &&
+                 cuda_argmax.find("path=%s") != std::string::npos,
+        "CUDA top-k verifier path must be selectable and loggable");
+    ok &= expect(server_context.find("dflash acceptance histogram") != std::string::npos &&
+                 server_context.find("dflash_accept_hist_by_ctx") != std::string::npos &&
+                 server_context.find("note_dflash_cycle") != std::string::npos &&
+                 server_context.find("dflash_cycle_count > 0 && dflash_server_profile_enabled(DFLASH_PROFILE_SUMMARY)") != std::string::npos,
+        "DFlash cycle logs must include profile-gated acceptance histograms by context bucket");
+    ok &= expect(speculative.find("target capture layers mix SWA and FULL") != std::string::npos &&
+                 speculative.find("target/draft SWA window mismatch") != std::string::npos &&
+                 speculative.find("common_dflash_capture_neighborhood_to_string") != std::string::npos &&
+                 speculative.find("common_dflash_log_contract_verbose()") != std::string::npos,
+        "DFlash startup must warn about Gemma SWA/FULL capture-contract risks while gating verbose contract detail");
+    ok &= expect(speculative.find("dflash checkpoint: ring restore") != std::string::npos &&
+                 speculative.find("DFLASH_DBG ring_state_load") == std::string::npos,
+        "DFlash checkpoint restore detail must be profile-gated and must not use always-on debug warnings");
 
     return ok ? 0 : 1;
 }
