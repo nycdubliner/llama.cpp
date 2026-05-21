@@ -3695,10 +3695,16 @@ bool llama_context::dflash_kv_cache_init(int ctx_size) {
 
     auto fn_write_d2d = (dflash_kv_cache_data::write_d2d_fn_t)
         ggml_backend_reg_get_proc_address(cuda_reg, "dflash_kv_cache_write_d2d");
+    auto fn_write_d2d_no_check = (dflash_kv_cache_data::write_d2d_fn_t)
+        ggml_backend_reg_get_proc_address(cuda_reg, "dflash_kv_cache_write_d2d_no_check");
     auto fn_append_d2d = (dflash_kv_cache_data::append_d2d_fn_t)
         ggml_backend_reg_get_proc_address(cuda_reg, "dflash_kv_cache_append_d2d");
     auto fn_append_d2d_no_check = (dflash_kv_cache_data::append_d2d_fn_t)
         ggml_backend_reg_get_proc_address(cuda_reg, "dflash_kv_cache_append_d2d_no_check");
+    auto fn_copy_d2d = (dflash_kv_cache_data::copy_d2d_fn_t)
+        ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_copy_d2d");
+    auto fn_copy_d2d_no_check = (dflash_kv_cache_data::copy_d2d_fn_t)
+        ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_copy_d2d_no_check");
     auto fn_prepare_ptr = (dflash_kv_cache_data::prepare_ptr_fn_t)
         ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_prepare_ptr");
     auto fn_sync_ptr = (dflash_kv_cache_data::sync_ptr_fn_t)
@@ -3733,8 +3739,11 @@ bool llama_context::dflash_kv_cache_init(int ctx_size) {
     cache->ring_size = ctx_size;
     cache->n_elem = n_elem;
     cache->fn_write_d2d = fn_write_d2d;
+    cache->fn_write_d2d_no_check = fn_write_d2d_no_check;
     cache->fn_append_d2d = fn_append_d2d;
     cache->fn_append_d2d_no_check = fn_append_d2d_no_check;
+    cache->fn_copy_d2d = fn_copy_d2d;
+    cache->fn_copy_d2d_no_check = fn_copy_d2d_no_check;
     cache->fn_prepare_ptr = fn_prepare_ptr;
     cache->fn_sync_ptr = fn_sync_ptr;
     cache->fn_wait_backend_stream = fn_wait_backend_stream;
@@ -3887,6 +3896,8 @@ bool llama_context::dflash_kv_cache_update(int n_tokens) {
     }
 
     const int filled_before = dflash_kv_cache->n_filled;
+    const int total = filled_before + n_tokens;
+    const bool needs_shift = total > dflash_kv_cache->ring_size;
     const bool fast_append =
         dflash_kv_cache->fn_append_d2d_no_check &&
         dflash_kv_cache->fn_prepare_ptr &&
@@ -3894,28 +3905,94 @@ bool llama_context::dflash_kv_cache_update(int n_tokens) {
         dflash_kv_cache->fn_prepare_ptr(dflash_kv_cache->k_ring[0]->data);
     const auto fn_append = fast_append ? dflash_kv_cache->fn_append_d2d_no_check
                                        : dflash_kv_cache->fn_append_d2d;
+    bool used_async_copy = false;
+
+    const size_t stride = (size_t) dflash_kv_cache->n_elem * sizeof(float);
+    const size_t shift_bytes = (size_t) dflash_kv_cache->ring_size * stride;
+    if (needs_shift && shift_bytes > dflash_kv_cache->shift_buf_size) {
+        if (dflash_kv_cache->shift_buf) {
+            ggml_backend_buffer_free(dflash_kv_cache->shift_buf);
+            dflash_kv_cache->shift_buf = nullptr;
+            dflash_kv_cache->shift_buf_size = 0;
+            dflash_kv_cache->shift_ptr = nullptr;
+        }
+        dflash_kv_cache->shift_buf = ggml_backend_buft_alloc_buffer(gpu_buft, shift_bytes);
+        dflash_kv_cache->shift_buf_size = dflash_kv_cache->shift_buf
+            ? ggml_backend_buffer_get_size(dflash_kv_cache->shift_buf) : 0;
+        dflash_kv_cache->shift_ptr = dflash_kv_cache->shift_buf
+            ? ggml_backend_buffer_get_base(dflash_kv_cache->shift_buf) : nullptr;
+    }
+    if (needs_shift && (!dflash_kv_cache->shift_buf || !dflash_kv_cache->shift_ptr)) {
+        return false;
+    }
+
+    const bool fast_copy =
+        needs_shift &&
+        dflash_kv_cache->fn_copy_d2d_no_check &&
+        dflash_kv_cache->fn_prepare_ptr &&
+        dflash_kv_cache->shift_ptr &&
+        dflash_kv_cache->fn_prepare_ptr(dflash_kv_cache->k_ring[0]->data) &&
+        dflash_kv_cache->fn_prepare_ptr(dflash_kv_cache->shift_ptr);
+    const auto fn_copy = fast_copy ? dflash_kv_cache->fn_copy_d2d_no_check
+                                   : dflash_kv_cache->fn_copy_d2d;
     for (int il = 0; il < n_layers; ++il) {
-        if (!fn_append(
-                dflash_kv_cache->k_ring[il]->data,
-                res->dflash_k_update[il]->data,
-                dflash_kv_cache->ring_size,
-                filled_before,
-                n_tokens,
-                dflash_kv_cache->n_elem)) {
+        if (!needs_shift) {
+            if (!fn_append(
+                    dflash_kv_cache->k_ring[il]->data,
+                    res->dflash_k_update[il]->data,
+                    dflash_kv_cache->ring_size,
+                    filled_before,
+                    n_tokens,
+                    dflash_kv_cache->n_elem)) {
+                return false;
+            }
+            if (!fn_append(
+                    dflash_kv_cache->v_ring[il]->data,
+                    res->dflash_v_update[il]->data,
+                    dflash_kv_cache->ring_size,
+                    filled_before,
+                    n_tokens,
+                    dflash_kv_cache->n_elem)) {
+                return false;
+            }
+            continue;
+        }
+
+        auto shift_and_append = [&](void * dst_cache, const void * src_update) -> bool {
+            char * cache = (char *) dst_cache;
+            const char * src = (const char *) src_update;
+
+            if (n_tokens >= dflash_kv_cache->ring_size) {
+                src += (size_t) (n_tokens - dflash_kv_cache->ring_size) * stride;
+                used_async_copy = true;
+                return fn_copy(cache, src, shift_bytes);
+            }
+
+            const int drop = total - dflash_kv_cache->ring_size;
+            const int keep = filled_before - drop;
+            if (keep > 0) {
+                const size_t keep_bytes = (size_t) keep * stride;
+                if (!fn_copy(dflash_kv_cache->shift_ptr, cache + (size_t) drop * stride, keep_bytes)) {
+                    return false;
+                }
+                if (!fn_copy(cache, dflash_kv_cache->shift_ptr, keep_bytes)) {
+                    return false;
+                }
+            }
+
+            used_async_copy = true;
+            return fn_copy(cache + (size_t) keep * stride, src, (size_t) n_tokens * stride);
+        };
+
+        if (!shift_and_append(dflash_kv_cache->k_ring[il]->data, res->dflash_k_update[il]->data)) {
             return false;
         }
-        if (!fn_append(
-                dflash_kv_cache->v_ring[il]->data,
-                res->dflash_v_update[il]->data,
-                dflash_kv_cache->ring_size,
-                filled_before,
-                n_tokens,
-                dflash_kv_cache->n_elem)) {
+        if (!shift_and_append(dflash_kv_cache->v_ring[il]->data, res->dflash_v_update[il]->data)) {
             return false;
         }
     }
 
-    if (fast_append) {
+    if (used_async_copy || (!needs_shift && fast_append)) {
         if (dflash_kv_cache->fn_wait_dflash_stream) {
             if (!dflash_kv_cache->fn_wait_dflash_stream(gpu_backend)) {
                 return false;
@@ -3926,7 +4003,7 @@ bool llama_context::dflash_kv_cache_update(int n_tokens) {
     }
 
     dflash_kv_cache->write_pos = 0;
-    dflash_kv_cache->n_filled = std::min(dflash_kv_cache->n_filled + n_tokens, dflash_kv_cache->ring_size);
+    dflash_kv_cache->n_filled = std::min(filled_before + n_tokens, dflash_kv_cache->ring_size);
     dflash_kv_cache->view.n_filled = dflash_kv_cache->n_filled;
     dflash_kv_cache->view.write_pos = dflash_kv_cache->write_pos;
     return true;
@@ -3960,6 +4037,293 @@ bool llama_context::dflash_kv_cache_update_gpu(
     cross.dflash_kv_update_fn_set_tensor_d2d = nullptr;
 
     return ok;
+}
+
+namespace {
+
+enum class dflash_commit_slot_state {
+    all_missing,
+    all_present,
+    invalid,
+};
+
+static llama_ubatch dflash_make_commit_ubatch(
+        uint32_t n_pos,
+        llama_seq_id seq_id,
+        llama_pos start_pos,
+        uint32_t n_tokens) {
+    auto data = std::make_shared<llama_ubatch::data_t>();
+    data->token.resize(n_tokens, 0);
+    data->pos.resize((size_t) n_tokens * n_pos, 0);
+    data->n_seq_id.resize(n_tokens, 1);
+    data->seq_id.resize(n_tokens);
+    data->seq_idx.resize(LLAMA_MAX_SEQ, -1);
+    data->output.resize(n_tokens, 0);
+    data->seq_id_data.resize(n_tokens, seq_id);
+    data->seq_id_unq.push_back(seq_id);
+
+    if (seq_id >= 0 && seq_id < LLAMA_MAX_SEQ) {
+        data->seq_idx[(size_t) seq_id] = 0;
+    }
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        data->seq_id[i] = &data->seq_id_data[i];
+        data->pos[i] = start_pos + (llama_pos) i;
+    }
+    if (!data->output.empty()) {
+        data->output.back() = 1;
+    }
+
+    return {
+        /*.b_equal_seqs =*/ true,
+        /*.n_tokens     =*/ n_tokens,
+        /*.n_seq_tokens =*/ n_tokens,
+        /*.n_seqs       =*/ 1,
+        /*.n_seqs_unq   =*/ 1,
+        /*.n_pos        =*/ n_pos,
+        /*.token        =*/ data->token.data(),
+        /*.embd         =*/ nullptr,
+        /*.pos          =*/ data->pos.data(),
+        /*.n_seq_id     =*/ data->n_seq_id.data(),
+        /*.seq_id       =*/ data->seq_id.data(),
+        /*.seq_id_unq   =*/ data->seq_id_unq.data(),
+        /*.seq_idx      =*/ data->seq_idx.data(),
+        /*.output       =*/ data->output.data(),
+        /*.data         =*/ std::move(data),
+    };
+}
+
+static dflash_commit_slot_state dflash_collect_commit_slot_info(
+        llama_kv_cache * kv,
+        llama_seq_id seq_id,
+        const llama_ubatch & ubatch,
+        llama_kv_cache::slot_info & sinfo) {
+    if (!kv || seq_id < 0) {
+        return dflash_commit_slot_state::invalid;
+    }
+
+    const uint32_t n_stream = kv->get_n_stream();
+    const uint32_t stream = n_stream > 1 ? (uint32_t) seq_id : 0;
+    if (stream >= n_stream) {
+        return dflash_commit_slot_state::invalid;
+    }
+
+    sinfo = {};
+    sinfo.s0 = stream;
+    sinfo.s1 = stream;
+    sinfo.resize(1);
+    sinfo.strm[0] = stream;
+    sinfo.idxs[0].reserve(ubatch.n_tokens);
+
+    uint32_t n_missing = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        uint32_t cell_indices[2] = {};
+        const llama_pos pos = ubatch.pos[i];
+        const int n_cells = kv->cells_at_pos(seq_id, pos, cell_indices, 2);
+        if (n_cells == 0) {
+            ++n_missing;
+            continue;
+        }
+        if (n_cells != 1) {
+            return dflash_commit_slot_state::invalid;
+        }
+        sinfo.idxs[0].push_back(cell_indices[0]);
+    }
+
+    if (n_missing == ubatch.n_tokens) {
+        return dflash_commit_slot_state::all_missing;
+    }
+    if (n_missing == 0 && sinfo.idxs[0].size() == ubatch.n_tokens) {
+        return dflash_commit_slot_state::all_present;
+    }
+    return dflash_commit_slot_state::invalid;
+}
+
+static llama_kv_cache * dflash_get_base_kv_cache(llama_memory_t memory) {
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(memory)) {
+        return kv;
+    }
+    if (auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory)) {
+        return kv_iswa->get_base();
+    }
+    return nullptr;
+}
+
+static llama_memory_context_ptr dflash_make_base_commit_context(
+        llama_kv_cache * base_kv,
+        llama_seq_id seq_id,
+        const llama_ubatch & ubatch) {
+    if (!base_kv) {
+        return nullptr;
+    }
+
+    llama_kv_cache::slot_info exact_sinfo;
+    const dflash_commit_slot_state slot_state =
+        dflash_collect_commit_slot_info(base_kv, seq_id, ubatch, exact_sinfo);
+    if (slot_state == dflash_commit_slot_state::invalid) {
+        return nullptr;
+    }
+
+    std::vector<llama_ubatch> ubatches = { ubatch };
+    llama_kv_cache::slot_info_vec_t sinfos;
+
+    if (slot_state == dflash_commit_slot_state::all_missing) {
+        sinfos = base_kv->prepare(ubatches);
+        if (sinfos.empty()) {
+            return nullptr;
+        }
+    } else {
+        sinfos.push_back(std::move(exact_sinfo));
+    }
+
+    return std::make_unique<llama_kv_cache_context>(base_kv, std::move(sinfos), std::move(ubatches));
+}
+
+} // namespace
+
+bool llama_context::dflash_target_kv_cache_update_gpu(
+        llama_seq_id seq_id,
+        llama_pos start_pos,
+        const void * d_hidden,
+        int n_tokens,
+        int n_layers,
+        int n_embd_layer,
+        set_tensor_d2d_fn_t fn_d2d) {
+    if (!d_hidden || n_tokens <= 0 || n_layers <= 0 || n_embd_layer <= 0 || !fn_d2d) {
+        return false;
+    }
+    if (!llm_arch_is_dflash_drafter(model.arch) || !memory) {
+        return false;
+    }
+    if (model.n_devices() > 1) {
+        return false;
+    }
+
+    const int64_t n_target_features = (int64_t) n_layers * n_embd_layer;
+    if (n_target_features != model.hparams.dflash_n_target_features) {
+        return false;
+    }
+
+    llama_kv_cache * base_kv = dflash_get_base_kv_cache(memory.get());
+    if (!base_kv) {
+        return false;
+    }
+
+    // We are refreshing the accepted tail of the drafter prefix with target-hidden
+    // K/V. Overwriting occupied cells in-place makes apply_ubatch() purge the whole
+    // earlier prefix to preserve its generic overwrite invariants. Drop only the
+    // tail we are about to replace, then allocate that suffix again so older
+    // accepted-prefix cells stay live.
+    base_kv->seq_rm(seq_id, start_pos, -1);
+
+    const auto ubatch = dflash_make_commit_ubatch(model.hparams.n_pos_per_embd(), seq_id, start_pos, (uint32_t) n_tokens);
+    auto sinfo = base_kv->find_slot(ubatch, false);
+    if (sinfo.empty()) {
+        return false;
+    }
+    base_kv->apply_ubatch(sinfo, ubatch);
+
+    std::vector<llama_ubatch> ubatches = { ubatch };
+    llama_kv_cache::slot_info_vec_t sinfos;
+    sinfos.push_back(std::move(sinfo));
+    auto mctx = std::make_unique<llama_kv_cache_context>(base_kv, std::move(sinfos), std::move(ubatches));
+
+    ggml_backend_t gpu_backend = nullptr;
+    for (auto & backend : backends) {
+        auto * dev = ggml_backend_get_device(backend.get());
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu_backend = backend.get();
+            break;
+        }
+    }
+    if (!gpu_backend) {
+        return false;
+    }
+
+    const size_t max_nodes = graph_max_nodes(n_tokens);
+    auto res = std::make_unique<llm_graph_result>(max_nodes);
+
+    const auto gparams = graph_params(res.get(), ubatch, mctx.get(), LLM_GRAPH_TYPE_DFLASH_KV_UPDATE);
+    ggml_cgraph * gf = model.build_graph(gparams);
+    if (!gf) {
+        return false;
+    }
+
+    ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(gpu_backend);
+    const size_t needed = ggml_backend_alloc_ctx_tensors_from_buft_size(res->get_ctx(), gpu_buft);
+
+    ggml_backend_buffer_t alloc_buf = nullptr;
+    const bool reuse_update_buf = dflash_kv_cache != nullptr;
+    if (reuse_update_buf) {
+        if (needed > dflash_kv_cache->update_buf_size) {
+            if (dflash_kv_cache->update_buf) {
+                ggml_backend_buffer_free(dflash_kv_cache->update_buf);
+            }
+            dflash_kv_cache->update_buf = ggml_backend_buft_alloc_buffer(gpu_buft, needed);
+            dflash_kv_cache->update_buf_size = dflash_kv_cache->update_buf
+                ? ggml_backend_buffer_get_size(dflash_kv_cache->update_buf) : 0;
+        }
+        alloc_buf = dflash_kv_cache->update_buf;
+    } else {
+        alloc_buf = ggml_backend_buft_alloc_buffer(gpu_buft, needed);
+    }
+    if (!alloc_buf) {
+        return false;
+    }
+
+    {
+        struct ggml_tallocr talloc = ggml_tallocr_new(alloc_buf);
+        struct ggml_tensor * t = ggml_get_first_tensor(res->get_ctx());
+        while (t) {
+            if (t->data == nullptr && t->view_src == nullptr) {
+                ggml_tallocr_alloc(&talloc, t);
+            } else if (t->view_src != nullptr && t->buffer == nullptr) {
+                ggml_backend_view_init(t);
+            }
+            t = ggml_get_next_tensor(res->get_ctx(), t);
+        }
+    }
+
+    cross.dflash_kv_update_gpu = d_hidden;
+    cross.dflash_kv_update_n_embd = n_target_features;
+    cross.dflash_kv_update_n_enc_real = n_tokens;
+    cross.dflash_kv_update_fn_set_tensor_d2d = fn_d2d;
+
+    const ggml_status status = [&] {
+        res->set_inputs(&ubatch);
+        return ggml_backend_graph_compute_async(gpu_backend, gf);
+    }();
+
+    cross.dflash_kv_update_gpu = nullptr;
+    cross.dflash_kv_update_n_embd = 0;
+    cross.dflash_kv_update_n_enc_real = 0;
+    cross.dflash_kv_update_fn_set_tensor_d2d = nullptr;
+
+    // Reused commit scratch lives on cudaStreamPerThread, while the graph runs on
+    // the backend stream. Order those streams before this function returns so the
+    // next accepted-prefix commit cannot overwrite update_buf while the prior
+    // async commit is still reading from it.
+    bool synchronized = false;
+    if (status == GGML_STATUS_SUCCESS) {
+        const bool ordered =
+            reuse_update_buf &&
+            dflash_kv_cache &&
+            dflash_kv_cache->fn_wait_backend_stream &&
+            dflash_kv_cache->fn_wait_backend_stream(gpu_backend);
+        if (!ordered) {
+            ggml_backend_synchronize(gpu_backend);
+            synchronized = true;
+        }
+    }
+
+    if (!reuse_update_buf) {
+        if (!synchronized) {
+            ggml_backend_synchronize(gpu_backend);
+        }
+        ggml_backend_buffer_free(alloc_buf);
+    }
+
+    return status == GGML_STATUS_SUCCESS;
 }
 
 void llama_context::set_tree_mask(const uint8_t * visibility, int n_tree_tokens) {
@@ -7528,6 +7892,24 @@ bool llama_dflash_kv_cache_update_from_ring(
 
     const int n_update = std::min(ring_filled, n_tokens);
     return ctx->dflash_kv_cache_update_gpu(d_staging, n_update, n_layers, n_embd, h->fn_set_tensor);
+}
+
+bool llama_dflash_target_kv_cache_update_from_ring(
+        llama_context * ctx, void * handle,
+        int ring_write_pos, int ring_filled,
+        int n_layers, int n_embd, int n_tokens,
+        llama_seq_id seq_id, llama_pos start_pos) {
+    if (!ctx || !handle || n_tokens <= 0) return false;
+    auto * h = (dflash_cross_ring_handle *) handle;
+
+    const float * d_staging = h->fn_interleave(h->gpu_ring, ring_write_pos, ring_filled, n_tokens);
+    if (!d_staging) {
+        return false;
+    }
+
+    const int n_update = std::min(ring_filled, n_tokens);
+    return ctx->dflash_target_kv_cache_update_gpu(
+        seq_id, start_pos, d_staging, n_update, n_layers, n_embd, h->fn_set_tensor);
 }
 
 void llama_set_tree_mask(llama_context * ctx, const uint8_t * visibility, int n_tree_tokens) {

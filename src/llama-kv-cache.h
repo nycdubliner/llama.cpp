@@ -213,6 +213,8 @@ public:
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+    void set_input_k_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+    void set_input_v_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
@@ -221,6 +223,8 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+    void set_input_k_rot_backend(ggml_tensor * dst) const;
+    void set_input_v_rot_backend(ggml_tensor * dst) const;
 
 private:
     const llama_model & model;
@@ -367,6 +371,8 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    llama_kv_cache * get_kv() const;
+    const llama_kv_cache::slot_info & current_sinfo() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -403,6 +409,8 @@ public:
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_k_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_v_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
@@ -410,6 +418,8 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+    void set_input_k_rot_backend(ggml_tensor * dst) const;
+    void set_input_v_rot_backend(ggml_tensor * dst) const;
 
 private:
     llama_memory_status status;

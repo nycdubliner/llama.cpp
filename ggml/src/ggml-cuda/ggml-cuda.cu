@@ -5643,6 +5643,7 @@ extern "C" bool   dflash_cross_ring_gpu_snapshot(void *, int, int, int, float *,
 extern "C" const float * dflash_cross_ring_gpu_interleave(void *, int, int, int);
 extern "C" void   dflash_cross_ring_gpu_set_tensor(void *, const void *, size_t, size_t);
 extern "C" bool   dflash_kv_cache_write_d2d(void *, const void *, int, int, int, int);
+extern "C" bool   dflash_kv_cache_write_d2d_no_check(void *, const void *, int, int, int, int);
 extern "C" bool   dflash_kv_cache_append_d2d(void *, const void *, int, int, int, int);
 extern "C" bool   dflash_kv_cache_append_d2d_no_check(void *, const void *, int, int, int, int);
 extern "C" bool   dflash_kv_cache_interleave(const void *, void *, int, int, int, int, int);
@@ -5729,6 +5730,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "dflash_kv_cache_write_d2d") == 0) {
         return (void *)dflash_kv_cache_write_d2d;
+    }
+    if (strcmp(name, "dflash_kv_cache_write_d2d_no_check") == 0) {
+        return (void *)dflash_kv_cache_write_d2d_no_check;
     }
     if (strcmp(name, "dflash_kv_cache_append_d2d") == 0) {
         return (void *)dflash_kv_cache_append_d2d;

@@ -1238,6 +1238,11 @@ extern "C" {
             struct llama_context * ctx, void * handle,
             int ring_write_pos, int ring_filled,
             int n_layers, int n_embd, int n_tokens);
+    LLAMA_API bool   llama_dflash_target_kv_cache_update_from_ring(
+            struct llama_context * ctx, void * handle,
+            int ring_write_pos, int ring_filled,
+            int n_layers, int n_embd, int n_tokens,
+            llama_seq_id seq_id, llama_pos start_pos);
 
     // DDTree: set tree attention mask for verification decode
     // visibility: bool[n_tree_tokens * n_tree_tokens] row-major, true = can attend

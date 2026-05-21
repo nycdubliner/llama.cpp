@@ -340,7 +340,10 @@ struct dflash_kv_cache_data {
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
     ggml_backend_buffer_t update_buf = nullptr;
+    ggml_backend_buffer_t shift_buf = nullptr;
     size_t update_buf_size = 0;
+    size_t shift_buf_size = 0;
+    void * shift_ptr = nullptr;
 
     std::vector<ggml_tensor *> k_ring;
     std::vector<ggml_tensor *> v_ring;
@@ -352,13 +355,17 @@ struct dflash_kv_cache_data {
 
     using write_d2d_fn_t = bool (*)(void *, const void *, int, int, int, int);
     using append_d2d_fn_t = bool (*)(void *, const void *, int, int, int, int);
+    using copy_d2d_fn_t = bool (*)(void *, const void *, size_t);
     using prepare_ptr_fn_t = bool (*)(const void *);
     using sync_ptr_fn_t = bool (*)(const void *);
     using sync_backend_stream_fn_t = bool (*)(ggml_backend_t);
     using interleave_fn_t = bool (*)(const void *, void *, int, int, int, int, int);
     write_d2d_fn_t fn_write_d2d = nullptr;
+    write_d2d_fn_t fn_write_d2d_no_check = nullptr;
     append_d2d_fn_t fn_append_d2d = nullptr;
     append_d2d_fn_t fn_append_d2d_no_check = nullptr;
+    copy_d2d_fn_t fn_copy_d2d = nullptr;
+    copy_d2d_fn_t fn_copy_d2d_no_check = nullptr;
     prepare_ptr_fn_t fn_prepare_ptr = nullptr;
     sync_ptr_fn_t fn_sync_ptr = nullptr;
     sync_backend_stream_fn_t fn_wait_backend_stream = nullptr;
@@ -368,6 +375,9 @@ struct dflash_kv_cache_data {
     ~dflash_kv_cache_data() {
         if (update_buf) {
             ggml_backend_buffer_free(update_buf);
+        }
+        if (shift_buf) {
+            ggml_backend_buffer_free(shift_buf);
         }
         if (buf) {
             ggml_backend_buffer_free(buf);
@@ -671,6 +681,7 @@ public:
     void dflash_kv_cache_reset();
     bool dflash_kv_cache_update(int n_tokens);
     bool dflash_kv_cache_update_gpu(const void * d_hidden, int n_tokens, int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d);
+    bool dflash_target_kv_cache_update_gpu(llama_seq_id seq_id, llama_pos start_pos, const void * d_hidden, int n_tokens, int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d);
     bool dflash_kv_cache_prepare(int ctx_window);
 
     // DDTree: set/clear tree attention mask for verification

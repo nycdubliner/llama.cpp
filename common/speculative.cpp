@@ -1757,10 +1757,72 @@ struct common_speculative_state_dflash : public common_speculative_state {
         return cross_len;
     }
 
+    int drafter_prefix_window() const {
+        const int n_ctx_dft = llama_n_ctx(ctx_dft);
+        return std::max(0, n_ctx_dft - block_size);
+    }
+
+    void trim_drafter_prefix_window() {
+        auto * mem_dft = llama_get_memory(ctx_dft);
+        if (!mem_dft) {
+            return;
+        }
+
+        // Match the z-lab contract: keep only the accepted prefix in the drafter
+        // cache, then let the retained prefix window slide forward with the
+        // current context instead of staying anchored at position 0.
+        llama_memory_seq_rm(mem_dft, seq_id, committed_len, -1);
+
+        const int keep = drafter_prefix_window();
+        if (keep <= 0 || committed_len <= keep) {
+            return;
+        }
+
+        const llama_pos trim_before = committed_len - keep;
+        const bool trimmed = llama_memory_seq_rm(mem_dft, seq_id, 0, trim_before);
+        if (!trimmed) {
+            static bool warned = false;
+            if (!warned) {
+                LOG_WRN("dflash: failed to slide drafter accepted-prefix window to current context (seq=%d keep=%d committed=%d)\n",
+                        seq_id, keep, committed_len);
+                warned = true;
+            }
+            return;
+        }
+
+        if (common_dflash_debug_logs_enabled()) {
+            LOG_DBG("DFLASH_DBG trim_drafter_prefix_window: seq=%d keep=%d trim_before=%d committed_len=%d\n",
+                    seq_id, keep, (int) trim_before, committed_len);
+        }
+    }
+
     void update_drafter_kv_cache(int n_written) {
         if (!gpu_ring_handle || n_written <= 0) {
             return;
         }
+
+        trim_drafter_prefix_window();
+
+        const int n_update = std::min(n_written, cross_ctx);
+        const int gpu_write_pos = ring_write_pos % cross_ctx;
+        const int gpu_filled = std::min(ring_filled, cross_ctx);
+        const llama_pos start_pos = committed_len - n_written;
+
+        const bool full_kv_ok = llama_dflash_target_kv_cache_update_from_ring(
+            ctx_dft, gpu_ring_handle,
+            gpu_write_pos, gpu_filled,
+            n_target_layers, n_embd, n_update,
+            seq_id, start_pos);
+        if (!full_kv_ok) {
+            static bool warned_full_kv = false;
+            if (!warned_full_kv) {
+                LOG_WRN("dflash: accepted target-hidden full-KV commit failed; clearing drafter KV suffix for seq=%d start=%d\n",
+                        seq_id, (int) start_pos);
+                warned_full_kv = true;
+            }
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, start_pos, -1);
+        }
+
         if (common_dflash_kv_cache_disabled()) {
             return;
         }
@@ -1777,10 +1839,6 @@ struct common_speculative_state_dflash : public common_speculative_state {
         if (!kv_cache_enabled) {
             return;
         }
-
-        const int n_update = std::min(n_written, cross_ctx);
-        const int gpu_write_pos = ring_write_pos % cross_ctx;
-        const int gpu_filled = std::min(ring_filled, cross_ctx);
 
         const bool profile_copy = profile_enabled(DFLASH_PROFILE_COPY);
         const int64_t t_start = profile_copy ? ggml_time_us() : 0;
@@ -1925,11 +1983,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
             int n_capture_swa = 0;
             int n_capture_full = 0;
             int n_capture_unknown = 0;
+            const int target_n_swa = llama_model_n_swa(model_tgt);
+            const int draft_n_swa  = llama_model_n_swa(model_dft_);
             common_dflash_capture_attention_counts(
                     model_tgt, capture_layers, n_capture_swa, n_capture_full, n_capture_unknown);
 
-            const int target_n_swa = llama_model_n_swa(model_tgt);
-            const int draft_n_swa  = llama_model_n_swa(model_dft_);
             if (n_capture_swa > 0 && n_capture_full > 0) {
                 LOG_WRN("dflash: target capture layers mix SWA and FULL attention "
                         "(swa=%d full=%d unknown=%d layers=%s neighborhoods=%s); "
@@ -2069,7 +2127,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
     }
 
     // prepare cross-attention data for batched draft decode.
-    // Returns cross_len (position offset for tokens), or -1 if no committed tokens.
+    // Returns cross_len (active cross-window size), or -1 if no committed tokens.
     int prepare_batch_draft(llama_context * ctx_dft_ext) override {
         if (committed_len == 0) {
             return -1;
@@ -2463,6 +2521,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         const int64_t t0 = ggml_time_us();
 
+        // Keep the drafter aligned to the currently accepted prefix. Rejecting
+        // part of the prior proposal must drop stale future sequence state,
+        // but accepted past stays live for the next block.
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, committed_len, -1);
+
         int cross_len = build_cross_data(ctx_dft);
         if (cross_len <= 0) {
             return;
@@ -2471,13 +2534,15 @@ struct common_speculative_state_dflash : public common_speculative_state {
         const int64_t t1 = ggml_time_us();
 
         // build drafter batch: [id_last, mask, mask, ..., mask]
-        // positions are relative to the context window fed to the drafter
+        // positions stay on the target model's absolute timeline so RoPE tracks
+        // the current suffix instead of restarting from the window head.
         // batch size adapts to n_draft+1 (saves compute when n_max < block_size-1)
         const int batch_len = n_draft + 1;
+        const int draft_pos_base = committed_len;
         common_batch_clear(batch_dft);
-        common_batch_add(batch_dft, id_last, cross_len, { seq_id }, true);
+        common_batch_add(batch_dft, id_last, draft_pos_base, { seq_id }, true);
         for (int i = 1; i < batch_len; ++i) {
-            common_batch_add(batch_dft, mask_token_id, cross_len + i, { seq_id }, true);
+            common_batch_add(batch_dft, mask_token_id, draft_pos_base + i, { seq_id }, true);
         }
 
         const int64_t t2 = ggml_time_us();
@@ -2565,15 +2630,19 @@ struct common_speculative_state_dflash : public common_speculative_state {
         // --- begin shared draft setup ---
         const int64_t t0 = ggml_time_us();
 
+        // Tree mode uses the same accepted-prefix contract as flat DFlash.
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, committed_len, -1);
+
         int cross_len = build_cross_data(ctx_dft);
         if (cross_len <= 0) {
             return;
         }
 
         common_batch_clear(batch_dft);
-        common_batch_add(batch_dft, id_last, cross_len, { seq_id }, true);
+        const int draft_pos_base = committed_len;
+        common_batch_add(batch_dft, id_last, draft_pos_base, { seq_id }, true);
         for (int i = 1; i < block_size; ++i) {
-            common_batch_add(batch_dft, mask_token_id, cross_len + i, { seq_id }, true);
+            common_batch_add(batch_dft, mask_token_id, draft_pos_base + i, { seq_id }, true);
         }
 
         int ret = llama_decode(ctx_dft, batch_dft);
@@ -3611,6 +3680,7 @@ void common_speculative_draft_batch(
     struct ready_slot {
         common_speculative_state * impl;
         int           cross_len;
+        int           draft_pos_base;
         llama_seq_id  seq_id;
         int           spec_idx;
     };
@@ -3629,7 +3699,7 @@ void common_speculative_draft_batch(
             }
 
             auto * dfl = static_cast<common_speculative_state_dflash *>(impl.get());
-            ready.push_back({ impl.get(), cross_len, dfl->seq_id, s });
+            ready.push_back({ impl.get(), cross_len, dfl->committed_len, dfl->seq_id, s });
             break;
         }
     }
@@ -3643,15 +3713,22 @@ void common_speculative_draft_batch(
     // Phase 2: set drafter graph width
     llama_set_dflash_n_slots(ctx_dft, n_ready);
 
+    // Shared ctx_dft is reused across slots. Trim each slot back to the
+    // accepted prefix so stale proposal tokens cannot survive into the next
+    // block draft.
+    for (const auto & rs : ready) {
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), rs.seq_id, rs.draft_pos_base, -1);
+    }
+
     const int64_t t1 = ggml_time_us();
 
     // Phase 3: build combined batch — each spec's tokens tagged with its seq_id
     llama_batch batch = llama_batch_init(n_ready * batch_len, 0, 1);
 
     for (const auto & rs : ready) {
-        common_batch_add(batch, id_last_per_spec[rs.spec_idx], rs.cross_len, { rs.seq_id }, true);
+        common_batch_add(batch, id_last_per_spec[rs.spec_idx], rs.draft_pos_base, { rs.seq_id }, true);
         for (int i = 1; i < batch_len; i++) {
-            common_batch_add(batch, mask_tok, rs.cross_len + i, { rs.seq_id }, true);
+            common_batch_add(batch, mask_tok, rs.draft_pos_base + i, { rs.seq_id }, true);
         }
     }
 

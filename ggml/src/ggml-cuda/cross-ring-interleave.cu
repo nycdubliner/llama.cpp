@@ -590,6 +590,41 @@ extern "C" bool dflash_kv_cache_write_d2d(
     return cudaGetLastError() == cudaSuccess && cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess;
 }
 
+extern "C" bool dflash_kv_cache_write_d2d_no_check(
+        void * d_ring, const void * d_src,
+        int ring_size, int ring_pos, int n_tokens, int n_elem) {
+    if (!d_ring || !d_src) return false;
+    if (ring_size <= 0 || n_tokens <= 0 || n_elem <= 0) return false;
+
+    const char * src = (const char *) d_src;
+    char * dst = (char *) d_ring;
+    const size_t stride = (size_t) n_elem * sizeof(float);
+
+    int pos = ring_pos % ring_size;
+    if (pos < 0) {
+        pos += ring_size;
+    }
+    if (n_tokens > ring_size) {
+        const int skip = n_tokens - ring_size;
+        src += (size_t) skip * stride;
+        pos = (pos + skip) % ring_size;
+        n_tokens = ring_size;
+    }
+
+    const int first = ring_size - pos;
+    if (first >= n_tokens) {
+        cudaMemcpyAsync(dst + (size_t) pos * stride, src,
+                        (size_t) n_tokens * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    } else {
+        cudaMemcpyAsync(dst + (size_t) pos * stride, src,
+                        (size_t) first * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        cudaMemcpyAsync(dst, src + (size_t) first * stride,
+                        (size_t) (n_tokens - first) * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    }
+
+    return cudaGetLastError() == cudaSuccess;
+}
+
 __global__ static void k_dflash_kv_cache_shift_left(
         float * __restrict__ cache,
         const int keep_tokens,

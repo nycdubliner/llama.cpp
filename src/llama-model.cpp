@@ -8619,7 +8619,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
         case LLM_ARCH_DFLASH:
-        case LLM_ARCH_DFLASH_DRAFT:
             {
                 res = nullptr;
             } break;

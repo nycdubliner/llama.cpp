@@ -1,4 +1,6 @@
 #include "models.h"
+#include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
 
 #include <algorithm>
 #include <atomic>
@@ -33,6 +35,129 @@ static int64_t dflash_draft_ctx_len(const llama_cross * cross, const llama_cpara
     }
 
     return (int64_t) n_slots * per_slot_ctx;
+}
+
+static ggml_tensor * dflash_mul_mat_aux(
+        ggml_context * ctx,
+        ggml_tensor * cur,
+        ggml_tensor * rot) {
+    const auto n = rot->ne[0];
+
+    ggml_tensor * res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur) / n);
+    res = ggml_mul_mat(ctx, rot, res);
+    res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+
+    return res;
+}
+
+class llm_graph_input_attn_kv_backend final : public llm_graph_input_attn_kv {
+public:
+    llm_graph_input_attn_kv_backend(
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            const llama_kv_cache_context * mctx,
+            bool rebind_base_from_iswa) :
+        llm_graph_input_attn_kv(hparams, cparams, mctx),
+        rebind_base_from_iswa(rebind_base_from_iswa) {
+    }
+
+    void set_input(const llama_ubatch * ubatch) override {
+        mctx->set_input_k_idxs_backend(self_k_idxs, ubatch);
+        mctx->set_input_v_idxs_backend(self_v_idxs, ubatch);
+
+        if (self_k_rot) {
+            mctx->set_input_k_rot_backend(self_k_rot);
+        }
+
+        if (self_v_rot) {
+            mctx->set_input_v_rot_backend(self_v_rot);
+        }
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        const auto * mctx_cur = rebind_base_from_iswa
+            ? static_cast<const llama_kv_cache_iswa_context *>(params.mctx)->get_base()
+            : static_cast<const llama_kv_cache_context *>(params.mctx);
+        this->mctx = mctx_cur;
+
+        bool ok = true;
+        ok &= mctx_cur != nullptr;
+        ok &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+        return ok;
+    }
+
+    const bool rebind_base_from_iswa = false;
+};
+
+class llm_graph_input_attn_kv_commit_backend final : public llm_graph_input_attn_kv {
+public:
+    llm_graph_input_attn_kv_commit_backend(
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            const llama_kv_cache_context * mctx) :
+        llm_graph_input_attn_kv(hparams, cparams, mctx),
+        kv(mctx ? mctx->get_kv() : nullptr),
+        sinfo(mctx ? mctx->current_sinfo() : llama_kv_cache::slot_info()) {
+    }
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_ASSERT(kv != nullptr);
+        kv->set_input_k_idxs_backend(self_k_idxs, ubatch, sinfo);
+        kv->set_input_v_idxs_backend(self_v_idxs, ubatch, sinfo);
+
+        if (self_k_rot) {
+            kv->set_input_k_rot_backend(self_k_rot);
+        }
+
+        if (self_v_rot) {
+            kv->set_input_v_rot_backend(self_v_rot);
+        }
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        GGML_UNUSED(params);
+        return false;
+    }
+
+    const llama_kv_cache * kv = nullptr;
+    llama_kv_cache::slot_info sinfo;
+};
+
+static llm_graph_input_attn_kv * dflash_build_base_attn_input(
+        llm_graph_result * res,
+        ggml_context * ctx0,
+        const llama_hparams & hparams,
+        const llama_cparams & cparams,
+        const llama_ubatch & ubatch,
+        const llama_kv_cache_context * base_ctx,
+        bool rebind_base_from_iswa) {
+    auto inp = std::make_unique<llm_graph_input_attn_kv_backend>(hparams, cparams, base_ctx, rebind_base_from_iswa);
+
+    inp->self_k_idxs = base_ctx->build_input_k_idxs(ctx0, ubatch);
+    inp->self_v_idxs = base_ctx->build_input_v_idxs(ctx0, ubatch);
+
+    inp->self_k_rot = base_ctx->build_input_k_rot(ctx0);
+    inp->self_v_rot = base_ctx->build_input_v_rot(ctx0);
+
+    return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+}
+
+static llm_graph_input_attn_kv_commit_backend * dflash_build_commit_attn_input(
+        llm_graph_result * res,
+        ggml_context * ctx0,
+        const llama_hparams & hparams,
+        const llama_cparams & cparams,
+        const llama_ubatch & ubatch,
+        const llama_kv_cache_context * base_ctx) {
+    auto inp = std::make_unique<llm_graph_input_attn_kv_commit_backend>(hparams, cparams, base_ctx);
+
+    inp->self_k_idxs = base_ctx->build_input_k_idxs(ctx0, ubatch);
+    inp->self_v_idxs = base_ctx->build_input_v_idxs(ctx0, ubatch);
+
+    inp->self_k_rot = base_ctx->build_input_k_rot(ctx0);
+    inp->self_v_rot = base_ctx->build_input_v_rot(ctx0);
+
+    return (llm_graph_input_attn_kv_commit_backend *) res->add_input(std::move(inp));
 }
 
 enum dflash_kv_cache_mode {
@@ -308,21 +433,26 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
 
         const int64_t n_real = n_copy;
 
+        const bool have_pos = (ubatch != nullptr) && (ubatch->pos != nullptr)
+                           && ((int64_t) ubatch->n_tokens >= n_block);
+        const int32_t q_pos_base = have_pos && n_block > 0
+            ? (int32_t) ubatch->pos[0]
+            : (int32_t) n_real;
+        const int32_t ctx_pos_base = q_pos_base - (int32_t) n_real;
+
         if (pos_ctx && pos_ctx->buffer) {
             GGML_ASSERT(ggml_backend_buffer_is_host(pos_ctx->buffer));
             int32_t * data = (int32_t *) pos_ctx->data;
             for (int64_t i = 0; i < ctx_len; ++i) {
-                data[i] = (i < n_real) ? (int32_t) i : 0;
+                data[i] = (i < n_real) ? (ctx_pos_base + (int32_t) i) : 0;
             }
         }
 
         if (pos_q_rebased && pos_q_rebased->buffer) {
             GGML_ASSERT(ggml_backend_buffer_is_host(pos_q_rebased->buffer));
             int32_t * data = (int32_t *) pos_q_rebased->data;
-            const bool have_pos = (ubatch != nullptr) && (ubatch->pos != nullptr)
-                               && ((int64_t) ubatch->n_tokens >= n_block);
             for (int64_t q = 0; q < n_block; ++q) {
-                data[q] = have_pos ? (int32_t) (ubatch->pos[q] - win_off) : (int32_t) (n_real + q);
+                data[q] = have_pos ? (int32_t) ubatch->pos[q] : (ctx_pos_base + (int32_t) n_real + (int32_t) q);
             }
         }
 
@@ -346,14 +476,13 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
             float * data = (float *) kq_mask_swa->data;
             const int64_t n_kv   = ctx_len + n_block;
             const int32_t window = (int32_t) n_swa;
-            const bool    have_pos = (ubatch != nullptr) && (ubatch->pos != nullptr)
-                                   && ((int64_t) ubatch->n_tokens >= n_block);
             for (int64_t q = 0; q < n_block; ++q) {
-                const int32_t q_pos = have_pos ? (int32_t) (ubatch->pos[q] - win_off) : (int32_t) (n_real + q);
+                const int32_t q_pos = have_pos ? (int32_t) ubatch->pos[q] : (ctx_pos_base + (int32_t) n_real + (int32_t) q);
                 for (int64_t k = 0; k < n_kv; ++k) {
                     float v = 0.0f;
                     if (k < n_real) {
-                        if (q_pos - (int32_t) k > window) v = -INFINITY;
+                        const int32_t k_pos = ctx_pos_base + (int32_t) k;
+                        if (q_pos - k_pos >= window) v = -INFINITY;
                     } else if (k < ctx_len) {
                         v = -INFINITY;
                     } else {
@@ -463,7 +592,16 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
             }
         }
 
-        // pos_ctx: per-slot position patterns in each drafter window.
+        // pos_ctx: per-slot absolute positions for the active drafter window.
+        int32_t slot_ctx_pos_base[LLAMA_DFLASH_MAX_SLOTS] = {};
+        const bool have_pos = (ubatch != nullptr) && (ubatch->pos != nullptr)
+                           && ((int64_t) ubatch->n_tokens >= n_block);
+        for (int s = 0; s < n_seqs && s < LLAMA_DFLASH_MAX_SLOTS; s++) {
+            const int64_t nc = slot_n_copy[s];
+            const int64_t full_nr = slot_info[s].n_real > 0 ? slot_info[s].n_real : 0;
+            const int32_t q_pos_base = have_pos ? (int32_t) ubatch->pos[s * n_seq_tokens] : (int32_t) full_nr;
+            slot_ctx_pos_base[s] = q_pos_base - (int32_t) nc;
+        }
         if (pos_ctx && pos_ctx->buffer) {
             GGML_ASSERT(ggml_backend_buffer_is_host(pos_ctx->buffer));
             int32_t * data = (int32_t *) pos_ctx->data;
@@ -471,7 +609,7 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
                 const int64_t nc  = slot_n_copy[s];
                 const int64_t off = (int64_t) s * per_slot_ctx;
                 for (int64_t i = 0; i < per_slot_ctx; i++) {
-                    data[off + i] = (i < nc) ? (int32_t) i : 0;
+                    data[off + i] = (i < nc) ? (slot_ctx_pos_base[s] + (int32_t) i) : 0;
                 }
             }
         }
@@ -479,15 +617,13 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
         if (pos_q_rebased && pos_q_rebased->buffer) {
             GGML_ASSERT(ggml_backend_buffer_is_host(pos_q_rebased->buffer));
             int32_t * data = (int32_t *) pos_q_rebased->data;
-            const bool have_pos = (ubatch != nullptr) && (ubatch->pos != nullptr)
-                               && ((int64_t) ubatch->n_tokens >= n_block);
             for (int64_t q = 0; q < n_block; ++q) {
                 const int qs = (int)(q / n_seq_tokens);
                 const int ql = (int)(q % n_seq_tokens);
                 const int64_t full_nr = slot_info[qs].n_real > 0 ? slot_info[qs].n_real : 0;
                 data[q] = have_pos
-                    ? (int32_t) (ubatch->pos[q] - slot_win_off[qs])
-                    : (int32_t) (full_nr + ql);
+                    ? (int32_t) ubatch->pos[q]
+                    : (slot_ctx_pos_base[qs] + (int32_t) full_nr + ql);
             }
         }
 
@@ -524,20 +660,19 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
             float * data = (float *) kq_mask_swa->data;
             const int64_t n_kv   = ctx_len + n_block;
             const int32_t window = (int32_t) n_swa;
-            const bool have_pos  = (ubatch->pos != nullptr)
-                                 && ((int64_t) ubatch->n_tokens >= n_block);
             for (int64_t q = 0; q < n_block; q++) {
                 const int qs = (int)(q / n_seq_tokens);
                 const int ql = (int)(q % n_seq_tokens);
                 const int64_t nc = slot_n_copy[qs];
                 const int64_t full_nr = slot_info[qs].n_real > 0 ? slot_info[qs].n_real : 0;
-                const int32_t q_pos = have_pos ? (int32_t) (ubatch->pos[q] - slot_win_off[qs]) : (int32_t)(full_nr + ql);
+                const int32_t q_pos = have_pos ? (int32_t) ubatch->pos[q] : (slot_ctx_pos_base[qs] + (int32_t) full_nr + ql);
                 for (int64_t k = 0; k < n_kv; k++) {
                     float v = -INFINITY;
                     if (k < ctx_len) {
                         const int ks = (int)(k / per_slot_ctx);
                         const int kl = (int)(k % per_slot_ctx);
-                        if (ks == qs && kl < nc && q_pos - (int32_t) kl <= window) {
+                        const int32_t k_pos = slot_ctx_pos_base[ks] + kl;
+                        if (ks == qs && kl < nc && q_pos - k_pos < window) {
                             v = 0.0f;
                         }
                     } else {
@@ -632,8 +767,22 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     ggml_tensor * inpL = build_inp_embd(tok_embd_use);
     ggml_tensor * inp_out_ids = n_outputs < n_tokens ? build_inp_out_ids() : nullptr;
 
-    // block positions rebased into the drafter's sliding window
+    // Keep absolute target positions so RoPE tracks the live suffix instead of
+    // restarting from zero when the cross window slides.
     ggml_tensor * inp_pos = pos_q_rebased;
+
+    // Full-attention draft layers consume accepted-prefix K/V from the normal
+    // drafter KV cache. Sliding layers still read the current target-hidden
+    // window directly because their context is already bounded by SWA.
+    llm_graph_input_attn_kv * inp_attn_kv_full = nullptr;
+    if (mctx) {
+        const bool rebind_base_from_iswa = hparams.swa_type != LLAMA_SWA_TYPE_NONE;
+        const llama_kv_cache_context * base_ctx =
+            rebind_base_from_iswa
+                ? static_cast<const llama_kv_cache_iswa_context *>(mctx)->get_base()
+                : static_cast<const llama_kv_cache_context *>(mctx);
+        inp_attn_kv_full = dflash_build_base_attn_input(res, ctx0, hparams, cparams, ubatch, base_ctx, rebind_base_from_iswa);
+    }
 
     // --- Fusion layer: project concatenated target hidden states ---
     ggml_tensor * fused_target = build_lora_mm(model.dflash_fc, target_hidden);
@@ -649,7 +798,7 @@ llm_build_dflash_draft::llm_build_dflash_draft(
         ggml_tensor * cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        // --- KV-injection attention ---
+        // --- Attention ---
         {
             // Q from drafter hidden only
             ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
@@ -660,7 +809,7 @@ llm_build_dflash_draft::llm_build_dflash_draft(
                                  ext_factor, attn_factor, beta_fast, beta_slow);
             cb(Qcur, "Qcur", il);
 
-            // K from drafter (noise tokens)
+            // K/V from drafter proposal tokens
             ggml_tensor * Kcur_noise = build_lora_mm(model.layers[il].wk, cur);
             Kcur_noise = ggml_reshape_3d(ctx0, Kcur_noise, n_embd_head, n_head_kv, n_tokens);
             Kcur_noise = build_norm(Kcur_noise, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
@@ -669,113 +818,120 @@ llm_build_dflash_draft::llm_build_dflash_draft(
                                        ext_factor, attn_factor, beta_fast, beta_slow);
             cb(Kcur_noise, "Kcur_noise", il);
 
-            const auto * kv_cache = cross ? cross->dflash_kv_cache : nullptr;
-            const dflash_kv_cache_mode kv_cache_mode = dflash_kv_cache_mode_env();
-            const bool use_kv_cache =
-                use_kv_cache_graph &&
-                kv_cache != nullptr &&
-                kv_cache_mode != DFLASH_KV_CACHE_OFF &&
-                il < kv_cache->n_layers &&
-                (int) kv_cache->k_ring.size() > il &&
-                (int) kv_cache->v_ring.size() > il &&
-                kv_cache->k_ring[il] != nullptr &&
-                kv_cache->v_ring[il] != nullptr;
-            const bool use_k_cache = use_kv_cache &&
-                (kv_cache_mode == DFLASH_KV_CACHE_BOTH || kv_cache_mode == DFLASH_KV_CACHE_K_ONLY);
-            const bool use_v_cache = use_kv_cache &&
-                (kv_cache_mode == DFLASH_KV_CACHE_BOTH || kv_cache_mode == DFLASH_KV_CACHE_V_ONLY);
-
-            // K from target (context features)
-            ggml_tensor * Kcur_ctx = nullptr;
-            if (use_k_cache) {
-                auto * k_ring = kv_cache->k_ring[il];
-                const int64_t write_pos = kv_cache->n_filled >= ctx_len
-                    ? (kv_cache->write_pos % ctx_len)
-                    : 0;
-                if (write_pos > 0) {
-                    const int64_t tail_len = ctx_len - write_pos;
-                    ggml_tensor * k_tail = ggml_view_3d(ctx0, k_ring,
-                        n_embd_head, n_head_kv, tail_len,
-                        k_ring->nb[1], k_ring->nb[2], (size_t) write_pos * k_ring->nb[2]);
-                    ggml_tensor * k_head = ggml_view_3d(ctx0, k_ring,
-                        n_embd_head, n_head_kv, write_pos,
-                        k_ring->nb[1], k_ring->nb[2], 0);
-                    Kcur_ctx = ggml_concat(ctx0, k_tail, k_head, 2);
-                    cb(Kcur_ctx, "Kcur_ctx_cache_ordered", il);
-                } else {
-                    Kcur_ctx = ggml_view_3d(ctx0, k_ring,
-                        n_embd_head, n_head_kv, ctx_len,
-                        k_ring->nb[1], k_ring->nb[2], 0);
-                    cb(Kcur_ctx, "Kcur_ctx_cache_pre_rope", il);
-                }
-                Kcur_ctx = ggml_rope_ext(ctx0, Kcur_ctx, pos_ctx, nullptr,
-                                         n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                                         ext_factor, attn_factor, beta_fast, beta_slow);
-            } else {
-                Kcur_ctx = build_lora_mm(model.layers[il].wk, fused_target);
-                Kcur_ctx = ggml_reshape_3d(ctx0, Kcur_ctx, n_embd_head, n_head_kv, ctx_len);
-                Kcur_ctx = build_norm(Kcur_ctx, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
-                Kcur_ctx = ggml_rope_ext(ctx0, Kcur_ctx, pos_ctx, nullptr,
-                                         n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                                         ext_factor, attn_factor, beta_fast, beta_slow);
-            }
-            cb(Kcur_ctx, use_k_cache ? "Kcur_ctx_cache" : "Kcur_ctx", il);
-
-            // V from drafter (noise tokens)
             ggml_tensor * Vcur_noise = build_lora_mm(model.layers[il].wv, cur);
             Vcur_noise = ggml_reshape_3d(ctx0, Vcur_noise, n_embd_head, n_head_kv, n_tokens);
             cb(Vcur_noise, "Vcur_noise", il);
 
-            // V from target (context features)
-            ggml_tensor * Vcur_ctx = nullptr;
-            if (use_v_cache) {
-                auto * v_ring = kv_cache->v_ring[il];
-                const int64_t write_pos = kv_cache->n_filled >= ctx_len
-                    ? (kv_cache->write_pos % ctx_len)
-                    : 0;
-                if (write_pos > 0) {
-                    const int64_t tail_len = ctx_len - write_pos;
-                    ggml_tensor * v_tail = ggml_view_3d(ctx0, v_ring,
-                        n_embd_head, n_head_kv, tail_len,
-                        v_ring->nb[1], v_ring->nb[2], (size_t) write_pos * v_ring->nb[2]);
-                    ggml_tensor * v_head = ggml_view_3d(ctx0, v_ring,
-                        n_embd_head, n_head_kv, write_pos,
-                        v_ring->nb[1], v_ring->nb[2], 0);
-                    Vcur_ctx = ggml_concat(ctx0, v_tail, v_head, 2);
-                    cb(Vcur_ctx, "Vcur_ctx_cache_ordered", il);
-                } else {
-                    Vcur_ctx = ggml_view_3d(ctx0, v_ring,
-                        n_embd_head, n_head_kv, ctx_len,
-                        v_ring->nb[1], v_ring->nb[2], 0);
-                }
+            if (inp_attn_kv_full && !hparams.is_swa(il)) {
+                const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
+                cur = build_attn(inp_attn_kv_full,
+                                 model.layers[il].wo, nullptr, nullptr,
+                                 Qcur, Kcur_noise, Vcur_noise,
+                                 nullptr, nullptr, nullptr, kq_scale, il);
             } else {
-                Vcur_ctx = build_lora_mm(model.layers[il].wv, fused_target);
-                Vcur_ctx = ggml_reshape_3d(ctx0, Vcur_ctx, n_embd_head, n_head_kv, ctx_len);
+                const auto * kv_cache = cross ? cross->dflash_kv_cache : nullptr;
+                const dflash_kv_cache_mode kv_cache_mode = dflash_kv_cache_mode_env();
+                const bool use_kv_cache =
+                    use_kv_cache_graph &&
+                    kv_cache != nullptr &&
+                    kv_cache_mode != DFLASH_KV_CACHE_OFF &&
+                    il < kv_cache->n_layers &&
+                    (int) kv_cache->k_ring.size() > il &&
+                    (int) kv_cache->v_ring.size() > il &&
+                    kv_cache->k_ring[il] != nullptr &&
+                    kv_cache->v_ring[il] != nullptr;
+                const bool use_k_cache = use_kv_cache &&
+                    (kv_cache_mode == DFLASH_KV_CACHE_BOTH || kv_cache_mode == DFLASH_KV_CACHE_K_ONLY);
+                const bool use_v_cache = use_kv_cache &&
+                    (kv_cache_mode == DFLASH_KV_CACHE_BOTH || kv_cache_mode == DFLASH_KV_CACHE_V_ONLY);
+
+                // K from target (context features)
+                ggml_tensor * Kcur_ctx = nullptr;
+                if (use_k_cache) {
+                    auto * k_ring = kv_cache->k_ring[il];
+                    const int64_t write_pos = kv_cache->n_filled >= ctx_len
+                        ? (kv_cache->write_pos % ctx_len)
+                        : 0;
+                    if (write_pos > 0) {
+                        const int64_t tail_len = ctx_len - write_pos;
+                        ggml_tensor * k_tail = ggml_view_3d(ctx0, k_ring,
+                            n_embd_head, n_head_kv, tail_len,
+                            k_ring->nb[1], k_ring->nb[2], (size_t) write_pos * k_ring->nb[2]);
+                        ggml_tensor * k_head = ggml_view_3d(ctx0, k_ring,
+                            n_embd_head, n_head_kv, write_pos,
+                            k_ring->nb[1], k_ring->nb[2], 0);
+                        Kcur_ctx = ggml_concat(ctx0, k_tail, k_head, 2);
+                        cb(Kcur_ctx, "Kcur_ctx_cache_ordered", il);
+                    } else {
+                        Kcur_ctx = ggml_view_3d(ctx0, k_ring,
+                            n_embd_head, n_head_kv, ctx_len,
+                            k_ring->nb[1], k_ring->nb[2], 0);
+                        cb(Kcur_ctx, "Kcur_ctx_cache_pre_rope", il);
+                    }
+                    Kcur_ctx = ggml_rope_ext(ctx0, Kcur_ctx, pos_ctx, nullptr,
+                                             n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                                             ext_factor, attn_factor, beta_fast, beta_slow);
+                } else {
+                    Kcur_ctx = build_lora_mm(model.layers[il].wk, fused_target);
+                    Kcur_ctx = ggml_reshape_3d(ctx0, Kcur_ctx, n_embd_head, n_head_kv, ctx_len);
+                    Kcur_ctx = build_norm(Kcur_ctx, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+                    Kcur_ctx = ggml_rope_ext(ctx0, Kcur_ctx, pos_ctx, nullptr,
+                                             n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                                             ext_factor, attn_factor, beta_fast, beta_slow);
+                }
+                cb(Kcur_ctx, use_k_cache ? "Kcur_ctx_cache" : "Kcur_ctx", il);
+
+                // V from target (context features)
+                ggml_tensor * Vcur_ctx = nullptr;
+                if (use_v_cache) {
+                    auto * v_ring = kv_cache->v_ring[il];
+                    const int64_t write_pos = kv_cache->n_filled >= ctx_len
+                        ? (kv_cache->write_pos % ctx_len)
+                        : 0;
+                    if (write_pos > 0) {
+                        const int64_t tail_len = ctx_len - write_pos;
+                        ggml_tensor * v_tail = ggml_view_3d(ctx0, v_ring,
+                            n_embd_head, n_head_kv, tail_len,
+                            v_ring->nb[1], v_ring->nb[2], (size_t) write_pos * v_ring->nb[2]);
+                        ggml_tensor * v_head = ggml_view_3d(ctx0, v_ring,
+                            n_embd_head, n_head_kv, write_pos,
+                            v_ring->nb[1], v_ring->nb[2], 0);
+                        Vcur_ctx = ggml_concat(ctx0, v_tail, v_head, 2);
+                        cb(Vcur_ctx, "Vcur_ctx_cache_ordered", il);
+                    } else {
+                        Vcur_ctx = ggml_view_3d(ctx0, v_ring,
+                            n_embd_head, n_head_kv, ctx_len,
+                            v_ring->nb[1], v_ring->nb[2], 0);
+                    }
+                } else {
+                    Vcur_ctx = build_lora_mm(model.layers[il].wv, fused_target);
+                    Vcur_ctx = ggml_reshape_3d(ctx0, Vcur_ctx, n_embd_head, n_head_kv, ctx_len);
+                }
+                cb(Vcur_ctx, use_v_cache ? "Vcur_ctx_cache" : "Vcur_ctx", il);
+
+                // concatenate K: [ctx, noise] along sequence dim (dim 2)
+                ggml_tensor * Kcur = ggml_concat(ctx0, Kcur_ctx, Kcur_noise, 2);
+                cb(Kcur, "Kcur", il);
+
+                // concatenate V: [ctx, noise] along sequence dim (dim 2)
+                ggml_tensor * Vcur = ggml_concat(ctx0, Vcur_ctx, Vcur_noise, 2);
+                cb(Vcur, "Vcur", il);
+
+                // prevent reordering
+                ggml_build_forward_expand(gf, Qcur);
+                ggml_build_forward_expand(gf, Kcur);
+                ggml_build_forward_expand(gf, Vcur);
+
+                // asymmetric attention: Q [head_dim, n_head, n_tokens]
+                //                       K [head_dim, n_head_kv, n_kv_total]
+                //                    mask [n_kv_total, n_tokens, 1, 1]
+                cur = build_attn_mha(Qcur, Kcur, Vcur, nullptr, kq_mask, nullptr, nullptr,
+                                     1.0f / sqrtf(float(n_embd_head)), il);
+                cb(cur, "kqv_out", il);
+
+                // output projection
+                cur = build_lora_mm(model.layers[il].wo, cur);
             }
-            cb(Vcur_ctx, use_v_cache ? "Vcur_ctx_cache" : "Vcur_ctx", il);
-
-            // concatenate K: [ctx, noise] along sequence dim (dim 2)
-            ggml_tensor * Kcur = ggml_concat(ctx0, Kcur_ctx, Kcur_noise, 2);
-            cb(Kcur, "Kcur", il);
-
-            // concatenate V: [ctx, noise] along sequence dim (dim 2)
-            ggml_tensor * Vcur = ggml_concat(ctx0, Vcur_ctx, Vcur_noise, 2);
-            cb(Vcur, "Vcur", il);
-
-            // prevent reordering
-            ggml_build_forward_expand(gf, Qcur);
-            ggml_build_forward_expand(gf, Kcur);
-            ggml_build_forward_expand(gf, Vcur);
-
-            // asymmetric attention: Q [head_dim, n_head, n_tokens]
-            //                       K [head_dim, n_head_kv, n_kv_total]
-            //                    mask [n_kv_total, n_tokens, 1, 1]
-            cur = build_attn_mha(Qcur, Kcur, Vcur, nullptr, kq_mask, nullptr, nullptr,
-                                 1.0f / sqrtf(float(n_embd_head)), il);
-            cb(cur, "kqv_out", il);
-
-            // output projection
-            cur = build_lora_mm(model.layers[il].wo, cur);
         }
 
         // residual connection
@@ -855,25 +1011,54 @@ llm_build_dflash_kv_update::llm_build_dflash_kv_update(
     ggml_tensor * target_hidden = inp_update->target_hidden;
     res->add_input(std::move(inp_update));
 
+    ggml_tensor * inp_pos = nullptr;
+    llm_graph_input_attn_kv_commit_backend * inp_attn_kv = nullptr;
+    if (mctx != nullptr) {
+        inp_pos = build_inp_pos();
+        inp_attn_kv = dflash_build_commit_attn_input(
+            res, ctx0, hparams, cparams, ubatch, static_cast<const llama_kv_cache_context *>(mctx));
+    }
+
     ggml_tensor * fused_target = build_lora_mm(model.dflash_fc, target_hidden);
     fused_target = build_norm(fused_target, model.dflash_hidden_norm, nullptr, LLM_NORM_RMS, -1);
     cb(fused_target, "dflash_kv_update_fused", -1);
-
-    res->dflash_k_update.reserve(n_layer);
-    res->dflash_v_update.reserve(n_layer);
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * Kcur_ctx = build_lora_mm(model.layers[il].wk, fused_target);
         Kcur_ctx = ggml_reshape_3d(ctx0, Kcur_ctx, n_embd_head, n_head_kv, n_tokens);
         Kcur_ctx = build_norm(Kcur_ctx, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
-        cb(Kcur_ctx, "dflash_kv_update_k", il);
-        res->dflash_k_update.push_back(Kcur_ctx);
-        ggml_build_forward_expand(gf, Kcur_ctx);
-
         ggml_tensor * Vcur_ctx = build_lora_mm(model.layers[il].wv, fused_target);
         Vcur_ctx = ggml_reshape_3d(ctx0, Vcur_ctx, n_embd_head, n_head_kv, n_tokens);
-        cb(Vcur_ctx, "dflash_kv_update_v", il);
-        res->dflash_v_update.push_back(Vcur_ctx);
-        ggml_build_forward_expand(gf, Vcur_ctx);
+
+        if (mctx == nullptr) {
+            cb(Kcur_ctx, "dflash_kv_update_k", il);
+            res->dflash_k_update.push_back(Kcur_ctx);
+            ggml_build_forward_expand(gf, Kcur_ctx);
+
+            cb(Vcur_ctx, "dflash_kv_update_v", il);
+            res->dflash_v_update.push_back(Vcur_ctx);
+            ggml_build_forward_expand(gf, Vcur_ctx);
+            continue;
+        }
+
+        if (hparams.is_swa(il)) {
+            continue;
+        }
+
+        Kcur_ctx = ggml_rope_ext(ctx0, Kcur_ctx, inp_pos, nullptr,
+                                 n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                                 ext_factor, attn_factor, beta_fast, beta_slow);
+        cb(Kcur_ctx, "dflash_kv_commit_k", il);
+        cb(Vcur_ctx, "dflash_kv_commit_v", il);
+
+        GGML_ASSERT(inp_attn_kv != nullptr);
+        if (inp_attn_kv->self_k_rot) {
+            Kcur_ctx = dflash_mul_mat_aux(ctx0, Kcur_ctx, inp_attn_kv->self_k_rot);
+        }
+        if (inp_attn_kv->self_v_rot) {
+            Vcur_ctx = dflash_mul_mat_aux(ctx0, Vcur_ctx, inp_attn_kv->self_v_rot);
+        }
+        ggml_build_forward_expand(gf, inp_attn_kv->kv->cpy_k(ctx0, Kcur_ctx, inp_attn_kv->get_k_idxs(), il, inp_attn_kv->sinfo));
+        ggml_build_forward_expand(gf, inp_attn_kv->kv->cpy_v(ctx0, Vcur_ctx, inp_attn_kv->get_v_idxs(), il, inp_attn_kv->sinfo));
     }
 }
