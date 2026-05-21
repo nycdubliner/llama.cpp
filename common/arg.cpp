@@ -1032,7 +1032,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             };
             const bool b_passed   = arg_passed({"-b", "--batch-size"});
             const bool ub_passed  = arg_passed({"-ub", "--ubatch-size"});
-            const bool cd_passed  = arg_passed({"-cd", "--ctx-size-draft"});
+            const bool cd_passed  = arg_passed({"-cd", "--ctx-size-draft", "--spec-draft-ctx-size"});
 
             if (!cd_passed && params.speculative.draft.n_ctx == 0) {
                 LOG_INF("dflash: setting -cd to 256 (drafter doesn't need the full main ctx; pass -cd N to override)\n");
