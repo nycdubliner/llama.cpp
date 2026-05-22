@@ -45,9 +45,9 @@ llama-server \
   --kv-unified \
   -ngl all \
   --spec-draft-ngl all \
-  -b 2048 -ub 256 \
-  --ctx-size 122800 \
-  --cache-type-k turbo4 --cache-type-v turbo3_tcq \
+  -b 2048 -ub 512 \
+  --ctx-size 102400 \
+  --cache-type-k q5_0 --cache-type-v q4_0 \
   --flash-attn on \
   --cache-ram 0 \
   --jinja \
@@ -69,7 +69,7 @@ What this shape means:
 | `-ngl all`, `--spec-draft-ngl all` | Fully offload target and draft models when devices can hold them. |
 | `-b`, `-ub` | Override DFlash-safe parser caps for prompt prefill batching. |
 | `--cache-type-k`, `--cache-type-v` | Use asymmetric KV precision. |
-| `--cache-ram 0` | Disable the server prompt-cache RAM subsystem. |
+| `--cache-ram 0` | Disable the server prompt-cache RAM subsystem. Live-slot prefix reuse still works. |
 | `--no-mmap`, `--mlock`, `--no-host` | Prefer locked model memory and direct backend buffer behavior over filesystem cache behavior. |
 | `--metrics`, `--log-*` | Expose metrics and make logs easier to capture. |
 | `--reasoning on`, `--chat-template-kwargs`, `--temp`, `--top-k`, `--min-p` | Control thinking/template behavior and target sampling. |
@@ -197,10 +197,10 @@ Bee fork cache storage:
 | `turbo3_tcq` | `3.25` bpv | TCQ path, commonly useful for V in Bee experiments. |
 | `turbo2_tcq` | `2.25` bpv | Most compressed TCQ path; verify carefully. |
 
-For long-context DFlash serving, the launch script's asymmetric choice is:
+For current long-context Qwen and Gemma DFlash serving, the common asymmetric choice is:
 
 ```sh
---cache-type-k turbo4 --cache-type-v turbo3_tcq
+--cache-type-k q5_0 --cache-type-v q4_0
 ```
 
 Do not assume enum compatibility with TheTom's public TurboQuant fork. Bee uses the buun enum order for Turbo/TCQ types while keeping a 128-value `turbo3` block.
@@ -312,7 +312,7 @@ Adaptive Draft-Max is enabled by default for DFlash. It can reduce the active dr
 | `--spec-dm-profit-warmup N` | `0` | Positive-depth warmup cycles after the no-spec baseline is seeded (0 = use --spec-dm-profit-min-samples). |
 | `--spec-dm-profit-baseline-interval N` | `1024` | Active speculative cycles between no-spec baseline reprobes (0 = disabled). |
 
-Use `profit` for normal serving. Use `fringe` when you want behavior tied more directly to observed draft acceptance near the active tail. Use `--no-spec-dm-adaptive` only when comparing fixed `--spec-draft-n-max` values or reproducing a narrow benchmark.
+Use `profit` for normal serving. Use `fringe` when you want behavior tied more directly to observed draft acceptance near the active tail. Use `--no-spec-dm-adaptive --spec-draft-n-max N` when comparing fixed draft depths.
 
 ## Other Speculative Backends
 
@@ -483,12 +483,32 @@ Validation rules in the server require positive windows/periods/coverage/interva
 | `--log-timestamps` | Include timestamps in logs. |
 | `--log-prefix` | Include log prefixes. |
 | `--log-colors on|off|auto` | Control ANSI color output. Use `off` for clean log files. |
+| `-lv`, `--verbosity N`, `--log-verbosity N` | Log threshold. `0` generic, `1` error, `2` warning, `3` info, `4` debug. Also available as `LLAMA_LOG_VERBOSITY`. |
+| `-v`, `--verbose`, `--log-verbose` | Set verbosity to the maximum debug level. |
 
 The launch script uses all three so captured logs are stable:
 
 ```sh
 --log-timestamps --log-prefix --log-colors off
 ```
+
+Routine per-ubatch `decode ubatch` timing and the non-profile `spec cycle` summary are debug-level logs. Use `--verbosity 4` or `--verbose` when you want those lines.
+
+DFlash diagnostic environment variables:
+
+| Env var | Use |
+| --- | --- |
+| `GGML_DFLASH_PROFILE=default,prefill` | Enables summary, replay, copy, verify, and prefill diagnostics without trace logging. `1`, `on`, `true`, and `default` mean `summary,replay,copy,verify`. |
+| `GGML_DFLASH_PROFILE_SYNC_SPLIT=1` | Forces a diagnostic scheduler sync after verifier graph compute so decode wait time is separated from compact logits copy time. This changes timing shape and is for profiling only. |
+| `GGML_DFLASH_DEBUG=1` | Enables DFlash debug logs such as prefill route/capture decisions. |
+| `GGML_DFLASH_CRASH_TRACE=1` | Enables high-volume crash breadcrumbs around recurrent backup and decode sync points. |
+| `GGML_DFLASH_INPUT_DEBUG=1` | Dumps DFlash drafter input metadata for input-shape debugging. |
+| `GGML_DFLASH_VERBOSE_CONTRACT=1` | Logs extra drafter/target contract details during DFlash setup. |
+| `GGML_DFLASH_FORCE_CPU_CROSS=1` | Force the CPU hidden-state cross path even when the GPU ring is available. |
+| `GGML_DFLASH_VERIFY_PAD=1` | Re-enable diagnostic verifier padding to the active draft depth. Default is off because padded rows consume target verify time but are not sampled or accepted. |
+| `GGML_DFLASH_GPU_RING=0` | Disable the GPU cross-attention ring and force the CPU ring path. |
+| `GGML_DFLASH_MAX_CTX=N` | Cap the DFlash cross-attention context length. `0` removes the cap. |
+| `GGML_DFLASH_KV_CACHE_MODE=k|v|both|off` | Keep only K projections, only V projections, both, or disable the DFlash drafter K/V cache entirely. |
 
 ## Request JSON Overrides
 
@@ -528,7 +548,7 @@ llama-server -m target.gguf \
   -ngl all \
   --spec-draft-ngl all \
   -b 2048 \
-  -ub 256 \
+  -ub 512 \
   --kv-unified \
   --cache-type-k turbo4 \
   --cache-type-v turbo3_tcq \

@@ -63,31 +63,28 @@ Two practical combos have emerged from benchmarking. Pick one based on what you 
 
 | Combo | Target | Drafter | K cache | V cache | Best for |
 |-------|--------|---------|---------|---------|----------|
-| **Precision** | Q5_K_S | Q4_K_M or Q5_K_M | turbo4 | turbo3_tcq | Coding and precision-sensitive tasks where quality matters more than speed |
-| **Speed / VRAM** | Q4_K_M or IQ4_XS | Q4_K_M or IQ4_XS | turbo3_tcq | turbo3_tcq (or turbo2_tcq for extreme VRAM saving) | Throughput, VRAM-constrained, or when prompt generation speed matters more than precision |
+| **Precision** | Q5_K_S | IQ4_XS or Q4_K_M or Q5_K_M | q5_0 | q4_1 | Coding and precision-sensitive tasks where quality matters more than speed |
+| **Speed / VRAM** | Q4_K_M or Q4_K_S or IQ4_XS | IQ4_XS or Q4_K_M | q4_0 | q4_0 (or turbo3_tcq for tighter VRAM) | Throughput, VRAM-constrained, or when prompt generation speed matters more than precision |
 
-The precision combo gives the best model quality. The drafter is Q4_K_M or Q5_K_M: at higher draft depths stronger draft quality might help acceptance rates. The speed combo uses a lighter Q4_K_M target which generates tokens faster and free VRAM for higher `--ctx-size` or `-ub`, at the cost of some precision.
+The precision combo gives the best model quality. The `q5_0` K cache plus `q4_1` V cache is the current default, as my recent long-context KV quant benchmarks showed it is a better quality/size trade than the older TurboQuant recommendation. The speed combo uses lighter Q4 targets that generate tokens faster and frees VRAM for higher `--ctx-size` or `-ub`, at the cost of some precision.
 
-For extreme VRAM savings look for IQ4_XS model, specifically the one linked below in the download sections, as it's probably the smallest Q4 model out there with its size rivaling higher end of Q3 models. IQ4_XS drafter might be worth trying and benchmarking as well.
+For extreme VRAM savings look for IQ4_XS model, specifically the one linked below in the download sections, as it's probably the smallest Q4 model out there with its size rivaling higher end of Q3 models.
 
 As for heavier drafters like Q8, from my testing it was always a net negative for tok/s, probably due to combination of the model being much larger, and quantization not mattering as much for drafting as all the model needs to do is guess 8-16 tokens at a time. But if someone will provide benchmarks that prove otherwise or point out it's due to an incorrect implementation in the code, I'll be happy to change the stance.
 
 ### Where to download
 
-**Target model** — from [unsloth/Qwen3.6-27B-GGUF](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF): Q5_K_S and Q4_K_M.
+**Target model** — from [unsloth/Qwen3.6-27B-GGUF](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF)
 
 For the IQ4_XS target used in extreme VRAM situations: [cHunter789/Qwen3.6-27B-i1-IQ4_XS-GGUF](https://huggingface.co/cHunter789/Qwen3.6-27B-i1-IQ4_XS-GGUF).
 
-**DFlash draft model:**
-- [spiritbuun/Qwen3.6-27B-DFlash-GGUF](https://huggingface.co/spiritbuun/Qwen3.6-27B-DFlash-GGUF) — Q8 and Q4_K_M
-- [Ardenzard/Qwen3.6-27B-DFlash-GGUF](https://huggingface.co/Ardenzard/Qwen3.6-27B-DFlash-GGUF) — Q5_K_M, IQ4_XS, and other quants
-- [z-lab/Qwen3.6-27B-DFlash](https://huggingface.co/z-lab/Qwen3.6-27B-DFlash) — original full-precision weights
+**DFlash draft model** — from [Anbeeld/Qwen3.6-27B-DFlash-GGUF](https://huggingface.co/Anbeeld/Qwen3.6-27B-DFlash-GGUF)
 
 The draft model shares the target's token embedding and LM head at runtime, so the GGUF file only contains the DFlash-specific weights.
 
 ### Multimodal projector (optional)
 
-Download from [unsloth/Qwen3.6-27B-GGUF](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) (look for `mmproj-BF16.gguf`). The launch command below uses `--no-mmproj-offload`, which runs the mmproj on the CPU instead of the GPU. On a dedicated GPU this frees VRAM for the model and cache at the cost of some mmproj latency. On systems with unified memory (macOS/Metal) the flag does not save VRAM — the GPU and CPU share the same pool — so drop it and let the mmproj use the GPU via Metal.
+Download from [unsloth/Qwen3.6-27B-GGUF](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) (look for `mmproj-BF16.gguf`).
 
 ## Launch
 
@@ -97,15 +94,15 @@ Replace the model paths with your own.
 
 ### Precision combo (coding, quality-sensitive)
 
-Q5_K_S target, Q4_K_M drafter, turbo4 K cache, turbo3_tcq V cache. Vision is enabled but is offloaded to CPU as thus consumes no VRAM, which seems to work with no issues whatsoever thanks to fixes implemented in the fork.
+Q5_K_S target, IQ4_XS or Q4_K_M or Q5_K_M drafter, `q5_0` K cache, `q4_1` V cache. Vision is enabled but is offloaded to CPU as thus consumes no VRAM, which seems to work with no issues whatsoever thanks to fixes implemented in the fork.
 
-Note that this config has low-ish 120k context (`--ctx-size 122800`) and `-ub 256` (important for prefill speed) by default. These values are considered safe and should work even with Windows reserving some VRAM and a couple of Electron-based VRAM hogs being open at the same time.
+Note that this config has 100k context (`--ctx-size 102400`) and `-ub 512` (important for prefill speed) by default. These values are considered safe and should work even with Windows reserving some VRAM and a couple of Electron-based VRAM hogs being open at the same time.
 
-I can personally confirm that on my RTX 3090 24GB after fresh Windows 11 restart and with minimum background apps, I was able to launch the precision combo with **200k context** and chat with the model about some stuff through **WebUI in Chromium**, with 2 monitors connected to dGPU and HWiNFO 64 open on the second monitor for checking stats.
+I can personally confirm that on my RTX 3090 24 GB after fresh Windows 11 restart and with minimum background apps, I was able to launch the precision combo with **160k context** and chat with the model about some stuff through **WebUI in Chromium**, with 2 monitors connected to dGPU and HWiNFO 64 open on the second monitor for checking stats.
 
-This of course consumed 99.7% of my VRAM, but after killing the server the system was still using **700MB VRAM**. Which basically means that if you eliminate VRAM pressure from other sources, you should be able to comfortably use the `Qwen 3/6 27B Q5 + Q4/Q5 DFlash + K TQ 4 + V TQ 3_tcq` combo with 150-200k context on a single 3090 or 4090, which to me sounds like a great deal.
+This of course consumed 99.5% of my VRAM, but after killing the server the system was still using **700MB VRAM**. Which basically means that if you eliminate VRAM pressure from other sources, you should be very comfortable with the precision combo above 100k context on a single 3090 or 4090.
 
-So if you are not on Windows, or your monitors are connected to iGPU freeing up gGPU VRAM, or your monitors are turned off and all apps are closed, etc. etc. you can freely experiment with higher values up to like 200k content and 512 or 1024 `-ub`.
+So if you are not on Windows, or your monitors are connected to iGPU freeing up gGPU VRAM, or your monitors are turned off and all apps are closed, etc. etc. you can freely experiment with higher values up to like 200k context.
 
 Also there's `--spec-dflash-cross-ctx 1024` which is how much context the drafter sees at the time. Higher values eat up more VRAM, but in my testing they didn't increase tok/s as this slowed down the drafter itself quite a bit. Default value is `512`, but for longer context `1024` seemed better from testing, still might be something worth tinkering with.
 
@@ -124,18 +121,17 @@ llama-server.exe `
   --kv-unified `
   -ngl all `
   --spec-draft-ngl all `
-  -b 2048 -ub 256 `
-  --ctx-size 122800 `
-  --cache-type-k turbo4 --cache-type-v turbo3_tcq `
+  -b 2048 -ub 512 `
+  --ctx-size 102400 `
+  --cache-type-k q5_0 --cache-type-v q4_1 `
   --flash-attn on `
   --cache-ram 0 `
   --jinja `
   --no-mmap --mlock `
-  --no-host --metrics `
-  --log-timestamps --log-prefix --log-colors off `
+  --no-host `
   --reasoning on `
   --chat-template-kwargs '{\"preserve_thinking\":true}' `
-  --temp 0.6 --top-k 20 --min-p 0.0
+  --temp 0.6 --top-k 20 --top-p 1.0 --min-p 0.0
 ```
 
 **Linux / macOS:**
@@ -153,42 +149,42 @@ llama-server \
   --kv-unified \
   -ngl all \
   --spec-draft-ngl all \
-  -b 2048 -ub 256 \
-  --ctx-size 122800 \
-  --cache-type-k turbo4 --cache-type-v turbo3_tcq \
+  -b 2048 -ub 512 \
+  --ctx-size 102400 \
+  --cache-type-k q5_0 --cache-type-v q4_1 \
   --flash-attn on \
   --cache-ram 0 \
   --jinja \
   --no-mmap --mlock \
-  --no-host --metrics \
-  --log-timestamps --log-prefix --log-colors off \
+  --no-host \
   --reasoning on \
   --chat-template-kwargs '{"preserve_thinking":true}' \
-  --temp 0.6 --top-k 20 --min-p 0.0
+  --temp 0.6 --top-k 20 --top-p 1.0 --min-p 0.0
 ```
 
 `--reasoning on` gives the drafter richer context via thinking tokens, which improves prediction quality. `--chat-template-kwargs '{"preserve_thinking":true}'` keeps those tokens across turns — recommended when reasoning is on. Turning reasoning off entirely is valid if your task does not benefit from it.
 
 ### Speed / VRAM combo (throughput, lighter)
 
-Q4_K_M or IQ4_XS target, maybe IQ4_XS drafter (debatable, default is probably still Q4_K_M), turbo3_tcq K and V cache. Frees a lot of VRAM for higher `--ctx-size` or `-ub`, or just allows to fit in if have less than 24GB VRAM. Prompt generation should be somewhat faster, at the cost of precision.
+Q4_K_M or IQ4_XS target, maybe IQ4_XS drafter (debatable, default is probably still Q4_K_M), `q4_0` K and V cache. Frees VRAM for higher `--ctx-size` or `-ub`, or just allows the model to fit if you have less than 24GB VRAM. Prompt generation should be somewhat faster, at the cost of precision.
 
 Change these flags from the precision command above, with drafter change being optional:
 
 ```
 -m "path\to\Qwen3.6-27B-Q4_K_M.gguf"
 --spec-draft-model "path\to\Qwen3.6-27B-DFlash-IQ4_XS.gguf"
---cache-type-k turbo3_tcq
+--cache-type-k q4_0
+--cache-type-v q4_0
 ```
 
-For even more VRAM headroom (and even less precision), use `turbo2_tcq` for the V cache: `--cache-type-v turbo2_tcq`.
+For even more VRAM headroom (and less precision), use `turbo3_tcq` for both K and V. If that still does not fit, use `turbo2_tcq` as a last resort.
 
 ### Optionally: use `--spec-draft-hf` instead of a local file
 
 Replace `--spec-draft-model "path/to/draft.gguf"` with:
 
 ```
---spec-draft-hf spiritbuun/Qwen3.6-27B-DFlash-GGUF:Q4_K_M
+--spec-draft-hf Anbeeld/Qwen3.6-27B-DFlash-GGUF:IQ4_XS
 ```
 
 This downloads the draft model from HuggingFace on first run and caches it locally.
@@ -210,15 +206,15 @@ For full command-line tuning, including upstream llama.cpp args, DFlash args, Tu
 
 | Flag | Value | What it controls |
 |------|-------|-----------------|
-| `--ctx-size` | `122800` | Total KV context allocation. Lower to save VRAM |
+| `--ctx-size` | `102400` | Total KV context allocation. Lower to save VRAM |
 | `-b` | `2048` | Logical batch size for prompt evaluation |
-| `-ub` | `256` | Physical microbatch size |
+| `-ub` | `512` | Physical microbatch size |
 | `--kv-unified` | — | Single KV buffer shared across server slots |
 | `-ngl` | `all` | Offload all target model layers to GPU |
-| `--cache-type-k` | `turbo4` | TurboQuant K cache (4.125 bits/value, 3.88× FP16 compression). Slightly slower than `turbo3_tcq` but more precise |
-| `--cache-type-v` | `turbo3_tcq` | TurboQuant+TCQ V cache (3.25 bits/value, 4.92× FP16 compression) |
-| `--flash-attn` | `on` | Use Flash Attention kernels (auto-enabled when TurboQuant cache types are selected) |
-| `--cache-ram` | `0` | Disable prompt cache in system RAM (default is 8192 MiB) |
+| `--cache-type-k` | `q5_0` | K cache quantization. `q5_0` is the recommended default for Q5_K_S targets |
+| `--cache-type-v` | `q4_1` | V cache quantization. `q4_1` keeps the default cache footprint reasonable while preserving better tail behavior|
+| `--flash-attn` | `on` | Use Flash Attention kernels |
+| `--cache-ram` | `0` | Disable prompt-cache RAM snapshots (default is 8192 MiB). Live-slot prefix reuse still works |
 | `--jinja` | — | Enable Jinja template engine for chat formatting |
 
 ### Model and sampling flags
@@ -232,6 +228,7 @@ For full command-line tuning, including upstream llama.cpp args, DFlash args, Tu
 | `--chat-template-kwargs` | `{"preserve_thinking":true}` | Preserve thinking tokens across turns for better output quality and stronger drafter predictions. Recommended when `--reasoning on` |
 | `--temp` | `0.6` | Sampling temperature |
 | `--top-k` | `20` | Top-K sampling |
+| `--top-p` | `1.0` | Top-P sampling |
 | `--min-p` | `0.0` | Min-P sampling (0 = disabled) |
 
 ### Server and infrastructure flags
@@ -241,12 +238,8 @@ For full command-line tuning, including upstream llama.cpp args, DFlash args, Tu
 | `-np` | `1` | Parallel slots (DFlash works with one slot by default) |
 | `--port` | `8082` | HTTP listen port |
 | `--no-host` | — | Bypass host buffer, allowing extra buffers to be used |
-| `--metrics` | — | Expose Prometheus metrics at `/metrics` |
 | `--no-mmap` | — | Load model into memory instead of memory-mapping |
 | `--mlock` | — | Lock model pages in RAM to prevent swapping |
-| `--log-timestamps` | — | Timestamp each log line |
-| `--log-prefix` | — | Prefix log lines with the log level |
-| `--log-colors` | `off` | Disable colored log output |
 
 ## Platform notes
 
@@ -256,11 +249,11 @@ Full DFlash acceleration: GPU cross-attention ring buffer, device-to-device hidd
 
 ### Apple Metal (macOS)
 
-DFlash runs through the CPU ring buffer path — functional but slower than CUDA — because there is no GPU cross-attention ring on Metal. Only `turbo3` and `turbo4` are available on Metal; `turbo2` and the TCQ types (`turbo2_tcq`, `turbo3_tcq`) are CUDA-only. On macOS, use `turbo4` for K cache and `turbo4` or `turbo3` for V cache instead of `turbo3_tcq`.
+DFlash runs through the CPU ring buffer path — functional but slower than CUDA — because there is no GPU cross-attention ring on Metal. The recommended `q5_0` / `q4_1` cache works as the normal path. Only `turbo3` and `turbo4` are available from the TurboQuant family on Metal; `turbo2` and the TCQ types (`turbo2_tcq`, `turbo3_tcq`) are CUDA-only.
 
 ### AMD ROCm
 
-DFlash falls back to the CPU ring buffer path. The ROCm build compiles from the same CUDA source files (via HIP), so TurboQuant and TCQ cache types may work, but compilation success under HIPCC is not guaranteed. If TCQ types fail, use `turbo4` for K cache and `turbo4` or `turbo3` for V cache instead of `turbo3_tcq`. If all TurboQuant types fail, fall back to `q8_0` or `f16` instead. Build with `-DGGML_HIP=ON` instead of `-DGGML_CUDA=ON`.
+DFlash falls back to the CPU ring buffer path. Standard cache types such as `q5_0` and `q4_1` are the recommended starting point. The ROCm build compiles TurboQuant from the same CUDA source files (via HIP), so TurboQuant and TCQ cache types may work, but compilation success under HIPCC is not guaranteed. If TCQ types fail, stay on standard cache types or try non-TCQ TurboQuant. Build with `-DGGML_HIP=ON` instead of `-DGGML_CUDA=ON`.
 
 ### Vulkan
 
@@ -276,16 +269,18 @@ Tree verification (`--spec-branch-budget` > 0) is automatically disabled when th
 |----------|---------|--------|
 | `GGML_DFLASH_GPU_RING` | enabled | Set to `0` to disable the GPU cross-attention ring buffer and force CPU-only ring |
 | `GGML_DFLASH_MAX_CTX` | `4096` | Cap cross-attention context length in tokens. Set to `0` for unlimited |
-| `GGML_DFLASH_PROFILE` | `0` | Set to `1` to enable DFlash timing diagnostics in logs |
+| `GGML_DFLASH_PROFILE` | `0` | `1` / `default` enables summary, replay, copy, and verify timing. Add categories such as `prefill` or `trace` for deeper profiling |
+| `GGML_DFLASH_DEBUG` | `0` | Enable DFlash debug logs such as prefill route and capture decisions |
+| `GGML_DFLASH_CRASH_TRACE` | `0` | Enable high-volume crash breadcrumbs around recurrent backup and decode sync points |
 | `GGML_DFLASH_KV_CACHE_MODE` | `both` | DFlash K/V cache mode: `off`/`none`/`disabled` disables, `k`/`k-only` keeps K only, `v`/`v-only` keeps V only, unset or any other value keeps both |
 
 ## Adjusting for your hardware
 
 The default command targets 24 GB VRAM with Q5_K_S. If you are running out of memory, adjust in this order:
 
-1. **Reduce `--ctx-size`.** Each unit of context costs VRAM for both the target model's KV cache and the DFlash cross-attention buffer. Dropping from 122800 to 65536 or 32768 frees significant memory.
-2. **Switch cache types.** Replace `turbo4` / `turbo3_tcq` with more aggressive compression. On CUDA, `turbo2` for K and `turbo2_tcq` for V squeeze further. On Metal, use `turbo3` for both K and V. On any backend, standard types (`q8_0`, `q4_0`) are available as a fallback.
-3. **Drop the target quantization.** Move from Q5_K_S to Q4_K_M, or as a last resort to IQ4_XS.
+1. **Reduce `--ctx-size`.** Each unit of context costs VRAM for both the target model's KV cache and the DFlash cross-attention buffer. Dropping from 102400 to 65536 or 32768 frees significant memory.
+2. **Switch cache types.** Replace `q5_0` / `q4_1` with `q4_0` / `q4_0` first. On CUDA, `turbo3_tcq` for both K and V squeezes further; `turbo2_tcq` is the last resort. On Metal, use `turbo3` for both K and V if `q4_0` is too large.
+3. **Drop the target quantization.** Move from Q5_K_S to Q4_K_M or Q4_K_S, or as a last resort to IQ4_XS.
 4. **Reduce `--spec-dflash-cross-ctx`.** Lowering from 1024 to 512 saves VRAM at the cost of less context for the drafter's cross-attention.
 5. **Lower context checkpoints.** Each checkpoint stores a full KV state copy. The default caps at 32 checkpoints per slot (`--ctx-checkpoints 32`), taken every 8192 tokens during prefill (`--checkpoint-every-n-tokens 8192`). At long contexts this adds up. Drop to 16 or 24 to free RAM:
 
@@ -295,21 +290,21 @@ The default command targets 24 GB VRAM with Q5_K_S. If you are running out of me
 
 6. **Remove `--mlock`.** If system RAM is abundant and swapping is not a concern, `--mlock` can be removed.
 
-Start with the precision combo and drop down if VRAM is tight. The drafter quantization matters too: Q4_K_M as default, Q5_K_M for potential gains from precision, IQ4_XS for a tiny bit more VRAM.
+Start with the precision combo and drop down if VRAM is tight.
 
 ### When you have VRAM to spare
 
 If you switch to a lighter target quantization (Q4_K_M or IQ4_XS) or boast a 5090 with its 32GB, the spare VRAM buys you more than just breathing room. Spend it on:
 
-- **Higher `--ctx-size`** — push past 120K and further without hitting the ceiling.
-- **Higher `-ub`** — raise the microbatch from 256 to 512 or 1024. This speeds up prompt prefill noticeably because more tokens are batched per GPU kernel launch. The ideal `-ub` is typically the largest power-of-two that still fits.
-- **Heavier KV cache types** — if you previously dropped cache compression to save VRAM, you can go back to `turbo4` / `turbo3_tcq` for better precision at the same context length.
+- **Higher model quant** — UD-Q5_K_XL, Q6_K and UD-Q6_K_XL models bring noticeable output quality improvements.
+- **Higher `--ctx-size`** — push past 100K and further without hitting the ceiling.
+- **Heavier KV cache types** — combo like `q8_0` / `q5_1` should be noticeably better at preserving precision.
 
 ## Adaptive draft depth
 
 By default, the server adjusts draft depth using the `profit` controller, which raises and lowers the active draft depth (up to the ceiling set by `--spec-draft-n-max`) based on real-time acceptance rates. You do not need to change anything to benefit from this.
 
-Adaptive draft is highly configurable, so if you are interested in tinkering with it, check out [beellama-args.md](beellama-args.md). For benchmarking with a fixed draft depth, use `--no-spec-dm-adaptive`.
+Adaptive draft is highly configurable, so if you are interested in tinkering with it, check out [beellama-args.md](beellama-args.md). For fixed-depth benchmarking, use `--no-spec-dm-adaptive --spec-draft-n-max N`.
 
 ## Troubleshooting
 
@@ -323,6 +318,6 @@ Adaptive draft is highly configurable, so if you are interested in tinkering wit
 
 **Slow DFlash on macOS.** The CPU ring path is slower than the CUDA GPU ring. This is a platform limitation, not a configuration issue. Reducing `--spec-dflash-cross-ctx` to 512 lowers CPU ring overhead.
 
-**TCQ cache types fail on non-CUDA backends.** `turbo2_tcq` and `turbo3_tcq` are CUDA-only. On Metal, use `turbo3` or `turbo4` for V cache instead (note that `turbo2` is also unavailable on Metal). On ROCm, try the TCQ types first; if they fail, try non-TCQ TurboQuant or use `q8_0` or `f16`.
+**TCQ cache types fail on non-CUDA backends.** `turbo2_tcq` and `turbo3_tcq` are CUDA-only. Use standard cache types such as `q5_0`, `q4_0`, `q8_0`, or `f16` instead. On Metal, non-TCQ TurboQuant is limited to `turbo3` and `turbo4`; on ROCm, non-TCQ TurboQuant may work if the HIP build succeeds.
 
 **DFlash seems disabled.** Check the server log for `dflash:` or `speculative` lines. If DFlash is active, you will see draft acceptance rates and timing. If you see no DFlash output, verify that `--spec-type dflash` is set and the draft model loaded successfully. A DFlash draft GGUF auto-detects as `dflash` even without `--spec-type`, but setting it explicitly avoids ambiguity.

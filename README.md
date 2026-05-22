@@ -6,17 +6,20 @@ BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing
 
 > Not quite a pegasus, but close enough.
 
-Here's a [plug-and-play Qwen 3.6 27B setup](docs/quickstart-qwen36-dflash.md) with a config to run it in Q5 + 200k of practically lossless KV cache + vision on a single RTX 3090 or 4090.
+### Plug-and-play setups
+
+- [Qwen 3.6 27B Q5_K_S + DFlash + vision + 160k context in 24 GB VRAM](docs/quickstart-qwen36-dflash.md)
+- [Gemma 4 31B Q4_K_S + DFlash + vision + 140k context in 24 GB VRAM](docs/quickstart-gemma-4-31b-dflash.md)
 
 [![Support my work!](https://anbeeld.com/images/support.jpg)](https://anbeeld.com/support)
 
 ## Fork Features
 
-- **DFlash speculative decoding**: `--spec-type dflash` drives a DFlash draft GGUF alongside the target model. The target captures hidden states into a per-layer 4096-slot ring buffer, the drafter cross-attends to the most recent `--spec-dflash-cross-ctx` hidden-state tokens and proposes drafts for target verification.
-- **TurboQuant / TCQ KV-cache compression**: Five cache types (`turbo2`, `turbo3`, `turbo4`, `turbo2_tcq`, `turbo3_tcq`) spanning from 4x to 7.5x compression, with higher-bit options being practically lossless in many cases. Set independently with `--cache-type-k` and `--cache-type-v`.
-- **Adaptive draft-max control**: The server adjusts the active draft horizon at runtime instead of using a fixed `--spec-draft-n-max`. The default `profit` controller compares speculative throughput against a no-spec baseline; the `fringe` alternative maps acceptance-rate bands to draft depth.
-- **Full multimodal support**: When `--mmproj` is active, the server keeps flat DFlash available for text generation. The model can be fully offloaded to CPU with no problems to reduce VRAM pressure.
-- **Reasoning-loop protection**: The server detects repeated hidden reasoning output and intervenes. Default mode is `force-close` with `--reasoning-loop-window` and `--reasoning-loop-max-period` tuning available.
+- **DFlash speculative decoding**: `--spec-type dflash` drives a DFlash draft GGUF alongside the target model. The target captures hidden states into a ring buffer, the drafter cross-attends to the most recent `--spec-dflash-cross-ctx` hidden-state tokens and proposes drafts for target verification.
+- **Adaptive draft-max control**: The server adjusts the active draft horizon at runtime instead of using a fixed `--spec-draft-n-max`. The default `profit` controller compares speculative throughput against a no-spec baseline, the `fringe` alternative maps acceptance-rate bands to draft depth.
+- **Full multimodal support**: When `--mmproj` is active, the server keeps DFlash available for text generation. The model can be fully offloaded to CPU with no problems to reduce VRAM pressure.
+- **TurboQuant / TCQ KV-cache compression**: Five cache types (`turbo2`, `turbo3`, `turbo4`, `turbo2_tcq`, `turbo3_tcq`) spanning from 4x to 7.5x compression, with TCQ types offering good precision for their size. Set independently with `--cache-type-k` and `--cache-type-v`.
+- **Reasoning-loop protection**: The server detects repeated hidden reasoning output and intervenes. Default mode is `force-close`, with `--reasoning-loop-window` and `--reasoning-loop-max-period` tuning available.
 - **Sampled DFlash verification**: `--spec-draft-temp` enables rejection-sampling drafter behavior. Activates when both draft and target temperature exceed zero. Draft log probabilities must be available for rejection sampling to produce correct output.
 - **DDTree branch verification**: optional `--spec-branch-budget` adds branch nodes beyond the main draft path with GPU `parent_ids`, tree masks, and recurrent tree kernels. Disabled automatically when the target model spans more than one GPU. This one is very much work in progress!
 - **Request-level speculative overrides**: Draft-max and branch budget can be overridden per-request through JSON fields without restarting the server.
@@ -28,32 +31,264 @@ TurboQuant (WHT-based scalar quantization) originates from [TheTom/llama-cpp-tur
 
 ## DFlash Speedup
 
-Here's your typical "write in Python" best-case ceiling benchmark with [Qwen 3.6 27B](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) using [Q4_K_M drafter](https://huggingface.co/spiritbuun/Qwen3.6-27B-DFlash-GGUF) on a single RTX 3090 24GB. Like any other speculative prediction, DFlash is strongest on structured, repetitive generation: code, tests, boilerplate, JSON-like formats, and other low-entropy continuations.
+DFlash is strongest on structured, repetitive generation: code, tests, boilerplate, JSON-like formats, and other low-entropy continuations. Open-ended prose is much less predictable, so gains are smaller.
 
-| Task | Model | Output | Baseline | Bee DFlash | Speedup | Acceptance |
+* Setup: Windows 11, AMD Ryzen 7 5700X3D, 32 GB DDR4 RAM, RTX 3090 24 GB
+* Config: same as recommended in quick start docs ([Qwen 3.6 27B](docs/quickstart-qwen36-dflash.md), [Gemma 4 31B](docs/quickstart-gemma-4-31b-dflash.md))
+* Baseline llama.cpp used in comparison is [b9275](https://github.com/ggml-org/llama.cpp/releases/tag/b9275) CUDA 13.1 Windows prebuilt
+
+<details>
+<summary>Benchmark prompts</summary>
+
+**Task store module**
+
+```text
+Write one complete Python 3 file using only the standard library.
+
+Return only Python code. Do not use markdown, comments, tests, examples, or explanatory text.
+
+Implement a deterministic Task store module with a compact, repetitive structure that is easy to predict.
+
+Required shape:
+- imports: dataclasses, datetime, typing
+- dataclass Task with fields id: int, title: str, status: str, created_at: str
+- class TaskStore with an internal dict[int, Task]
+- methods: add, get, rename, mark_done, reopen, delete, clear, list_all, list_open, list_done, count_open, count_done, titles, to_dicts, __len__, __contains__
+- add assigns increasing integer ids starting at 1
+- valid statuses are "open" and "done"
+- all list methods return tasks sorted by id
+- count_open and count_done use explicit loops
+- titles returns task titles sorted by task id
+- to_dicts returns deterministic dictionaries sorted by id
+- to_dicts includes id, title, status, and created_at keys for every task
+- raise ValueError for empty title or missing task id
+- use straightforward if statements and explicit loops
+- keep method bodies short and similar in style
+- no argparse, no JSON, no file IO, no unittest, no pytest
+- target about 110 to 132 lines of code
+- define __all__ = ["Task", "TaskStore"]
+- stop immediately after defining __all__
+```
+
+**KV report module**
+
+```text
+Write one complete Python 3 file using only the standard library.
+
+Return only Python code. Do not use markdown, comments, tests, examples, or explanatory text.
+
+Implement a deterministic KV report module with a compact, repetitive structure that is easy to predict.
+
+Required shape:
+- imports: dataclasses, typing
+- dataclass Row with fields key: str, value: str
+- class Report with an internal list[Row]
+- methods: add, set, get, delete, clear, keys, values, items, sorted_rows, render_lines, render_text, render_csv, filter_prefix, update_many, to_dict, copy, count_prefix, first_key, __len__, __contains__
+- add appends a new row and rejects duplicate keys
+- set updates an existing row or appends a new row
+- get returns the value for a key
+- delete removes a row by key
+- keys, values, and items preserve insertion order
+- sorted_rows returns rows sorted by key
+- render_lines returns strings formatted as "key: value"
+- render_text joins render_lines with newline characters
+- render_csv returns deterministic "key,value" lines with a header
+- filter_prefix returns a new Report containing keys that start with the prefix
+- update_many applies set for each key and value in a dictionary sorted by key
+- to_dict returns a deterministic dictionary sorted by key
+- copy returns a new Report with the same rows in the same order
+- count_prefix returns the number of keys that start with the prefix using an explicit loop
+- first_key returns the first key and raises ValueError when there are no rows
+- raise ValueError for empty keys, duplicate keys, or missing keys
+- use straightforward if statements and explicit loops
+- keep method bodies short and similar in style
+- no enum, no alignment modes, no markdown table, no textwrap, no itertools, no unittest, no pytest
+- target about 130 to 155 lines of code
+- define __all__ = ["Row", "Report"]
+- stop immediately after defining __all__
+```
+
+**Doubly-linked list**
+
+```text
+Write a complete Python 3 module implementing a doubly-linked list with the following methods: append, prepend, insert_at, remove_at, find, reverse, to_list, length, is_empty, iter. Include comprehensive docstrings, type hints, and pytest unit tests for every method. Return only the code, no commentary.
+```
+
+**Multi-turn coding**
+
+**Turn 1**
+
+```text
+Build an async WebSocket gateway for telemetry devices. Use Python 3.12 style typing.
+
+Return exactly one labeled code block per requested file. Label each code block with a file header like `# ws_gateway/router.py`; outside code blocks, use at most one short sentence per file explaining why it exists. Assume this is a chat response only: do not mention saving files or accessing a filesystem.
+
+Return code blocks for:
+- `ws_gateway/models.py`: dataclasses/enums for `Topic`, `OutboundMessage`, `AckState`, `ClientId`, and `MetricSnapshot`
+- `ws_gateway/metrics.py`: small standard-library metrics collector with counters/gauges and a Prometheus text export method
+- `ws_gateway/errors.py`: error types for invalid topics, duplicate subscriptions, queue overflow policy errors, and closed sessions
+- `ws_gateway/config.py`: immutable config dataclass for queue depth, ping interval, ack timeout, and rate limits
+
+Keep prose brief and adjacent to the code. Do not write a separate architecture essay. Do not add extra files, alternate designs, or optional extensions.
+```
+
+**Turn 2**
+
+```text
+Now implement the topic router and subscriber queues. Return code-first output only: labeled code blocks plus brief inline notes if needed.
+
+Return code blocks for:
+- `ws_gateway/router.py`
+- `tests/test_router.py`
+
+Requirements:
+- MQTT-like topics with `+` for one segment and `#` for the remaining suffix
+- `subscribe`, `unsubscribe`, `publish`, `drain`, and `close_subscriber`
+- stable per-subscriber ordering
+- bounded per-subscriber queues with drop-oldest backpressure using a per-subscriber `deque(maxlen=...)`
+- injectable clock for tests
+- metrics updates for publishes, deliveries, drops, and active subscriptions
+- pytest tests for wildcard matching, ordering, unsubscribe cleanup, and queue overflow
+
+Use only the standard library in runtime code. Stay within the names and structure already established unless this prompt explicitly changes them.
+```
+
+**Turn 3**
+
+```text
+Add the connection/session layer over the router. Keep the answer mostly code: labeled code blocks and tests, no standalone design section.
+
+Return code blocks for:
+- `ws_gateway/session.py`
+- `tests/test_session.py`
+
+Implement:
+- `ClientSession` with user id, connection id, subscribed topics, last pong time, pending ack ids, and lifecycle state
+- `WebSocketLike` protocol with `send_json`, `close`, and `ping`
+- `ConnectionManager` that accepts an authenticated session, starts/stops tasks, maps users to sessions, and unsubscribes on disconnect
+- outbound delivery loop from subscriber queue to websocket
+- ping/pong keepalive with zombie detection at 3x interval
+- incoming token-bucket rate limiter at 10 messages/sec with burst 20
+- tests for clean disconnect, zombie close, slow consumer drops, and rate limit rejection
+
+Reuse the exact names and APIs already established unless this prompt explicitly changes them.
+```
+
+**Turn 4**
+
+```text
+Wire the service boundary. Keep prose to one-line notes beside code blocks.
+
+Return code blocks for:
+- `ws_gateway/app.py`: aiohttp app factory, websocket handler skeleton, health/readiness handlers, JWT verifier protocol, and graceful shutdown hooks
+- `ws_gateway/persistence.py`: minimal ack persistence protocol plus an in-memory implementation for tests
+- `tests/test_app_lifecycle.py`: tests for shutdown order, readiness false when persistence is unhealthy, and ack drain on disconnect
+- `docs/load_test_plan.md`: concise checklist only, no paragraphs
+
+Keep handlers thin and concrete. Do not introduce extra modules or abstractions beyond the listed files. The shutdown order and dependency boundaries must be concrete in code. Reuse the exact names and APIs already established unless this prompt explicitly changes them.
+```
+
+**Turn 5**
+
+```text
+Patch the code from this conversation. Output only chat-safe patch content: one short comment line per issue, then a unified diff or replacement snippet, then a pytest test. No separate review prose and no filesystem instructions.
+
+Fix the top 5 concrete correctness problems likely in this gateway:
+- leaked delivery or keepalive tasks on disconnect
+- duplicate subscription state after reconnect
+- unfair drop-oldest behavior across hot and cold topics
+- ack persistence race during shutdown
+- readiness or metrics reporting success while internal tasks are failing
+
+For each fix, include:
+1. a one-line bug label as a code comment
+2. the smallest Python diff or replacement snippet
+3. one focused pytest test that fails before the fix
+
+Stay within the existing file labels and APIs.
+```
+
+</details>
+
+### Qwen 3.6 27B
+
+Target model: [Qwen 3.6 27B Q5_K_S](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) or [Qwen 3.6 27B MTP Q5_K_S](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF). DFlash model: [Q4_K_M](https://huggingface.co/Anbeeld/Qwen3.6-27B-DFlash-GGUF).
+
+| Prompt | Server | Output | Median | Best | Speedup | Acceptance |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Linked list | Q4_K_M | ~1.2K tok | 39.2 tok/s | **130.1 tok/s** | **3.32x** | 49.1% / 84.5% |
-| Linked list | Q5_K_S | ~1.2K tok | 36.5 tok/s | **135.8 tok/s** | **3.72x** | 47.8% / 85.8% |
-| Cache library | Q4_K_M | ~3.6K tok | 37.5 tok/s | **91.5 tok/s** | **2.44x** | 40.5% / 78.8% |
-| Cache library | Q5_K_S | ~3.6K tok | 35.9 tok/s | **83.7 tok/s** | **2.33x** | 36.7% / 76.2% |
+| Task store module | llama.cpp baseline | ~1K tok | 37.2 tok/s | 37.2 tok/s | 1.00x | N/A |
+| Task store module | Bee DFlash+ | ~1K tok | **163.9 tok/s** | 181.9 tok/s | **4.40x** | 67.7% / 89.2% |
+| Task store module | llama.cpp MTP | ~1K tok | 69.3 tok/s | 69.6 tok/s | 1.86x | 92.0% / 73.3% |
+| KV report module | llama.cpp baseline | ~1K tok | 34.6 tok/s | 36.5 tok/s | 1.00x | N/A |
+| KV report module | Bee DFlash+ | ~1K tok | **157.7 tok/s** | 162.5 tok/s | **4.56x** | 58.8% / 88.9% |
+| KV report module | llama.cpp MTP | ~1K tok | 67.3 tok/s | 68.1 tok/s | 1.94x | 89.3% / 73.0% |
+| Doubly-linked list | llama.cpp baseline | ~4K tok | 36.8 tok/s | 36.9 tok/s | 1.00x | N/A |
+| Doubly-linked list | Bee DFlash+ | ~4K tok | **130.8 tok/s** | 154.1 tok/s | **3.56x** | 50.4% / 86.8% |
+| Doubly-linked list | llama.cpp MTP | ~4K tok | 66.3 tok/s | 68.0 tok/s | 1.80x | 87.8% / 72.5% |
+| Prompt processing | llama.cpp baseline | ~20K tok | 1229.5 tok/s | 1229.5 tok/s | 1.00x | N/A |
+| Prompt processing | Bee DFlash+ | ~20K tok | **1214.4 tok/s** | 1221.7 tok/s | **0.99x** | N/A |
+| Prompt processing | llama.cpp MTP | ~20K tok | 1162.6 tok/s | 1164.7 tok/s | 0.95x | N/A |
+| Multi-turn coding | llama.cpp baseline | ~28K tok | 33.3 tok/s | 33.3 tok/s | 1.00x | N/A |
+| Multi-turn coding | Bee DFlash+ | ~30K tok | **64.6 tok/s** | 65.4 tok/s | **1.94x** | 24.9% / 72.9% |
+| Multi-turn coding | llama.cpp MTP | ~34K tok | 56.5 tok/s | 56.5 tok/s | 1.70x | 71.9% / 68.3% |
 
-*Acceptance: accepted to proposed draft tokens / accepted draft tokens to final generated tokens.*
+*Acceptance: accepted to proposed draft tokens / accepted draft tokens to final generated tokens*
 
-This is not a claim about all workloads. DFlash can go much faster on highly predictable code generation than on normal chat. Open-ended prose is much less predictable, so gains are smaller.
+### Gemma 4 31B
 
-On the bright side, adaptive draft-max will track how much DFlash is helping on the current task and will adjust its intensity accordingly, or even turn it off if you would dip below the baseline otherwise.
+Target model: [Gemma 4 31B Q4_K_S](https://huggingface.co/unsloth/gemma-4-31b-it-GGUF). DFlash model: [Q5_K_M](https://huggingface.co/Anbeeld/gemma-4-31B-it-DFlash-GGUF).
 
-## TurboQuant / TCQ cache
+| Prompt | Server | Output | Median | Best | Speedup | Acceptance |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Task store module | llama.cpp baseline | ~1K tok | 36.1 tok/s | 36.1 tok/s | 1.00x | N/A |
+| Task store module | Bee DFlash+ | ~1K tok | **177.8 tok/s** | 182.0 tok/s | **4.93x** | 65.7% / 90.0% |
+| KV report module | llama.cpp baseline | ~1K tok | 35.9 tok/s | 36.0 tok/s | 1.00x | N/A |
+| KV report module | Bee DFlash+ | ~1K tok | **154.3 tok/s** | 162.8 tok/s | **4.29x** | 55.7% / 88.6% |
+| Doubly-linked list | llama.cpp baseline | ~1.9K tok | 36.0 tok/s | 36.0 tok/s | 1.00x | N/A |
+| Doubly-linked list | Bee DFlash+ | ~1.9K tok | **116.6 tok/s** | 127.3 tok/s | **3.24x** | 44.5% / 84.9% |
+| Prompt processing | llama.cpp baseline | ~24K tok | 1021.3 tok/s | 1021.3 tok/s | 1.00x | N/A |
+| Prompt processing | Bee DFlash+ | ~24K tok | **954.5 tok/s** | 954.9 tok/s | **0.93x** | N/A |
+| Multi-turn coding | llama.cpp baseline | ~12K tok | 34.8 tok/s | 34.8 tok/s | 1.00x | N/A |
+| Multi-turn coding | Bee DFlash+ | ~12K tok | **60.6 tok/s** | 64.1 tok/s | **1.74x** | 24.4% / 72.3% |
 
-| Type | bpv | Diff | Quality vs f16/q8_0 | Practical verdict |
-| --- | ---: | ---: | --- | --- |
-| turbo4 | 4.125 | 3.88x | Best scalar TurboQuant quality tier. Available tests show minimal measurable degradation vs f16/q8_0. | Best safe scalar compression target, especially for V cache. |
-| turbo3_tcq | 3.25 | 4.92x | Strongest 3-bit quality. The TCQ docs report 10–44% KL reduction over scalar 2–3 bit quantization and lower PPL than FP16 in one Qwen3.5-27B result: 5.802 vs 5.805. | Best high-compression quality-aware option. |
-| turbo3 | 3.125 | 5.12x | Strong compression with measurable quality cost. Available tests put it below turbo4 but still usable on tolerant models/configs. | Aggressive scalar compression. Validate per model, especially if used on K. |
-| turbo2_tcq | 2.25 | 7.11x | Best 2-bit option. Per the TCQ docs it significantly improves 2-bit quantization and closes much of the gap with 3-bit scalar methods. | Extreme compression with better quality story than scalar 2-bit. |
-| turbo2 | 2.125 | 7.53x | Extreme scalar compression. Highest quality risk among scalar TurboQuant types. | Emergency context/VRAM mode. Prefer as a last resort V-only. |
+*Acceptance: accepted to proposed draft tokens / accepted draft tokens to final generated tokens*
 
-TurboQuant is not *truly* lossless at any point, but on the higher end it might very well be *practically* lossless for most tasks. Especially when one's *practicality* is heavily influenced by VRAM constraints and how to get the most out of it.
+## KV Cache Quantization
+
+K and V cache types are set independently with `--cache-type-k` and `--cache-type-v`. For benchmark details, see [KV Cache Quantization Benchmarks for Long Context](https://anbeeld.com/articles/kv-cache-quantization-benchmarks-for-long-context).
+
+### Preset Ladder
+
+| K / V | % of bf16 size | 99.9% precision | What it is for |
+| --- | ---: | ---: | --- |
+| bf16 / bf16 | 100 | 100.0% | Preserving full quality |
+| q8_0 / q8_0 | 53.1 | 94.6% | Compression with minimal losses |
+| **q8_0 / q5_1** | **45.3** | **94.2%** | **Great precision/size at high end** |
+| q8_0 / q5_0 | 43.8 | 93.7% | If q8_0 / q5_1 doesn't fit just a bit |
+| q5_0 / q5_0 | 34.4 | 92.7% | Good precision/size, relatively safe |
+| **q5_0 / q4_1** | **32.8** | **92.6%** | **Best default if VRAM-constrained** |
+| q5_0 / q4_0 | 31.3 | 91.4% | If q5_0 / q4_1 doesn't fit just a bit |
+| q4_0 / q4_0 | 28.1 | 89.8% | Memory saving with precision loss |
+| q4_0 / turbo3_tcq | 24.2 | 84.9% | Smaller than q4, cleaner than turbo3_tcq |
+| **turbo3_tcq / turbo3_tcq** | **20.3** | **81.6%** | **Viable as extreme compression** |
+| turbo2_tcq / turbo2_tcq | 14.1 | 54.4% | Last resort: not for code and tool calls |
+
+*99.9% precision = `100 · exp(−(quantKLD − bf16KLD))` at the 99.9% KL-divergence tail.*
+
+### Type Reference
+
+| Type | Origin | bpv | Diff vs bf16 | Notes |
+| --- | --- | ---: | ---: | --- |
+| q8_0 | upstream | 8.5 | 1.88× | High-fidelity K or V |
+| q5_1 | upstream | 6 | 2.67× | Conservative, might be better for V than q5_0 |
+| q5_0 | upstream | 5.5 | 2.91× | Strong K type for VRAM constrained configs |
+| q4_1 | upstream | 5 | 3.2× | Smaller than q5_0, but weaker in the tail. Prefer q5_0 for K |
+| q4_0 | upstream | 4.5 | 3.56× | Default high compression type, decent at its size |
+| turbo4 | fork | 4.125 | 3.88× | Barely smaller than q4_0, slower, worse tail |
+| turbo3_tcq | fork | 3.25 | 4.92× | Viable compact mode, 82% precision at KLD 99.9%. CUDA-only |
+| turbo3 | fork | 3.125 | 5.12× | Weaker than turbo3_tcq. Use only when TCQ is unavailable |
+| turbo2_tcq | fork | 2.25 | 7.11× | Last resort, 54% precision at KLD 99.9%. CUDA-only |
+| turbo2 | fork | 2.125 | 7.53× | Extreme quality risk. Use only when TCQ is unavailable |
 
 ## Installation
 

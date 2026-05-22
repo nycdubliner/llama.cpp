@@ -9,7 +9,7 @@ The short feature list is below. For full command-line tuning, including upstrea
 BeeLlama's practical advantage is combination. Public llama.cpp has the main runtime, public TheTom has classic TurboQuant work, and public buun has DFlash/TCQ work. BeeLlama brings those lines together and adds server-facing controls that are not present in the checked public refs.
 
 - Modern llama.cpp base: GGUF model loading, `llama-server`, OpenAI-compatible HTTP endpoints, chat templates, reasoning output handling, sampling controls, multimodal projector loading, prompt caching, context checkpoints, unified KV, continuous batching, GPU offload, Flash Attention selection, and the upstream speculative backends that still apply.
-- DFlash draft architecture: `dflash-draft` model support, target hidden-state capture, a 4096-token per-layer CPU ring, a configurable DFlash cross-attention window, and a DFlash drafter context shared across server slots.
+- DFlash draft architecture: both Bee/buun `dflash-draft` and upstream-style `dflash` draft GGUF support, target hidden-state capture, a 4096-token per-layer CPU ring, a configurable DFlash cross-attention window, and a DFlash drafter context shared across server slots.
 - DFlash server execution: explicit `--spec-type dflash`, automatic DFlash detection for DFlash draft GGUFs, flat verification with `--spec-branch-budget 0`, tree verification with positive `--spec-branch-budget`, slot capping with `--spec-dflash-max-slots`, and request-time speculative overrides.
 - DDTree controls: Bee uses branch-only budgeting through `--spec-branch-budget`. Public buun's `--tree-budget` is still accepted for compatibility, but Bee converts it to branch nodes beyond the main draft path after parsing.
 - Adaptive Draft-Max: DFlash draft depth is not just a fixed `--spec-draft-n-max`. Bee adds server-side `profit` and `fringe` controllers with `--spec-dm-*` args, probe cycles, off dwell, EWMA stats, and continuation-state preservation.
@@ -31,7 +31,7 @@ BeeLlama's practical advantage is combination. Public llama.cpp has the main run
 | Chat templates and reasoning output | Yes | Inherited | Inherited | Yes, plus reasoning loop guard |
 | Multimodal projector path | Yes | Inherited | Inherited | Yes, with flat-DFlash compatibility rule |
 | Upstream speculative modes | Draft model, EAGLE3, ngram variants | Inherited where present | Inherited plus fork modes | Inherited plus DFlash, CopySpec, suffix, recycle |
-| DFlash draft architecture | No checked match | No checked match | Yes | Yes |
+| DFlash draft architecture | No checked match | No checked match | Yes | Yes, plus upstream `dflash` schema compatibility |
 | DFlash server path | No | No | Yes | Yes |
 | DFlash hidden-state CPU ring | No | No | Yes, fixed DFlash window in state | Yes, 4096-token per-layer ring |
 | DFlash cross window | No | No | Fixed `LLAMA_DFLASH_PER_SLOT_CTX = 512` at checked ref | `--spec-dflash-cross-ctx`, default `512` |
@@ -53,7 +53,7 @@ BeeLlama's practical advantage is combination. Public llama.cpp has the main run
 
 ## DFlash
 
-DFlash is the main fork feature. A DFlash draft model is loaded as the draft side of speculative decoding, but unlike a plain draft model it receives recent hidden states from the target model. Bee wires this through the server eval callback, target-side capture layers, DFlash cross-data APIs, and the `LLM_ARCH_DFLASH_DRAFT` architecture path.
+DFlash is the main fork feature. A DFlash draft model is loaded as the draft side of speculative decoding, but unlike a plain draft model it receives recent hidden states from the target model. Bee accepts both Bee/buun `dflash-draft` GGUFs and upstream-style `dflash` GGUFs, then wires them through the server eval callback, target-side capture layers, DFlash cross-data APIs, and the `LLM_ARCH_DFLASH_DRAFT` / `LLM_ARCH_DFLASH` architecture paths.
 
 The target-side hidden-state store is a CPU ring of 4096 tokens per captured layer. The drafter does not necessarily see all 4096 tokens on every draft. `--spec-dflash-cross-ctx` controls the recent hidden-state window exposed to DFlash; the code default is `512`, and the GPU cross ring is allocated for that requested window.
 
