@@ -6,7 +6,7 @@ BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing
 
 > Not quite a pegasus, but close enough.
 
-### Plug-and-play setups
+### Plug-and-Play Setups
 
 - [Qwen 3.6 27B Q5_K_S + DFlash + vision + 160k context in 24 GB VRAM](docs/quickstart-qwen36-dflash.md)
 - [Gemma 4 31B Q4_K_S + DFlash + vision + 140k context in 24 GB VRAM](docs/quickstart-gemma-4-31b-dflash.md)
@@ -292,9 +292,10 @@ K and V cache types are set independently with `--cache-type-k` and `--cache-typ
 
 ## Installation
 
-### Quickstart: DFlash on a Single GPU
+### Plug-and-Play Setups
 
-For a step-by-step walkthrough with Qwen 3.6 on a 24 GB NVIDIA card (RTX 3090/4090, etc.), see [docs/quickstart-qwen36-dflash.md](docs/quickstart-qwen36-dflash.md). It covers model download, prebuilt binaries, and a tuned launch command.
+- [Qwen 3.6 27B Q5_K_S + DFlash + vision + 160k context in 24 GB VRAM](docs/quickstart-qwen36-dflash.md)
+- [Gemma 4 31B Q4_K_S + DFlash + vision + 140k context in 24 GB VRAM](docs/quickstart-gemma-4-31b-dflash.md)
 
 ### Prebuilt (Windows)
 
