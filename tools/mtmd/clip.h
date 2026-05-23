@@ -125,3 +125,9 @@ struct clip_cap {
     bool has_audio;
 };
 struct clip_cap clip_get_cap(const char * fname);
+
+struct clip_decode_requirements {
+    bool needs_non_causal_full_batch;
+    int32_t min_decoder_batch_tokens;
+};
+struct clip_decode_requirements clip_get_decode_requirements(const char * fname);

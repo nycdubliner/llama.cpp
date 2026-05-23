@@ -255,6 +255,12 @@ struct mtmd_caps {
 };
 MTMD_API struct mtmd_caps mtmd_get_cap_from_file(const char * mmproj_fname);
 
+struct mtmd_decode_requirements {
+    bool needs_non_causal_full_batch;
+    int32_t min_decoder_batch_tokens;
+};
+MTMD_API struct mtmd_decode_requirements mtmd_get_decode_requirements_from_file(const char * mmproj_fname);
+
 /////////////////////////////////////////
 
 // test function, to be used in test-mtmd-c-api.c

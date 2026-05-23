@@ -48,9 +48,18 @@ int main(int argc, char ** argv) {
         "clip context params must receive the decoder physical ubatch");
     ok &= expect(mtmd_cpp.find("/* decoder_n_ubatch */ 0") != std::string::npos,
         "mtmd default params must leave decoder ubatch unspecified for API callers without a decoder context");
+    ok &= expect(mtmd_h.find("struct mtmd_decode_requirements") != std::string::npos &&
+                 mtmd_h.find("min_decoder_batch_tokens") != std::string::npos,
+        "mtmd must expose a lightweight mmproj decode-requirements query");
+    ok &= expect(clip_h.find("struct clip_decode_requirements") != std::string::npos &&
+                 clip_h.find("clip_get_decode_requirements") != std::string::npos,
+        "clip must expose metadata-only decode requirements for mtmd");
+    ok &= expect(mtmd_cpp.find("mtmd_get_decode_requirements_from_file") != std::string::npos,
+        "mtmd must wrap clip decode-requirement metadata queries");
 
     ok &= expect(server_context.find("mparams.decoder_n_ubatch = llama_n_ubatch(ctx)") != std::string::npos ||
-                 server_context.find("mparams.decoder_n_ubatch = llama_n_ubatch(ctx_tgt)") != std::string::npos,
+                 server_context.find("mparams.decoder_n_ubatch = llama_n_ubatch(ctx_tgt)") != std::string::npos ||
+                 server_context.find("mparams.decoder_n_ubatch = ctx_tgt ? llama_n_ubatch(ctx_tgt) : params_base.n_ubatch") != std::string::npos,
         "server mmproj setup must pass the text decoder ubatch to mtmd");
     ok &= expect(server_context.find("has_mmproj && params_base.fit_params && params_base.mmproj_use_gpu && llama_supports_gpu_offload() && !params_base.mmproj_gpu_swap") != std::string::npos,
         "server mmproj memory measurement for fit must only run when mmproj is GPU-offloaded");
@@ -61,12 +70,23 @@ int main(int argc, char ** argv) {
 
     ok &= expect(clip_cpp.find("clip_set_limit_image_tokens_for_non_causal_decode(hparams, 252, 280, decoder_n_ubatch)") != std::string::npos,
         "Gemma4 image token limits must be capped to decoder ubatch for non-causal image decode");
-    ok &= expect(clip_cpp.find("clip_set_limit_image_tokens_for_non_causal_decode(hparams, 8, 256, decoder_n_ubatch)") != std::string::npos,
-        "Gemma3 image token limits must be capped to decoder ubatch for non-causal image decode");
+    ok &= expect(clip_cpp.find("clip_set_fixed_image_size_for_non_causal_decode") == std::string::npos,
+        "Gemma3 fixed-size image decode must preserve full resolution instead of shrinking image_size");
+    ok &= expect(clip_cpp.find("PROJECTOR_TYPE_GEMMA3") != std::string::npos &&
+                 clip_cpp.find("requirements.min_decoder_batch_tokens = clip_default_fixed_image_tokens(model.hparams)") != std::string::npos,
+        "Gemma3 fixed-size decode requirements must report the full image token count");
     ok &= expect(clip_cpp.find("loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION, ctx_params.decoder_n_ubatch)") != std::string::npos,
         "clip initialization must pass decoder ubatch into vision hparam loading");
     ok &= expect(mtmd_cpp.find("/* decoder_n_ubatch */ ctx_params.decoder_n_ubatch") != std::string::npos,
         "mtmd must forward decoder ubatch to clip initialization");
+
+    const size_t decode_req_pos = server_context.find("mtmd_get_decode_requirements_from_file(mmproj_path.c_str())");
+    const size_t llama_init_pos = server_context.find("llama_init = common_init_from_params(params_base)");
+    ok &= expect(decode_req_pos != std::string::npos && llama_init_pos != std::string::npos && decode_req_pos < llama_init_pos,
+        "server must inspect mmproj decode requirements before creating the text context");
+    ok &= expect(server_context.find("params_base.n_batch = std::max(params_base.n_batch, mmproj_decode_req.min_decoder_batch_tokens)") != std::string::npos &&
+                 server_context.find("params_base.n_ubatch = std::max(params_base.n_ubatch, mmproj_decode_req.min_decoder_batch_tokens)") != std::string::npos,
+        "server must raise batch and ubatch before context creation for full non-causal image chunks");
 
     ok &= expect(mtmd_helper.find("const int32_t n_ubatch = llama_n_ubatch(lctx)") != std::string::npos,
         "mtmd image decode must inspect the decoder physical ubatch");

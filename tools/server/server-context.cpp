@@ -1682,9 +1682,26 @@ private:
         mparams.warmup           = use_gpu; // only warmup when on GPU
         mparams.image_min_tokens = params_base.image_min_tokens;
         mparams.image_max_tokens = params_base.image_max_tokens;
-        mparams.decoder_n_ubatch = llama_n_ubatch(ctx_tgt);
+        mparams.decoder_n_ubatch = ctx_tgt ? llama_n_ubatch(ctx_tgt) : params_base.n_ubatch;
         mparams.media_marker     = get_media_marker();
         return mparams;
+    }
+
+    void adjust_mmproj_decoder_batch_for_non_causal(const mtmd_decode_requirements & mmproj_decode_req) {
+        if (!mmproj_decode_req.needs_non_causal_full_batch || mmproj_decode_req.min_decoder_batch_tokens <= 0) {
+            return;
+        }
+
+        const int32_t old_n_batch  = params_base.n_batch;
+        const int32_t old_n_ubatch = params_base.n_ubatch;
+
+        params_base.n_batch = std::max(params_base.n_batch, mmproj_decode_req.min_decoder_batch_tokens);
+        params_base.n_ubatch = std::max(params_base.n_ubatch, mmproj_decode_req.min_decoder_batch_tokens);
+
+        if (params_base.n_batch != old_n_batch || params_base.n_ubatch != old_n_ubatch) {
+            SRV_WRN("mmproj non-causal image decode requires full chunks; raised batch/ubatch from %d/%d to %d/%d\n",
+                    old_n_batch, old_n_ubatch, params_base.n_batch, params_base.n_ubatch);
+        }
     }
 
     void reload_mmproj(bool use_gpu) {
@@ -1844,6 +1861,11 @@ private:
 
         const std::string & mmproj_path = params_base.mmproj.path;
         const bool has_mmproj = !mmproj_path.empty();
+
+        if (has_mmproj) {
+            const mtmd_decode_requirements mmproj_decode_req = mtmd_get_decode_requirements_from_file(mmproj_path.c_str());
+            adjust_mmproj_decoder_batch_for_non_causal(mmproj_decode_req);
+        }
 
         // measure mmproj memory for auto-fit (upstream #21489)
         // skip when mmproj_gpu_swap: mmproj starts on CPU, swap path handles GPU margin separately

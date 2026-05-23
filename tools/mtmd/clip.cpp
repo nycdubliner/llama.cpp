@@ -1022,6 +1022,22 @@ static void clip_set_limit_image_tokens_for_non_causal_decode(
     hparams.set_limit_image_tokens(effective_min, effective_max);
 }
 
+static int32_t clip_default_fixed_image_tokens(const clip_hparams & hparams) {
+    const int cur_merge = hparams.n_merge == 0 ? 1 : hparams.n_merge;
+    const int stride    = hparams.patch_size * cur_merge;
+
+    if (stride <= 0 || hparams.image_size <= 0) {
+        return 0;
+    }
+
+    const int default_side = hparams.image_size / stride;
+    if (default_side <= 0) {
+        return 0;
+    }
+
+    return default_side * default_side;
+}
+
 struct clip_model_loader {
     ggml_context_ptr ctx_meta;
     gguf_context_ptr ctx_gguf;
@@ -1402,7 +1418,6 @@ struct clip_model_loader {
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
                         // test model (tinygemma3) has a different value, we optionally read it
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
-                        clip_set_limit_image_tokens_for_non_causal_decode(hparams, 8, 256, decoder_n_ubatch);
                     } break;
 
                 case PROJECTOR_TYPE_GEMMA4V:
@@ -2970,6 +2985,32 @@ struct clip_cap clip_get_cap(const char * fname) {
     res.has_vision = loader.has_vision;
     res.has_audio  = loader.has_audio;
     return res;
+}
+
+struct clip_decode_requirements clip_get_decode_requirements(const char * fname) {
+    clip_decode_requirements requirements{};
+    clip_model_loader loader(fname, /* skip_tensors= */ true);
+
+    if (!loader.has_vision) {
+        return requirements;
+    }
+
+    clip_model model;
+    loader.load_hparams(model, CLIP_MODALITY_VISION, /* decoder_n_ubatch */ 0);
+
+    switch (model.proj_type) {
+        case PROJECTOR_TYPE_GEMMA3:
+            requirements.needs_non_causal_full_batch = true;
+            requirements.min_decoder_batch_tokens = clip_default_fixed_image_tokens(model.hparams);
+            break;
+        case PROJECTOR_TYPE_GEMMA4V:
+            requirements.needs_non_causal_full_batch = true;
+            break;
+        default:
+            break;
+    }
+
+    return requirements;
 }
 
 struct clip_image_size * clip_image_size_init() {

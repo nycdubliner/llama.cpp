@@ -1465,6 +1465,19 @@ struct mtmd_caps mtmd_get_cap_from_file(const char * fname) {
     }
 }
 
+struct mtmd_decode_requirements mtmd_get_decode_requirements_from_file(const char * fname) {
+    try {
+        auto tmp = clip_get_decode_requirements(fname);
+        mtmd_decode_requirements requirements;
+        requirements.needs_non_causal_full_batch = tmp.needs_non_causal_full_batch;
+        requirements.min_decoder_batch_tokens    = tmp.min_decoder_batch_tokens;
+        return requirements;
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: failed to get decode requirements from file '%s': %s\n", __func__, fname, e.what());
+        return mtmd_decode_requirements{ false, 0 };
+    }
+}
+
 //
 // Debugging API (NOT intended for public use)
 //

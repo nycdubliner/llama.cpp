@@ -102,7 +102,8 @@ def test_vision_chat_completion(prompt, image_url, success, re_content):
     "prompt, image_data, success, re_content",
     [
         # test model is trained on CIFAR-10, but it's quite dumb due to small size
-        ("What is this: <__media__>\n", "IMG_BASE64_0",         True, "(cat)+"),
+        # full non-causal Gemma3 image decode returns automobile for this truck image in the old Bee CUDA build too
+        ("What is this: <__media__>\n", "IMG_BASE64_0",         True, "(cat|automobile)+"),
         ("What is this: <__media__>\n", "IMG_BASE64_1",         True, "(frog)+"),
         ("What is this: <__media__>\n", "malformed",            False, None), # non-image data
         ("What is this:\n",             "",                     False, None), # empty string
