@@ -153,6 +153,7 @@ private:
     struct recurrent_copy_plan_entry {
         ggml_tensor * tensor = nullptr;
         size_t row_bytes = 0;
+        int device = -1;
     };
 
     bool build_recurrent_copy_plan();
@@ -161,7 +162,6 @@ private:
 
     bool copy_plan_valid = false;
     bool copy_plan_cuda_fast = false;
-    int copy_plan_device = -1;
     std::vector<recurrent_copy_plan_entry> copy_plan_entries;
     dflash_cuda_copy_d2d_fn_t copy_plan_fn_copy = nullptr;
     dflash_cuda_set_device_fn_t copy_plan_fn_set_device = nullptr;

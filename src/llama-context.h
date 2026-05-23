@@ -102,6 +102,9 @@ struct dflash_tape_gpu_layer {
     ggml_tensor * gate = nullptr;  // [1, H_v, max_tokens]
     ggml_tensor * beta = nullptr;  // [1, H_v, max_tokens]
     ggml_tensor * qkv  = nullptr;  // [conv_channels, max_tokens]
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_context * ctx = nullptr;
+    ggml_backend_dev_t dev = nullptr;
 };
 
 struct dflash_tape_gpu {
@@ -113,6 +116,10 @@ struct dflash_tape_gpu {
     int n_tokens = 0;                           // actual tokens recorded this pass
 
     ~dflash_tape_gpu() {
+        for (auto & layer : layers) {
+            if (layer.buf) ggml_backend_buffer_free(layer.buf);
+            if (layer.ctx) ggml_free(layer.ctx);
+        }
         if (buf) ggml_backend_buffer_free(buf);
         if (ctx) ggml_free(ctx);
     }

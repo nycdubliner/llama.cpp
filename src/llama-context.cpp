@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <stdexcept>
 
 //
@@ -30,6 +31,22 @@
 //
 
 static llama_memory_recurrent * get_recurrent_mem(llama_memory_t mem);
+
+static ggml_backend_reg_t dflash_gpu_backend_reg() {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+    if (!reg) {
+        reg = ggml_backend_reg_by_name("ROCm");
+    }
+    return reg;
+}
+
+static bool dflash_is_cuda_compatible_tensor(const ggml_tensor * t) {
+    if (!t || !t->data || !t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
+        return false;
+    }
+    const char * name = ggml_backend_buffer_name(t->buffer);
+    return name && (std::strncmp(name, "CUDA", 4) == 0 || std::strncmp(name, "ROCm", 4) == 0);
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -1121,6 +1138,14 @@ static bool dflash_profile_sync_split_enabled() {
     return enabled;
 }
 
+static bool dflash_allow_multi_gpu_tape() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_DFLASH_ALLOW_MULTI_GPU_TAPE");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
 static void dflash_log_decode_seq_state(
         const char * where,
         const llama_ubatch & ubatch,
@@ -1383,17 +1408,17 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
     // (called at the top of decode()) zeroes buf.n_tokens for every slot before
     // the ubatch loop, so each slot's buffer accumulates only that slot's tokens
     // (in their ubatch order) across all ubatches in this llama_decode() call.
-        if (h_it != cap->hidden_name_idx.end()) {
-            if (cap->profile) {
-                cap->profile_cb_read++;
-                cap->profile_cb_hidden_read++;
-                dflash_profile_cb_name(*cap, t, "read");
-            }
-            const int64_t new_embd = t->ne[0];
-            const int64_t new_n = t->ne[1];
-            const size_t h_idx = h_it->second;
+    if (h_it != cap->hidden_name_idx.end()) {
+        if (cap->profile) {
+            cap->profile_cb_read++;
+            cap->profile_cb_hidden_read++;
+            dflash_profile_cb_name(*cap, t, "read");
+        }
+        const int64_t new_embd = t->ne[0];
+        const int64_t new_n = t->ne[1];
+        const size_t h_idx = h_it->second;
 
-            if (n_seqs_unq <= 1) {
+        if (n_seqs_unq <= 1) {
             // single-seq fast path: route the whole tensor to one slot
             const int slot = ub ? ub->seq_id_unq[0] : -1;
             auto * sh = cap->slot_hiddens(slot);
@@ -1513,6 +1538,7 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
 
     return true;
 }
+
 
 void llama_context::set_dflash_sample_temp(float temp) {
     cparams.dflash_sample_temp = temp;
@@ -1668,7 +1694,8 @@ void llama_context::set_dflash_gpu_capture(bool enabled) {
         return;
     }
 
-    dflash_capture->gpu_capture_enabled = enabled;
+    dflash_capture->gpu_capture_enabled =
+        enabled || (model.n_devices() > 1 && dflash_allow_multi_gpu_tape());
 
     // Always clear the graph-embedded capture cparams when changing mode;
     // the decode loop will repopulate them if GPU capture is active and
@@ -1845,7 +1872,7 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
         return;
     }
 
-    if (model.n_devices() > 1) {
+    if (model.n_devices() > 1 && !dflash_allow_multi_gpu_tape()) {
         dflash_capture->hidden_gpu.clear();
         dflash_capture->tapes.clear();
         if (!dflash_capture->multi_gpu_capture_fallback_logged) {
@@ -1854,6 +1881,14 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
             dflash_capture->multi_gpu_capture_fallback_logged = true;
         }
         return;
+    }
+    if (model.n_devices() > 1 && !dflash_capture->multi_gpu_capture_fallback_logged) {
+        // ROCm/HIP device-placement constraint: For multi-GPU targets, tape buffers must be allocated
+        // on the exact GPU device running the respective recurrent layer to ensure local device visibility
+        // during graph executions and direct GPU replay enqueues, avoiding nonlocal buffer access failures.
+        LLAMA_LOG_INFO("%s: multi-GPU target detected (%zu devices); enabling experimental graph GPU tape while hidden capture stays on eval callback\n",
+            __func__, model.n_devices());
+        dflash_capture->multi_gpu_capture_fallback_logged = true;
     }
 
     allocate_hidden_gpu(n_slots, max_tokens);
@@ -1868,18 +1903,15 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
         return;
     }
 
-    // find GPU backend
-    ggml_backend_t gpu_backend = nullptr;
-    for (auto & backend : backends) {
-        auto * dev = ggml_backend_get_device(backend.get());
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            gpu_backend = backend.get();
-            break;
+    auto backend_for_dev = [&](ggml_backend_dev_t want_dev) -> ggml_backend_t {
+        for (auto & backend : backends) {
+            auto * dev = ggml_backend_get_device(backend.get());
+            if (dev == want_dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                return backend.get();
+            }
         }
-    }
-    if (!gpu_backend) {
-        return; // no GPU, fall back to CPU tape via eval callback
-    }
+        return nullptr;
+    };
 
     const auto & hparams = model.hparams;
     const auto & rec_ids = dflash_capture->recurrent_layer_ids;
@@ -1899,27 +1931,35 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
     dflash_capture->tapes.reserve(n_slots);
 
     size_t total_size = 0;
+    std::map<ggml_backend_dev_t, int> layers_by_dev;
 
     for (int slot = 0; slot < n_slots; ++slot) {
-        // allocate ggml context for this slot's tensor descriptors
-        size_t ctx_mem = ggml_tensor_overhead() * (n_rec * 5 + 2);
-        struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
-        struct ggml_context * tape_ctx = ggml_init(ctx_params);
-        if (!tape_ctx) {
-            LLAMA_LOG_WARN("%s: failed to create GPU tape context for slot %d, falling back to CPU tape\n",
-                __func__, slot);
-            dflash_capture->tapes.clear();
-            return;
-        }
-
         auto tape = std::make_unique<dflash_tape_gpu>();
         tape->layers.resize(n_rec);
         tape->layer_ids = dflash_capture->recurrent_layer_ids;
         tape->max_tokens = max_tokens;
-        tape->ctx = tape_ctx;
 
         for (int li = 0; li < n_rec; ++li) {
             const int il = rec_ids[li];
+            ggml_backend_dev_t layer_dev = model.dev_layer(il);
+            ggml_backend_t layer_backend = backend_for_dev(layer_dev);
+            if (!layer_backend) {
+                LLAMA_LOG_WARN("%s: no GPU backend for recurrent layer %d device %s; falling back to CPU tape\n",
+                    __func__, il, layer_dev ? ggml_backend_dev_name(layer_dev) : "<null>");
+                dflash_capture->tapes.clear();
+                return;
+            }
+
+            const size_t ctx_mem = ggml_tensor_overhead() * 7;
+            struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
+            struct ggml_context * tape_ctx = ggml_init(ctx_params);
+            if (!tape_ctx) {
+                LLAMA_LOG_WARN("%s: failed to create GPU tape context for slot %d layer %d, falling back to CPU tape\n",
+                    __func__, slot, il);
+                dflash_capture->tapes.clear();
+                return;
+            }
+
             const auto * conv_kernel = model.layers[il].ssm_conv1d;
             GGML_ASSERT(conv_kernel != nullptr);
             const int64_t conv_window = conv_kernel->ne[0] - 1;
@@ -1932,25 +1972,33 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
             tl.gate = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)max_tokens);
             tl.beta = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)max_tokens);
             tl.qkv  = ggml_new_tensor_2d(tape_ctx, GGML_TYPE_F32, conv_ch, (int64_t)max_tokens);
+
+            tl.ctx = tape_ctx;
+            tl.dev = layer_dev;
+            tl.buf = ggml_backend_alloc_ctx_tensors(tape_ctx, layer_backend);
+
+            if (!tl.buf) {
+                LLAMA_LOG_WARN("%s: failed to allocate GPU tape buffer for slot %d layer %d device %s, falling back to CPU tape\n",
+                    __func__, slot, il, ggml_backend_dev_name(layer_dev));
+                dflash_capture->tapes.clear();
+                return;
+            }
+
+            total_size += ggml_backend_buffer_get_size(tl.buf);
+            layers_by_dev[layer_dev] += 1;
         }
 
-        tape->buf = ggml_backend_alloc_ctx_tensors(tape_ctx, gpu_backend);
-
-        if (!tape->buf) {
-            LLAMA_LOG_WARN("%s: failed to allocate GPU tape buffer for slot %d, falling back to CPU tape\n",
-                __func__, slot);
-            dflash_capture->tapes.clear();
-            return;
-        }
-
-        total_size += ggml_backend_buffer_get_size(tape->buf);
         dflash_capture->tapes.push_back(std::move(tape));
     }
 
     dflash_capture->active_tape_idx = 0;
 
-    LLAMA_LOG_INFO("%s: allocated GPU tape buffers: %.1f MB total (%d slot%s, %d layers, %d max tokens)\n",
+    LLAMA_LOG_INFO("%s: allocated device-aware GPU tape buffers: %.1f MB total (%d slot%s, %d layers, %d max tokens)\n",
         __func__, total_size / (1024.0 * 1024.0), n_slots, n_slots == 1 ? "" : "s", n_rec, max_tokens);
+    for (const auto & kv : layers_by_dev) {
+        LLAMA_LOG_INFO("%s: dflash tape placement: device=%s layers=%d\n",
+            __func__, ggml_backend_dev_name(kv.first), kv.second);
+    }
 }
 
 void llama_context::allocate_hidden_gpu(int n_slots, int max_tokens) {
@@ -2173,33 +2221,33 @@ bool llama_context::dflash_memory_seq_cp_recurrent_ordered(
         llama_seq_id seq_id_dst,
         llama_pos    p0,
         llama_pos    p1) {
-    if (model.n_devices() > 1) {
-        return false;
-    }
-
     llama_memory_recurrent * mem_recr = get_recurrent_mem(get_memory());
     if (!mem_recr) {
         return false;
     }
 
-    ggml_backend_t gpu_backend = nullptr;
-    ggml_backend_reg_t cuda_reg = nullptr;
+    using sync_dflash_stream_to_backend_fn_t = bool (*)(ggml_backend_t);
+    struct gpu_wait_backend {
+        ggml_backend_t backend = nullptr;
+        sync_dflash_stream_to_backend_fn_t fn_wait_backend = nullptr;
+    };
+    std::vector<gpu_wait_backend> gpu_wait_backends;
+
     for (auto & backend : backends) {
         auto * dev = ggml_backend_get_device(backend.get());
         if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            gpu_backend = backend.get();
-            cuda_reg = ggml_backend_dev_backend_reg(dev);
-            break;
+            ggml_backend_reg_t cuda_reg = ggml_backend_dev_backend_reg(dev);
+            auto fn_wait_backend = cuda_reg
+                ? (sync_dflash_stream_to_backend_fn_t)
+                    ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_backend_wait_for_dflash_stream")
+                : nullptr;
+            if (!fn_wait_backend) {
+                return false;
+            }
+            gpu_wait_backends.push_back({ backend.get(), fn_wait_backend });
         }
     }
-    if (!gpu_backend || !cuda_reg) {
-        return false;
-    }
-
-    using sync_dflash_stream_to_backend_fn_t = bool (*)(ggml_backend_t);
-    auto fn_wait_backend = (sync_dflash_stream_to_backend_fn_t)
-        ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_backend_wait_for_dflash_stream");
-    if (!fn_wait_backend) {
+    if (gpu_wait_backends.empty()) {
         return false;
     }
 
@@ -2212,9 +2260,11 @@ bool llama_context::dflash_memory_seq_cp_recurrent_ordered(
         LLAMA_LOG_INFO("%s: dflash crash breadcrumb: recurrent ordered copy enqueued src=%d dst=%d\n",
                 __func__, (int) seq_id_src, (int) seq_id_dst);
     }
-    if (!fn_wait_backend(gpu_backend)) {
-        LLAMA_LOG_ERROR("%s: failed to order DFlash recurrent backup stream before verifier compute\n", __func__);
-        GGML_ABORT("failed to order DFlash recurrent backup stream before verifier compute");
+    for (const gpu_wait_backend & gpu_wait : gpu_wait_backends) {
+        if (!gpu_wait.fn_wait_backend(gpu_wait.backend)) {
+            LLAMA_LOG_ERROR("%s: failed to order DFlash recurrent backup stream before verifier compute\n", __func__);
+            GGML_ABORT("failed to order DFlash recurrent backup stream before verifier compute");
+        }
     }
     if (dflash_crash_trace_enabled()) {
         LLAMA_LOG_INFO("%s: dflash crash breadcrumb: recurrent ordered copy synced src=%d dst=%d\n",
@@ -2366,6 +2416,8 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
     const auto & rec_ids = dflash_capture->recurrent_layer_ids;
     auto & tape_layers   = dflash_capture->tape_layers;
 
+    const uint32_t n_embd_s = hparams.n_embd_s();
+
     // find the tail cell for this seq_id
     int32_t cell_idx = -1;
     if (seq_id >= 0 && (uint32_t) seq_id < mem_recurrent->size) {
@@ -2378,9 +2430,6 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         LLAMA_LOG_WARN("%s: no active cell for seq %d\n", __func__, seq_id);
         return;
     }
-
-    const uint32_t n_embd_s = hparams.n_embd_s();
-    const uint32_t n_embd_r = hparams.n_embd_r();
 
     // find a GPU backend for graph computation
     ggml_backend_t gpu_backend = nullptr;
@@ -2411,6 +2460,17 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
 
     const bool multi_gpu_target = model.n_devices() > 1;
     if (multi_gpu_target) {
+        if (use_gpu_tape && tape_replay_gdn_direct_gpu(mem_recurrent, cell_idx, n_accepted)) {
+            dflash_capture->replay_pending = true;
+            dflash_capture->replay_gpu_backend = nullptr;
+            dflash_capture->replay_graph_ctx = nullptr;
+            dflash_capture->replay_direct_gpu = true;
+            dflash_capture->replay_n_accepted = n_accepted;
+            dflash_capture->replay_cell_idx = cell_idx;
+            dflash_capture->replay_seq_id = seq_id;
+            dflash_capture->replay_mem_recurrent = mem_recurrent;
+            return;
+        }
         if (tape_replay_gdn_direct_from_cpu_tape(mem_recurrent, cell_idx, n_accepted)) {
             tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
             return;
@@ -2645,15 +2705,17 @@ bool llama_context::tape_replay_gdn_direct_gpu(llama_memory_recurrent * mem_recu
         return false;
     }
 
-    ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
+    ggml_backend_reg_t cuda_reg = dflash_gpu_backend_reg();
     if (!cuda_reg) {
         return false;
     }
     using ptr_device_fn_t = bool (*)(const void *, int *);
+    using prepare_ptr_fn_t = bool (*)(const void *);
     using replay_fn_t = bool (*)(void *, const void *, const void *, const void *, const void *, int, int, int, int);
     auto fn_ptr_device = (ptr_device_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_ptr_device");
+    auto fn_prepare = (prepare_ptr_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_prepare_ptr");
     auto fn_replay = (replay_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_replay_gdn_state_no_check");
-    if (!fn_ptr_device || !fn_replay) {
+    if (!fn_ptr_device || !fn_prepare || !fn_replay) {
         return false;
     }
 
@@ -2678,14 +2740,6 @@ bool llama_context::tape_replay_gdn_direct_gpu(llama_memory_recurrent * mem_recu
     std::vector<replay_launch> launches;
     launches.reserve(rec_ids.size());
 
-    auto is_cuda_tensor = [](const ggml_tensor * t) {
-        if (!t || !t->data || !t->buffer) {
-            return false;
-        }
-        const char * name = ggml_backend_buffer_name(t->buffer);
-        return name && std::strncmp(name, "CUDA", 4) == 0;
-    };
-
     for (size_t li = 0; li < rec_ids.size(); ++li) {
         const int il = rec_ids[li];
         if (li >= gpu_tape->layers.size()) {
@@ -2694,8 +2748,9 @@ bool llama_context::tape_replay_gdn_direct_gpu(llama_memory_recurrent * mem_recu
 
         ggml_tensor * s_tensor = mem_recurrent->s_l[il];
         auto & tl = gpu_tape->layers[li];
-        if (!is_cuda_tensor(s_tensor) || !is_cuda_tensor(tl.k) || !is_cuda_tensor(tl.v) ||
-                !is_cuda_tensor(tl.gate) || !is_cuda_tensor(tl.beta)) {
+        if (!dflash_is_cuda_compatible_tensor(s_tensor) || !dflash_is_cuda_compatible_tensor(tl.k) ||
+                !dflash_is_cuda_compatible_tensor(tl.v) || !dflash_is_cuda_compatible_tensor(tl.gate) ||
+                !dflash_is_cuda_compatible_tensor(tl.beta)) {
             return false;
         }
 
@@ -2737,21 +2792,38 @@ bool llama_context::tape_replay_gdn_direct_gpu(llama_memory_recurrent * mem_recu
         if (!fn_ptr_device(launch.state, &device)) {
             return false;
         }
-        if (replay_device < 0) {
-            replay_device = device;
-        } else if (device != replay_device) {
+        int k_device = -1;
+        int v_device = -1;
+        int gate_device = -1;
+        int beta_device = -1;
+        if (!fn_ptr_device(launch.k, &k_device) ||
+                !fn_ptr_device(launch.v, &v_device) ||
+                !fn_ptr_device(launch.gate, &gate_device) ||
+                !fn_ptr_device(launch.beta, &beta_device)) {
+            return false;
+        }
+        if (k_device != device || v_device != device || gate_device != device || beta_device != device) {
             return false;
         }
         launch.device = device;
+        if (replay_device < 0) {
+            replay_device = device;
+        } else if (device != replay_device) {
+            replay_device = -2;
+        }
     }
 
     const int64_t t_start_us = dflash_capture->profile ? ggml_time_us() : 0;
     dflash_capture->replay_sync_ptrs.clear();
-    dflash_capture->replay_sync_device = replay_device;
+    dflash_capture->replay_sync_device = replay_device >= 0 ? replay_device : -1;
     for (const auto & launch : launches) {
-        if (!fn_replay(launch.state, launch.k, launch.v, launch.gate, launch.beta,
+        if (!fn_prepare(launch.state) ||
+                !fn_replay(launch.state, launch.k, launch.v, launch.gate, launch.beta,
                     n_accepted, launch.S, launch.H_k, launch.H_v)) {
             GGML_ABORT("DFlash direct GPU GDN replay launch failed after validation\n");
+        }
+        if (replay_device < 0) {
+            dflash_capture->replay_sync_ptrs.push_back(launch.state);
         }
     }
     if (dflash_capture->profile) {
@@ -2761,7 +2833,7 @@ bool llama_context::tape_replay_gdn_direct_gpu(llama_memory_recurrent * mem_recu
         dflash_capture->profile_replay_direct_gpu += 1;
         dflash_capture->profile_replay_layers += launches.size();
     }
-    dflash_capture->replay_sync_ptr = launches.back().state;
+    dflash_capture->replay_sync_ptr = replay_device >= 0 ? launches.back().state : nullptr;
     return true;
 }
 
@@ -2770,7 +2842,7 @@ bool llama_context::tape_replay_gdn_direct_from_cpu_tape(llama_memory_recurrent 
         return false;
     }
 
-    ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
+    ggml_backend_reg_t cuda_reg = dflash_gpu_backend_reg();
     if (!cuda_reg) {
         return false;
     }
@@ -2819,14 +2891,6 @@ bool llama_context::tape_replay_gdn_direct_from_cpu_tape(llama_memory_recurrent 
         }
     };
 
-    auto is_cuda_tensor = [](const ggml_tensor * t) {
-        if (!t || !t->data || !t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
-            return false;
-        }
-        const char * name = ggml_backend_buffer_name(t->buffer);
-        return name && std::strncmp(name, "CUDA", 4) == 0;
-    };
-
     for (size_t li = 0; li < rec_ids.size(); ++li) {
         if (li >= tape_layers.size()) {
             cleanup();
@@ -2869,7 +2933,7 @@ bool llama_context::tape_replay_gdn_direct_from_cpu_tape(llama_memory_recurrent 
         }
 
         ggml_tensor * s_tensor = mem_recurrent->s_l[il];
-        if (!is_cuda_tensor(s_tensor)) {
+        if (!dflash_is_cuda_compatible_tensor(s_tensor)) {
             cleanup();
             return false;
         }
@@ -2960,7 +3024,7 @@ bool llama_context::tape_replay_conv_gpu(llama_memory_recurrent * mem_recurrent,
         return false;
     }
 
-    ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
+    ggml_backend_reg_t cuda_reg = dflash_gpu_backend_reg();
     if (!cuda_reg) {
         return false;
     }
@@ -3045,7 +3109,7 @@ bool llama_context::tape_replay_conv_gpu_from_cpu_tape(llama_memory_recurrent * 
         return false;
     }
 
-    ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
+    ggml_backend_reg_t cuda_reg = dflash_gpu_backend_reg();
     if (!cuda_reg) {
         return false;
     }
@@ -3090,14 +3154,6 @@ bool llama_context::tape_replay_conv_gpu_from_cpu_tape(llama_memory_recurrent * 
         }
     };
 
-    auto is_cuda_tensor = [](const ggml_tensor * t) {
-        if (!t || !t->data || !t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
-            return false;
-        }
-        const char * name = ggml_backend_buffer_name(t->buffer);
-        return name && std::strncmp(name, "CUDA", 4) == 0;
-    };
-
     for (size_t li = 0; li < rec_ids.size(); ++li) {
         if (li >= tape_layers.size()) {
             cleanup();
@@ -3109,7 +3165,7 @@ bool llama_context::tape_replay_conv_gpu_from_cpu_tape(llama_memory_recurrent * 
         if (!r_tensor) {
             continue;
         }
-        if (!is_cuda_tensor(r_tensor)) {
+        if (!dflash_is_cuda_compatible_tensor(r_tensor)) {
             cleanup();
             return false;
         }
@@ -3406,7 +3462,7 @@ void llama_context::tape_replay_sync() {
     } else if (dflash_capture->replay_direct_gpu &&
             (!dflash_capture->replay_sync_ptrs.empty() || dflash_capture->replay_sync_ptr)) {
         const int64_t t_start_us = dflash_capture->profile ? ggml_time_us() : 0;
-        ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
+        ggml_backend_reg_t cuda_reg = dflash_gpu_backend_reg();
         using sync_ptr_fn_t = bool (*)(const void *);
         using sync_device_fn_t = bool (*)(int);
         auto fn_sync_ptr = cuda_reg
@@ -5725,6 +5781,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     dflash_capture->ubatch = &ubatch;
                 } else {
                     dflash_gpu_capture_ready = model.n_devices() <= 1 && dflash_capture->gpu_capture_enabled;
+                    const bool dflash_gpu_tape_ready_allowed =
+                        dflash_gpu_capture_ready ||
+                        (model.n_devices() > 1 && dflash_capture->gpu_capture_enabled &&
+                         dflash_allow_multi_gpu_tape());
                     dflash_capture->ubatch = &ubatch;
                     cparams.hidden_gpu_n_seqs = 0;
                     dflash_clear_prefill_cparams(cparams);
@@ -5940,7 +6000,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     dflash_graph_tape_ready =
                         !dflash_use_prefill_staging &&
                         !dflash_capture->tapes.empty() &&
-                        dflash_gpu_capture_ready &&
+                        dflash_gpu_tape_ready_allowed &&
                         dflash_capture->tape_enabled &&
                         dflash_capture_n_tokens <= LLAMA_DFLASH_MAX_VERIFY_TOKENS;
                     const int tape_ns = dflash_graph_tape_ready ? ns : 0;
