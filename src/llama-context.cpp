@@ -2031,13 +2031,6 @@ void llama_context::allocate_hidden_gpu(int n_slots, int max_tokens) {
         dflash_capture->sync_backend_to_stream_backend = nullptr;
         return;
     }
-    // Hidden GPU capture requires same-device graph output tensors; not yet supported for multi-GPU layer splits
-    if (model.n_devices() > 1) {
-        dflash_capture->hidden_gpu.clear();
-        dflash_capture->fn_sync_backend_to_stream = nullptr;
-        dflash_capture->sync_backend_to_stream_backend = nullptr;
-        return;
-    }
     if (!llama_dflash_gpu_hidden_supported_arch(model.arch)) {
         dflash_capture->hidden_gpu.clear();
         dflash_capture->fn_sync_backend_to_stream = nullptr;
@@ -2069,6 +2062,16 @@ void llama_context::allocate_hidden_gpu(int n_slots, int max_tokens) {
     dflash_capture->sync_backend_to_stream_backend =
         dflash_capture->fn_sync_backend_to_stream ? gpu_backend : nullptr;
 
+    auto backend_for_dev = [&](ggml_backend_dev_t want_dev) -> ggml_backend_t {
+        for (auto & backend : backends) {
+            auto * dev = ggml_backend_get_device(backend.get());
+            if (dev == want_dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                return backend.get();
+            }
+        }
+        return nullptr;
+    };
+
     const int n_layers = (int) dflash_capture->layer_ids.size();
     const int64_t n_embd = model.hparams.n_embd;
 
@@ -2077,36 +2080,48 @@ void llama_context::allocate_hidden_gpu(int n_slots, int max_tokens) {
 
     size_t total_size = 0;
     for (int slot = 0; slot < n_slots; ++slot) {
-        const size_t ctx_mem = ggml_tensor_overhead() * ((size_t) n_layers + 2);
-        struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
-        struct ggml_context * hidden_ctx = ggml_init(ctx_params);
-        if (!hidden_ctx) {
-            LLAMA_LOG_WARN("%s: failed to create GPU hidden context for slot %d; using callback hidden fallback\n",
-                __func__, slot);
-            dflash_capture->hidden_gpu.clear();
-            return;
-        }
-
         auto hidden = std::make_unique<dflash_hidden_gpu>();
         hidden->layers.resize(n_layers);
         hidden->layer_ids = dflash_capture->layer_ids;
         hidden->n_embd = n_embd;
         hidden->max_tokens = max_tokens;
-        hidden->ctx = hidden_ctx;
 
         for (int i = 0; i < n_layers; ++i) {
-            hidden->layers[i] = ggml_new_tensor_2d(hidden_ctx, GGML_TYPE_F32, n_embd, (int64_t) max_tokens);
+            const int il = dflash_capture->layer_ids[i];
+            ggml_backend_dev_t layer_dev = model.dev_layer(il);
+            ggml_backend_t layer_backend = backend_for_dev(layer_dev);
+            if (!layer_backend) {
+                LLAMA_LOG_WARN("%s: no GPU backend for hidden layer %d device %s; using callback hidden fallback\n",
+                    __func__, il, layer_dev ? ggml_backend_dev_name(layer_dev) : "<null>");
+                dflash_capture->hidden_gpu.clear();
+                return;
+            }
+
+            const size_t ctx_mem = ggml_tensor_overhead() * 2;
+            struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
+            struct ggml_context * hidden_ctx = ggml_init(ctx_params);
+            if (!hidden_ctx) {
+                LLAMA_LOG_WARN("%s: failed to create GPU hidden context for slot %d layer %d; using callback hidden fallback\n",
+                    __func__, slot, il);
+                dflash_capture->hidden_gpu.clear();
+                return;
+            }
+            hidden->ctxs.push_back(hidden_ctx);
+
+            ggml_tensor * t = ggml_new_tensor_2d(hidden_ctx, GGML_TYPE_F32, n_embd, (int64_t) max_tokens);
+            hidden->layers[i] = t;
+
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(hidden_ctx, layer_backend);
+            if (!buf) {
+                LLAMA_LOG_WARN("%s: failed to allocate GPU hidden buffer for slot %d layer %d; using callback hidden fallback\n",
+                    __func__, slot, il);
+                dflash_capture->hidden_gpu.clear();
+                return;
+            }
+            hidden->bufs.push_back(buf);
+            total_size += ggml_backend_buffer_get_size(buf);
         }
 
-        hidden->buf = ggml_backend_alloc_ctx_tensors(hidden_ctx, gpu_backend);
-        if (!hidden->buf) {
-            LLAMA_LOG_WARN("%s: failed to allocate GPU hidden buffer for slot %d; using callback hidden fallback\n",
-                __func__, slot);
-            dflash_capture->hidden_gpu.clear();
-            return;
-        }
-
-        total_size += ggml_backend_buffer_get_size(hidden->buf);
         dflash_capture->hidden_gpu.push_back(std::move(hidden));
     }
 
@@ -2122,10 +2137,6 @@ bool llama_context::allocate_prefill_gpu(int n_slots, int max_tokens) {
         n_slots = 1;
     }
     if (!dflash_capture->gpu_capture_enabled) {
-        return false;
-    }
-    // Prefill GPU allocation is not yet multi-GPU aware
-    if (model.n_devices() > 1) {
         return false;
     }
     if (!llama_dflash_gpu_hidden_supported_arch(model.arch)) {
@@ -2164,6 +2175,16 @@ bool llama_context::allocate_prefill_gpu(int n_slots, int max_tokens) {
             dflash_capture->fn_sync_backend_to_stream ? gpu_backend : nullptr;
     }
 
+    auto backend_for_dev = [&](ggml_backend_dev_t want_dev) -> ggml_backend_t {
+        for (auto & backend : backends) {
+            auto * dev = ggml_backend_get_device(backend.get());
+            if (dev == want_dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                return backend.get();
+            }
+        }
+        return nullptr;
+    };
+
     const int n_layers = (int) dflash_capture->layer_ids.size();
     const int64_t n_embd = model.hparams.n_embd;
 
@@ -2172,39 +2193,52 @@ bool llama_context::allocate_prefill_gpu(int n_slots, int max_tokens) {
 
     size_t total_size = 0;
     for (int slot = 0; slot < n_slots; ++slot) {
-        const size_t ctx_mem = ggml_tensor_overhead() * ((size_t) n_layers + 2);
-        struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
-        struct ggml_context * hidden_ctx = ggml_init(ctx_params);
-        if (!hidden_ctx) {
-            LLAMA_LOG_WARN("%s: failed to create prefill GPU context for slot %d; using callback fallback\n",
-                __func__, slot);
-            dflash_capture->prefill_gpu.clear();
-            dflash_capture->prefill_gpu_max_tokens = 0;
-            return false;
-        }
-
         auto hidden = std::make_unique<dflash_hidden_gpu>();
         hidden->layers.resize(n_layers);
         hidden->layer_ids = dflash_capture->layer_ids;
         hidden->n_embd = n_embd;
         hidden->max_tokens = max_tokens;
         hidden->n_tokens = 0;
-        hidden->ctx = hidden_ctx;
 
         for (int i = 0; i < n_layers; ++i) {
-            hidden->layers[i] = ggml_new_tensor_2d(hidden_ctx, GGML_TYPE_F32, n_embd, (int64_t) max_tokens);
+            const int il = dflash_capture->layer_ids[i];
+            ggml_backend_dev_t layer_dev = model.dev_layer(il);
+            ggml_backend_t layer_backend = backend_for_dev(layer_dev);
+            if (!layer_backend) {
+                LLAMA_LOG_WARN("%s: no GPU backend for prefill layer %d device %s; using callback fallback\n",
+                    __func__, il, layer_dev ? ggml_backend_dev_name(layer_dev) : "<null>");
+                dflash_capture->prefill_gpu.clear();
+                dflash_capture->prefill_gpu_max_tokens = 0;
+                return false;
+            }
+
+            const size_t ctx_mem = ggml_tensor_overhead() * 2;
+            struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
+            struct ggml_context * hidden_ctx = ggml_init(ctx_params);
+            if (!hidden_ctx) {
+                LLAMA_LOG_WARN("%s: failed to create prefill GPU context for slot %d layer %d; using callback fallback\n",
+                    __func__, slot, il);
+                dflash_capture->prefill_gpu.clear();
+                dflash_capture->prefill_gpu_max_tokens = 0;
+                return false;
+            }
+            hidden->ctxs.push_back(hidden_ctx);
+
+            ggml_tensor * t = ggml_new_tensor_2d(hidden_ctx, GGML_TYPE_F32, n_embd, (int64_t) max_tokens);
+            hidden->layers[i] = t;
+
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(hidden_ctx, layer_backend);
+            if (!buf) {
+                LLAMA_LOG_WARN("%s: failed to allocate prefill GPU buffer for slot %d layer %d; using callback fallback\n",
+                    __func__, slot, il);
+                dflash_capture->prefill_gpu.clear();
+                dflash_capture->prefill_gpu_max_tokens = 0;
+                return false;
+            }
+            hidden->bufs.push_back(buf);
+            total_size += ggml_backend_buffer_get_size(buf);
         }
 
-        hidden->buf = ggml_backend_alloc_ctx_tensors(hidden_ctx, gpu_backend);
-        if (!hidden->buf) {
-            LLAMA_LOG_WARN("%s: failed to allocate prefill GPU buffer for slot %d; using callback fallback\n",
-                __func__, slot);
-            dflash_capture->prefill_gpu.clear();
-            dflash_capture->prefill_gpu_max_tokens = 0;
-            return false;
-        }
-
-        total_size += ggml_backend_buffer_get_size(hidden->buf);
         dflash_capture->prefill_gpu.push_back(std::move(hidden));
     }
 
@@ -3039,17 +3073,22 @@ bool llama_context::tape_replay_conv_gpu(llama_memory_recurrent * mem_recurrent,
     if (!dflash_capture || !mem_recurrent || n_accepted <= 0) {
         return false;
     }
-    if (model.n_devices() > 1) {
-        return false;
-    }
 
     ggml_backend_reg_t cuda_reg = dflash_gpu_backend_reg();
     if (!cuda_reg) {
         return false;
     }
+    using ptr_device_fn_t = bool (*)(const void *, int *);
+    using set_device_fn_t = bool (*)(int);
+    using sync_device_fn_t = bool (*)(int);
     using rebuild_fn_t = bool (*)(void *, const void *, int, int, int);
+
+    auto fn_ptr_device = (ptr_device_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_ptr_device");
+    auto fn_set_device = (set_device_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_set_device");
+    auto fn_sync_device = (sync_device_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_synchronize_device");
     auto fn_rebuild = (rebuild_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_rebuild_conv_state");
-    if (!fn_rebuild) {
+
+    if (!fn_ptr_device || !fn_set_device || !fn_sync_device || !fn_rebuild) {
         return false;
     }
 
@@ -3065,9 +3104,12 @@ bool llama_context::tape_replay_conv_gpu(llama_memory_recurrent * mem_recurrent,
         const void * qkv;
         int conv_ch;
         int conv_window;
+        int device;
     };
     std::vector<conv_launch> launches;
     launches.reserve(rec_ids.size());
+
+    bool touched_devices[32] = {false};
 
     for (size_t li = 0; li < rec_ids.size(); ++li) {
         const int il = rec_ids[li];
@@ -3092,13 +3134,24 @@ bool llama_context::tape_replay_conv_gpu(llama_memory_recurrent * mem_recurrent,
             return false;
         }
 
+        int r_dev = -1;
+        if (!fn_ptr_device(r_tensor->data, &r_dev)) {
+            return false;
+        }
+        if (r_dev < 0 || r_dev >= 32) {
+            return false;
+        }
+
         const size_t r_offset = (size_t) cell_idx * n_embd_r * ggml_element_size(r_tensor);
         launches.push_back({
             (char *) r_tensor->data + r_offset,
             qkv_tensor->data,
             (int) conv_ch_i64,
             (int) conv_window_i64,
+            r_dev,
         });
+
+        touched_devices[r_dev] = true;
     }
 
     if (launches.empty()) {
@@ -3107,10 +3160,22 @@ bool llama_context::tape_replay_conv_gpu(llama_memory_recurrent * mem_recurrent,
 
     const int64_t t_gpu_start_us = dflash_capture->profile ? ggml_time_us() : 0;
     for (const auto & launch : launches) {
+        if (!fn_set_device(launch.device)) {
+            return false;
+        }
         if (!fn_rebuild(launch.r_state, launch.qkv, n_accepted, launch.conv_ch, launch.conv_window)) {
             return false;
         }
     }
+
+    for (int dev = 0; dev < 32; ++dev) {
+        if (touched_devices[dev]) {
+            if (!fn_sync_device(dev)) {
+                return false;
+            }
+        }
+    }
+
     if (dflash_capture->profile) {
         const uint64_t elapsed = ggml_time_us() - t_gpu_start_us;
         dflash_capture->profile_replay_conv_enqueue_us += elapsed;
@@ -3302,7 +3367,7 @@ void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int
     auto & tape_layers   = dflash_capture->tape_layers;
     const uint32_t n_embd_r = hparams.n_embd_r();
 
-    if (model.n_devices() <= 1 && tape_replay_conv_gpu(mem_recurrent, cell_idx, n_accepted)) {
+    if (tape_replay_conv_gpu(mem_recurrent, cell_idx, n_accepted)) {
         return;
     }
     if (model.n_devices() > 1 && tape_replay_conv_gpu_from_cpu_tape(mem_recurrent, cell_idx, n_accepted, seq_id)) {
@@ -5799,7 +5864,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     }
                     dflash_capture->ubatch = &ubatch;
                 } else {
-                    dflash_gpu_capture_ready = model.n_devices() <= 1 && dflash_capture->gpu_capture_enabled;
+                    dflash_gpu_capture_ready = (model.n_devices() <= 1 || dflash_allow_multi_gpu_tape()) && dflash_capture->gpu_capture_enabled;
                     const bool dflash_gpu_tape_ready_allowed =
                         dflash_gpu_capture_ready ||
                         (model.n_devices() > 1 && dflash_capture->gpu_capture_enabled &&

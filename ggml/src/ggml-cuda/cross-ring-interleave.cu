@@ -194,11 +194,11 @@ extern "C" bool dflash_cross_ring_gpu_write_d2d(
         return false;
     }
 #if CUDART_VERSION >= 10000 || defined(GGML_USE_HIP)
-    if (attr.type != cudaMemoryTypeDevice || attr.device != ring->device) {
+    if (attr.type != cudaMemoryTypeDevice) {
         return false;
     }
 #else
-    if (attr.memoryType != cudaMemoryTypeDevice || attr.device != ring->device) {
+    if (attr.memoryType != cudaMemoryTypeDevice) {
         return false;
     }
 #endif
@@ -219,14 +219,28 @@ extern "C" bool dflash_cross_ring_gpu_write_d2d(
     }
 
     int first = ring->ring_size - pos;
-    if (first >= n_tokens) {
-        cudaMemcpyAsync(dst + (size_t)pos * n_embd, src,
-                        (size_t)n_tokens * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    const bool is_peer = (attr.device != ring->device);
+    if (is_peer) {
+        if (first >= n_tokens) {
+            cudaMemcpyPeerAsync(dst + (size_t)pos * n_embd, ring->device, src, attr.device,
+                                (size_t)n_tokens * stride, cudaStreamPerThread);
+        } else {
+            cudaMemcpyPeerAsync(dst + (size_t)pos * n_embd, ring->device, src, attr.device,
+                                (size_t)first * stride, cudaStreamPerThread);
+            cudaMemcpyPeerAsync(dst, ring->device, src + (size_t)first * stride, attr.device,
+                                (size_t)(n_tokens - first) * stride, cudaStreamPerThread);
+        }
     } else {
-        cudaMemcpyAsync(dst + (size_t)pos * n_embd, src,
-                        (size_t)first * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
-        cudaMemcpyAsync(dst, src + (size_t)first * stride,
-                        (size_t)(n_tokens - first) * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        (void)cudaSetDevice(ring->device);
+        if (first >= n_tokens) {
+            cudaMemcpyAsync(dst + (size_t)pos * n_embd, src,
+                            (size_t)n_tokens * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        } else {
+            cudaMemcpyAsync(dst + (size_t)pos * n_embd, src,
+                            (size_t)first * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+            cudaMemcpyAsync(dst, src + (size_t)first * stride,
+                            (size_t)(n_tokens - first) * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        }
     }
 
     return cudaGetLastError() == cudaSuccess;

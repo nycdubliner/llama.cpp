@@ -359,11 +359,11 @@ int main(int argc, char ** argv) {
     ok &= expect(llama_h.find("llama_set_dflash_gpu_capture") != std::string::npos, "public DFlash API must expose GPU capture gating");
     ok &= expect(context_cpp.find("allocate_hidden_gpu(n_slots, max_tokens)") != std::string::npos, "GPU tape allocation must allocate hidden capture buffers too");
     ok &= expect(context_cpp.find("dflash_skip_eval_callback ? nullptr : dflash_eval_callback") != std::string::npos, "eligible DFlash verifier graph must disable eval callback, including suppressed no-intersection ubatches");
-    ok &= expect(context_cpp.find("const bool dflash_graph_tape_ready") != std::string::npos, "DFlash decode must gate GPU tape copies separately from hidden capture");
+    ok &= expect(context_cpp.find("bool dflash_graph_tape_ready") != std::string::npos, "DFlash decode must gate GPU tape copies separately from hidden capture");
     ok &= expect(context_cpp.find("dflash_graph_hidden_ready =\n                            !dflash_capture->hidden_gpu.empty()") != std::string::npos, "GPU hidden graph capture must not depend on active tape recording");
     ok &= expect(context_cpp.find("dflash_tape_gpu * graph_tp = dflash_graph_tape_ready ? tp : nullptr") != std::string::npos, "GPU tape graph pointers must be disabled when tape recording is inactive");
     ok &= expect(context_cpp.find("multi-GPU target detected") != std::string::npos, "multi-GPU target must fall back from graph-embedded DFlash GPU capture");
-    ok &= expect(context_cpp.find("const bool dflash_gpu_capture_ready = model.n_devices() <= 1 && dflash_capture->gpu_capture_enabled") != std::string::npos, "DFlash graph capture must be gated to single-GPU target placement and explicit GPU capture policy");
+    ok &= expect(context_cpp.find("dflash_gpu_capture_ready = (model.n_devices() <= 1 || dflash_allow_multi_gpu_tape()) && dflash_capture->gpu_capture_enabled;") != std::string::npos, "DFlash graph capture must be gated to single-GPU or multi-GPU tape mode and explicit GPU capture policy");
     ok &= expect(context_cpp.find("const bool multi_gpu_target = model.n_devices() > 1;") != std::string::npos, "DFlash replay must detect multi-GPU target placement before choosing GPU replay");
     ok &= expect(context_cpp.find("exact CUDA DFlash replay unavailable, using CPU recurrent replay fallback") != std::string::npos, "DFlash replay must log only the multi-GPU CPU replay fallback");
     ok &= expect(context_cpp.find("tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);\n        tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);") != std::string::npos,
@@ -413,7 +413,7 @@ int main(int argc, char ** argv) {
     ok &= expect(cuda_cpp.find("source buffer is not visible to CUDA backend device") != std::string::npos,
         "CUDA backend assert diagnostics must report the non-local source tensor");
     ok &= expect(context_h.find("tape_replay_conv_gpu") != std::string::npos, "DFlash must declare GPU conv rebuild fast path");
-    ok &= expect(context_cpp.find("model.n_devices() <= 1 && tape_replay_conv_gpu(mem_recurrent, cell_idx, n_accepted)") != std::string::npos, "conv replay must try GPU rebuild only for single-GPU target placement");
+    ok &= expect(context_cpp.find("tape_replay_conv_gpu(mem_recurrent, cell_idx, n_accepted)") != std::string::npos, "conv replay must try GPU rebuild");
     ok &= expect(context_cpp.find("const bool use_async_backend = gpu_backend && model.n_devices() <= 1;") != std::string::npos, "conv replay CPU fallback must use async backend copies only for single-GPU target placement");
     ok &= expect(context_cpp.find("ggml_backend_tensor_get_async(gpu_backend, r_tensor") == std::string::npos, "conv replay must not read split recurrent state through the first GPU backend");
     ok &= expect(context_cpp.find("ggml_backend_tensor_set_async(gpu_backend, d.r_tensor") == std::string::npos, "conv replay must not write split recurrent state through the first GPU backend");

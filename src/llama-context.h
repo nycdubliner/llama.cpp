@@ -125,9 +125,18 @@ struct dflash_tape_gpu {
     }
 };
 
+struct dflash_hidden_gpu_layer {
+    ggml_tensor * hidden = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_context * ctx = nullptr;
+    ggml_backend_dev_t dev = nullptr;
+};
+
 struct dflash_hidden_gpu {
     std::vector<ggml_tensor *> layers;  // one [n_embd, max_tokens] tensor per captured layer
     std::vector<int32_t> layer_ids;
+    std::vector<ggml_backend_buffer_t> bufs;
+    std::vector<ggml_context *> ctxs;
     ggml_backend_buffer_t buf = nullptr;
     ggml_context * ctx = nullptr;
     int64_t n_embd = 0;
@@ -135,6 +144,12 @@ struct dflash_hidden_gpu {
     int n_tokens = 0;
 
     ~dflash_hidden_gpu() {
+        for (auto b : bufs) {
+            if (b) ggml_backend_buffer_free(b);
+        }
+        for (auto c : ctxs) {
+            if (c) ggml_free(c);
+        }
         if (buf) ggml_backend_buffer_free(buf);
         if (ctx) ggml_free(ctx);
     }
