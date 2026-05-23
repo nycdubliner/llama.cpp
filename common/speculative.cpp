@@ -119,6 +119,48 @@ static bool common_dflash_gpu_ring_allowed(llama_context * ctx_tgt, llama_contex
     return true;
 }
 
+static void common_dflash_clear_drafter_seq(llama_context * ctx_dft, llama_seq_id seq_id, const char * reason) {
+    auto * mem_dft = ctx_dft ? llama_get_memory(ctx_dft) : nullptr;
+    if (!mem_dft) {
+        return;
+    }
+
+    if (common_dflash_debug_logs_enabled()) {
+        LOG_DBG("DFLASH_DBG clear drafter seq: seq=%d reason=%s pos_max=%d\n",
+                seq_id, reason && reason[0] ? reason : "-",
+                (int) llama_memory_seq_pos_max(mem_dft, seq_id));
+    }
+
+    llama_memory_seq_rm(mem_dft, seq_id, -1, -1);
+}
+
+static void common_dflash_reset_drafter_seq_and_kv_cache(llama_context * ctx_dft, llama_seq_id seq_id, const char * reason) {
+    common_dflash_clear_drafter_seq(ctx_dft, seq_id, reason);
+    if (ctx_dft) {
+        llama_dflash_kv_cache_reset(ctx_dft);
+    }
+}
+
+static void common_dflash_align_drafter_seq_or_clear(
+        llama_context * ctx_dft,
+        llama_seq_id   seq_id,
+        llama_pos      next_pos,
+        const char   * where) {
+    auto * mem_dft = ctx_dft ? llama_get_memory(ctx_dft) : nullptr;
+    if (!mem_dft) {
+        return;
+    }
+
+    const llama_pos pos_max = llama_memory_seq_pos_max(mem_dft, seq_id);
+    if (pos_max < 0 || pos_max + 1 == next_pos) {
+        return;
+    }
+
+    LOG_WRN("dflash: clearing stale drafter KV for seq=%d before %s: pos_max=%d next_pos=%d\n",
+            seq_id, where && where[0] ? where : "draft decode", (int) pos_max, (int) next_pos);
+    common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, where);
+}
+
 static bool common_dflash_argmax_token_valid(int32_t token_id, int n_vocab) {
     return token_id >= 0 && token_id < n_vocab;
 }
@@ -1710,7 +1752,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         prefill_suffix_seen = false;
         ring_write_discarded = true;
         cross_buf.clear();
-        llama_dflash_kv_cache_reset(ctx_dft);
+        common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, reason);
     }
 
     // Validate that target hidden capture produced expected shapes.
@@ -2347,7 +2389,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
             ring_write_pos = 0;
             ring_filled = 0;
             committed_len = 0;
-            llama_dflash_kv_cache_reset(ctx_dft);
+            common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, "first prefill flush");
         }
 
         // Only CPU callback hidden data can safely refresh the CPU mirror.
@@ -2475,6 +2517,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         ring_write_pos = saved_write_pos;
         ring_filled = saved_filled;
         committed_len = saved_committed;
+        common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, "ring state load");
 
         if (profile_enabled(DFLASH_PROFILE_PREFILL | DFLASH_PROFILE_COPY)) {
             LOG_INF("dflash checkpoint: ring restore write_pos=%d filled=%d committed=%d entries=%d compact=%d gpu=%d\n",
@@ -2506,7 +2549,6 @@ struct common_speculative_state_dflash : public common_speculative_state {
                     tmp, gpu_entries, n_embd);
             }
             llama_dflash_cross_ring_gpu_synchronize(gpu_ring_handle);
-            llama_dflash_kv_cache_reset(ctx_dft);
             update_drafter_kv_cache(gpu_entries);
         }
 
@@ -2547,6 +2589,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         // part of the prior proposal must drop stale future sequence state,
         // but accepted past stays live for the next block.
         llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, committed_len, -1);
+        common_dflash_align_drafter_seq_or_clear(ctx_dft, seq_id, committed_len, "flat draft");
 
         int cross_len = build_cross_data(ctx_dft);
         if (cross_len <= 0) {
@@ -2675,6 +2718,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         // Tree mode uses the same accepted-prefix contract as flat DFlash.
         llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, committed_len, -1);
+        common_dflash_align_drafter_seq_or_clear(ctx_dft, seq_id, committed_len, "tree draft");
 
         int cross_len = build_cross_data(ctx_dft);
         if (cross_len <= 0) {
@@ -2914,7 +2958,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
             ring_filled = 0;
             committed_len = 0;
             cpu_ring_valid = false;
-            llama_dflash_kv_cache_reset(ctx_dft);
+            common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, "tree update GPU hidden unavailable");
             return;
         }
 
@@ -3211,7 +3255,7 @@ private:
 
         ring_write_pos = 0;
         ring_filled = 0;
-        llama_dflash_kv_cache_reset(ctx_dft);
+        common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, "capture target hiddens");
         const int actual_written = ring_write(to_store, start_offset, true);
         if (ring_write_discarded) {
             return;
@@ -3775,6 +3819,7 @@ void common_speculative_draft_batch(
     // block draft.
     for (const auto & rs : ready) {
         llama_memory_seq_rm(llama_get_memory(ctx_dft), rs.seq_id, rs.draft_pos_base, -1);
+        common_dflash_align_drafter_seq_or_clear(ctx_dft, rs.seq_id, rs.draft_pos_base, "batched draft");
     }
 
     const int64_t t1 = ggml_time_us();

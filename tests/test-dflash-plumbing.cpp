@@ -250,6 +250,15 @@ int main(int argc, char ** argv) {
     ok &= expect(dflash_draft.find("dflash_build_base_attn_input") != std::string::npos &&
                  dflash_draft.find("static_cast<const llama_kv_cache_iswa_context *>(mctx)->get_base()") != std::string::npos,
         "DFlash full-attention layers must read accepted-prefix KV from the drafter base cache, not the cross window");
+    ok &= expect(speculative.find("common_dflash_align_drafter_seq_or_clear") != std::string::npos &&
+                 speculative.find("common_dflash_reset_drafter_seq_and_kv_cache") != std::string::npos,
+        "DFlash must have explicit helpers for clearing stale drafter sequence memory and projection cache");
+    ok &= expect(count_occurrences(speculative, "common_dflash_align_drafter_seq_or_clear(ctx_dft") >= 3,
+        "DFlash draft paths must clear stale drafter memory before decoding at absolute committed positions");
+    ok &= expect(speculative.find("common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, \"first prefill flush\")") != std::string::npos &&
+                 speculative.find("common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, \"capture target hiddens\")") != std::string::npos &&
+                 speculative.find("common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, \"ring state load\")") != std::string::npos,
+        "DFlash ring reset/restore paths must clear ctx_dft sequence memory so the next draft batch is consecutive");
     ok &= expect(dflash_draft.find("class llm_graph_input_attn_kv_backend final : public llm_graph_input_attn_kv") != std::string::npos &&
                  dflash_draft.find("mctx->set_input_k_idxs_backend(self_k_idxs, ubatch);") != std::string::npos &&
                  dflash_draft.find("mctx->set_input_v_idxs_backend(self_v_idxs, ubatch);") != std::string::npos &&
