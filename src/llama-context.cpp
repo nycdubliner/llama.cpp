@@ -23,7 +23,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <map>
 #include <stdexcept>
 
 //
@@ -1138,6 +1137,7 @@ static bool dflash_profile_sync_split_enabled() {
     return enabled;
 }
 
+// Controls the multi-GPU speculative decoding recurrent tape path. Independent of GGML_DFLASH_GPU_RING.
 static bool dflash_allow_multi_gpu_tape() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_DFLASH_ALLOW_MULTI_GPU_TAPE");
@@ -1696,6 +1696,9 @@ void llama_context::set_dflash_gpu_capture(bool enabled) {
 
     dflash_capture->gpu_capture_enabled =
         enabled || (model.n_devices() > 1 && dflash_allow_multi_gpu_tape());
+    if (!enabled && dflash_capture->gpu_capture_enabled) {
+        LLAMA_LOG_INFO("%s: forcing GPU capture enabled for multi-GPU tape support (GGML_DFLASH_ALLOW_MULTI_GPU_TAPE is set)\n", __func__);
+    }
 
     // Always clear the graph-embedded capture cparams when changing mode;
     // the decode loop will repopulate them if GPU capture is active and
@@ -1931,7 +1934,11 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
     dflash_capture->tapes.reserve(n_slots);
 
     size_t total_size = 0;
-    std::map<ggml_backend_dev_t, int> layers_by_dev;
+    struct dev_layer_count {
+        ggml_backend_dev_t dev;
+        int count;
+    };
+    std::vector<dev_layer_count> dev_counts;
 
     for (int slot = 0; slot < n_slots; ++slot) {
         auto tape = std::make_unique<dflash_tape_gpu>();
@@ -1985,7 +1992,17 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
             }
 
             total_size += ggml_backend_buffer_get_size(tl.buf);
-            layers_by_dev[layer_dev] += 1;
+            bool found = false;
+            for (auto & dc : dev_counts) {
+                if (dc.dev == layer_dev) {
+                    dc.count++;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                dev_counts.push_back({ layer_dev, 1 });
+            }
         }
 
         dflash_capture->tapes.push_back(std::move(tape));
@@ -1995,9 +2012,9 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
 
     LLAMA_LOG_INFO("%s: allocated device-aware GPU tape buffers: %.1f MB total (%d slot%s, %d layers, %d max tokens)\n",
         __func__, total_size / (1024.0 * 1024.0), n_slots, n_slots == 1 ? "" : "s", n_rec, max_tokens);
-    for (const auto & kv : layers_by_dev) {
+    for (const auto & dc : dev_counts) {
         LLAMA_LOG_INFO("%s: dflash tape placement: device=%s layers=%d\n",
-            __func__, ggml_backend_dev_name(kv.first), kv.second);
+            __func__, ggml_backend_dev_name(dc.dev), dc.count);
     }
 }
 
@@ -2014,6 +2031,7 @@ void llama_context::allocate_hidden_gpu(int n_slots, int max_tokens) {
         dflash_capture->sync_backend_to_stream_backend = nullptr;
         return;
     }
+    // Hidden GPU capture requires same-device graph output tensors; not yet supported for multi-GPU layer splits
     if (model.n_devices() > 1) {
         dflash_capture->hidden_gpu.clear();
         dflash_capture->fn_sync_backend_to_stream = nullptr;
@@ -2106,6 +2124,7 @@ bool llama_context::allocate_prefill_gpu(int n_slots, int max_tokens) {
     if (!dflash_capture->gpu_capture_enabled) {
         return false;
     }
+    // Prefill GPU allocation is not yet multi-GPU aware
     if (model.n_devices() > 1) {
         return false;
     }

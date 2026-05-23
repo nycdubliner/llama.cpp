@@ -566,7 +566,7 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
         bool all_queued = copy_plan_fn_set_device != nullptr;
         bool any_queued = false;
         int current_device = -1;
-        std::vector<int> touched_devices;
+        copy_plan_touched_devices.clear();
         const int64_t t_enqueue_start = profile_timing ? ggml_time_us() : 0;
 
         if (all_queued) {
@@ -585,8 +585,8 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
                     break;
                 }
                 any_queued = true;
-                if (std::find(touched_devices.begin(), touched_devices.end(), entry.device) == touched_devices.end()) {
-                    touched_devices.push_back(entry.device);
+                if (std::find(copy_plan_touched_devices.begin(), copy_plan_touched_devices.end(), entry.device) == copy_plan_touched_devices.end()) {
+                    copy_plan_touched_devices.push_back(entry.device);
                 }
                 profile.tensors_copied++;
                 profile.cuda_d2d_queued++;
@@ -606,7 +606,7 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
         if (any_queued && copy_plan_fn_sync_device) {
             const int64_t t_sync_start = profile_timing ? ggml_time_us() : 0;
             synced = true;
-            for (int device : touched_devices) {
+            for (int device : copy_plan_touched_devices) {
                 synced = copy_plan_fn_sync_device(device) && synced;
             }
             if (t_sync_start != 0) {

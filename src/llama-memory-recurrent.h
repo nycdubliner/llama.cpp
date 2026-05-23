@@ -163,6 +163,7 @@ private:
     bool copy_plan_valid = false;
     bool copy_plan_cuda_fast = false;
     std::vector<recurrent_copy_plan_entry> copy_plan_entries;
+    std::vector<int> copy_plan_touched_devices;
     dflash_cuda_copy_d2d_fn_t copy_plan_fn_copy = nullptr;
     dflash_cuda_set_device_fn_t copy_plan_fn_set_device = nullptr;
     dflash_cuda_sync_device_fn_t copy_plan_fn_sync_device = nullptr;
