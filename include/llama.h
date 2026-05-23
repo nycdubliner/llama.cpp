@@ -1095,10 +1095,10 @@ extern "C" {
     // if layer_ids are configured.  GPU buffers and tape state are preserved.
     LLAMA_API void llama_set_dflash_capture_active(struct llama_context * ctx, bool active);
 
-    // DFlash: enable graph-embedded GPU hidden/tape capture for target decode.
-    // Disable this before decode when the drafter cannot consume GPU cross-ring
-    // tensors directly, so the eval callback keeps CPU hidden buffers populated.
     LLAMA_API void llama_set_dflash_gpu_capture(struct llama_context * ctx, bool enabled);
+
+    // DFlash: check whether multi-GPU recurrent tape allocation is allowed
+    LLAMA_API bool llama_dflash_allow_multi_gpu_tape();
 
     // DFlash: set drafter sampling temperature (Gumbel-max trick)
     // temp=0: greedy argmax (default), temp>0: sample from softmax(logits/temp)

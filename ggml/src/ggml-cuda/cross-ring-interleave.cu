@@ -7,6 +7,11 @@
 #include <cstdio>
 #include <cstring>
 
+#ifndef GGML_CUDA_MAX_DEVICES
+#define GGML_CUDA_MAX_DEVICES 16
+#endif
+
+
 // GPU cross-attention ring buffer for DFlash speculative decoding.
 
 static bool dflash_cuda_debug_enabled() {
@@ -221,6 +226,32 @@ extern "C" bool dflash_cross_ring_gpu_write_d2d(
     int first = ring->ring_size - pos;
     const bool is_peer = (attr.device != ring->device);
     if (is_peer) {
+        static bool peer_enabled[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = { { false } };
+        if (attr.device >= 0 && attr.device < GGML_CUDA_MAX_DEVICES &&
+            ring->device >= 0 && ring->device < GGML_CUDA_MAX_DEVICES) {
+            if (!peer_enabled[attr.device][ring->device]) {
+                int can_access = 0;
+                cudaDeviceCanAccessPeer(&can_access, attr.device, ring->device);
+                if (can_access) {
+                    (void)cudaSetDevice(attr.device);
+                    cudaDeviceEnablePeerAccess(ring->device, 0);
+                    cudaGetLastError();
+                }
+                peer_enabled[attr.device][ring->device] = true;
+            }
+            if (!peer_enabled[ring->device][attr.device]) {
+                int can_access = 0;
+                cudaDeviceCanAccessPeer(&can_access, ring->device, attr.device);
+                if (can_access) {
+                    (void)cudaSetDevice(ring->device);
+                    cudaDeviceEnablePeerAccess(attr.device, 0);
+                    cudaGetLastError();
+                }
+                peer_enabled[ring->device][attr.device] = true;
+            }
+            (void)cudaSetDevice(ring->device);
+        }
+
         if (first >= n_tokens) {
             cudaMemcpyPeerAsync(dst + (size_t)pos * n_embd, ring->device, src, attr.device,
                                 (size_t)n_tokens * stride, cudaStreamPerThread);

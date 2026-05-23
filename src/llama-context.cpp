@@ -15,6 +15,11 @@
 #include "dflash-profile.h"
 #include "llama.h"
 
+#ifndef GGML_CUDA_MAX_DEVICES
+#define GGML_CUDA_MAX_DEVICES 16
+#endif
+
+
 #include "ggml-alloc.h"
 
 #include <algorithm>
@@ -1138,13 +1143,14 @@ static bool dflash_profile_sync_split_enabled() {
 }
 
 // Controls the multi-GPU speculative decoding recurrent tape path. Independent of GGML_DFLASH_GPU_RING.
-static bool dflash_allow_multi_gpu_tape() {
+bool llama_dflash_allow_multi_gpu_tape() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_DFLASH_ALLOW_MULTI_GPU_TAPE");
         return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
     return enabled;
 }
+
 
 static void dflash_log_decode_seq_state(
         const char * where,
@@ -1693,9 +1699,9 @@ void llama_context::set_dflash_gpu_capture(bool enabled) {
     if (!dflash_capture) {
         return;
     }
-
     dflash_capture->gpu_capture_enabled =
-        enabled || (model.n_devices() > 1 && dflash_allow_multi_gpu_tape());
+        enabled || (model.n_devices() > 1 && llama_dflash_allow_multi_gpu_tape());
+
     if (!enabled && dflash_capture->gpu_capture_enabled) {
         LLAMA_LOG_INFO("%s: forcing GPU capture enabled for multi-GPU tape support (GGML_DFLASH_ALLOW_MULTI_GPU_TAPE is set)\n", __func__);
     }
@@ -1874,8 +1880,7 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
         dflash_capture->tapes.clear();
         return;
     }
-
-    if (model.n_devices() > 1 && !dflash_allow_multi_gpu_tape()) {
+    if (model.n_devices() > 1 && !llama_dflash_allow_multi_gpu_tape()) {
         dflash_capture->hidden_gpu.clear();
         dflash_capture->tapes.clear();
         if (!dflash_capture->multi_gpu_capture_fallback_logged) {
@@ -3109,7 +3114,7 @@ bool llama_context::tape_replay_conv_gpu(llama_memory_recurrent * mem_recurrent,
     std::vector<conv_launch> launches;
     launches.reserve(rec_ids.size());
 
-    bool touched_devices[32] = {false};
+    bool touched_devices[GGML_CUDA_MAX_DEVICES] = {false};
 
     for (size_t li = 0; li < rec_ids.size(); ++li) {
         const int il = rec_ids[li];
@@ -3138,7 +3143,7 @@ bool llama_context::tape_replay_conv_gpu(llama_memory_recurrent * mem_recurrent,
         if (!fn_ptr_device(r_tensor->data, &r_dev)) {
             return false;
         }
-        if (r_dev < 0 || r_dev >= 32) {
+        if (r_dev < 0 || r_dev >= GGML_CUDA_MAX_DEVICES) {
             return false;
         }
 
@@ -3168,7 +3173,7 @@ bool llama_context::tape_replay_conv_gpu(llama_memory_recurrent * mem_recurrent,
         }
     }
 
-    for (int dev = 0; dev < 32; ++dev) {
+    for (int dev = 0; dev < GGML_CUDA_MAX_DEVICES; ++dev) {
         if (touched_devices[dev]) {
             if (!fn_sync_device(dev)) {
                 return false;
@@ -3367,6 +3372,8 @@ void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int
     auto & tape_layers   = dflash_capture->tape_layers;
     const uint32_t n_embd_r = hparams.n_embd_r();
 
+    // Attempt GPU conv replay path unconditionally. It handles its own gating checks internally
+    // and returns false to fallback if multi-device tape, GPU backend, or pointers are not eligible.
     if (tape_replay_conv_gpu(mem_recurrent, cell_idx, n_accepted)) {
         return;
     }
@@ -5864,11 +5871,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     }
                     dflash_capture->ubatch = &ubatch;
                 } else {
-                    dflash_gpu_capture_ready = (model.n_devices() <= 1 || dflash_allow_multi_gpu_tape()) && dflash_capture->gpu_capture_enabled;
+                    dflash_gpu_capture_ready = (model.n_devices() <= 1 || llama_dflash_allow_multi_gpu_tape()) && dflash_capture->gpu_capture_enabled;
                     const bool dflash_gpu_tape_ready_allowed =
                         dflash_gpu_capture_ready ||
                         (model.n_devices() > 1 && dflash_capture->gpu_capture_enabled &&
-                         dflash_allow_multi_gpu_tape());
+                         llama_dflash_allow_multi_gpu_tape());
                     dflash_capture->ubatch = &ubatch;
                     cparams.hidden_gpu_n_seqs = 0;
                     dflash_clear_prefill_cparams(cparams);

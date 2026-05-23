@@ -101,15 +101,6 @@ static bool common_dflash_log_contract_verbose() {
     }();
     return v;
 }
-
-static bool common_dflash_allow_multi_gpu_tape() {
-    static const bool enabled = [] {
-        const char * env = std::getenv("GGML_DFLASH_ALLOW_MULTI_GPU_TAPE");
-        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
 static bool common_dflash_gpu_ring_allowed(llama_context * ctx_tgt, llama_context * ctx_dft) {
     if (!common_dflash_gpu_ring_env_enabled()) {
         LOG_INF("dflash: GPU cross ring disabled by GGML_DFLASH_GPU_RING=0; using CPU hidden capture\n");
@@ -119,7 +110,7 @@ static bool common_dflash_gpu_ring_allowed(llama_context * ctx_tgt, llama_contex
     const int32_t n_tgt_devices = ctx_tgt ? llama_model_n_devices(llama_get_model(ctx_tgt)) : 1;
     const int32_t n_dft_devices = ctx_dft ? llama_model_n_devices(llama_get_model(ctx_dft)) : 1;
     if (n_tgt_devices > 1 || n_dft_devices > 1) {
-        if (common_dflash_allow_multi_gpu_tape()) {
+        if (llama_dflash_allow_multi_gpu_tape()) {
             LOG_INF("dflash: multi-GPU placement detected (target=%d devices, drafter=%d devices); enabling experimental GPU cross ring and graph hidden capture (GGML_DFLASH_ALLOW_MULTI_GPU_TAPE is set)\n",
                     n_tgt_devices, n_dft_devices);
         } else {
