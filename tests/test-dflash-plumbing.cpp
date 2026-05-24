@@ -142,6 +142,18 @@ int main(int argc, char ** argv) {
                      stale_ring_reset < keep_first,
             "server must discard stale DFlash ring state before processing a prompt with zero reusable prefix tokens");
     }
+    {
+        const size_t checkpoint_start = server_context.find("bool do_checkpoint = params_base.n_ctx_checkpoints > 0;");
+        const size_t cache_prompt_gate = server_context.find("do_checkpoint = do_checkpoint && slot.task->params.cache_prompt;");
+        const size_t checkpoint_memory_gate = server_context.find("// make a checkpoint of the parts of the memory that cannot be rolled back.");
+
+        ok &= expect(checkpoint_start != std::string::npos &&
+                     cache_prompt_gate != std::string::npos &&
+                     checkpoint_memory_gate != std::string::npos &&
+                     checkpoint_start < cache_prompt_gate &&
+                     cache_prompt_gate < checkpoint_memory_gate,
+            "server must not create context checkpoints for requests that explicitly disable prompt caching");
+    }
 
     const size_t pretranspose = qwen35moe.find("\"qkv_mixed_pretranspose\"");
     const size_t transpose    = qwen35moe.find("qkv_mixed = ggml_transpose(ctx0, qkv_mixed)");

@@ -4488,6 +4488,9 @@ private:
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
 
+                    // no-cache requests should not pay to create checkpoints for future prompt reuse
+                    do_checkpoint = do_checkpoint && slot.task->params.cache_prompt;
+
                     // make a checkpoint of the parts of the memory that cannot be rolled back.
                     // checkpoints are created only if:
                     // - the model does not support partial sequence removal
