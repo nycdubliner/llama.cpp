@@ -1995,6 +1995,7 @@ private:
         if (params_base.speculative.has_dft()) {
             // TODO speculative: move to common/speculative.cpp?
             const auto & params_spec = params_base.speculative.draft;
+            const bool draft_devices_explicit = !params_spec.devices.empty();
 
             SRV_INF("loading draft model '%s'\n", params_spec.mparams.path.c_str());
 
@@ -2008,6 +2009,11 @@ private:
             params_dft.n_gpu_layers = params_spec.n_gpu_layers;
             params_dft.cache_type_k = params_spec.cache_type_k;
             params_dft.cache_type_v = params_spec.cache_type_v;
+
+            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH && !draft_devices_explicit) {
+                params_dft.split_mode = LLAMA_SPLIT_MODE_NONE;
+                SRV_INF("DFlash draft model will use a single device by default; pass --spec-draft-device to override\n");
+            }
 
             if (params_spec.cpuparams.n_threads > 0) {
                 params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
@@ -2025,7 +2031,19 @@ private:
             }
 
             // Auto-detect DFlash from complete drafter metadata.
-            const bool draft_is_dflash = server_model_is_dflash_drafter(model_dft.get());
+            bool draft_is_dflash = server_model_is_dflash_drafter(model_dft.get());
+            if (draft_is_dflash && !draft_devices_explicit && llama_model_n_devices(model_dft.get()) > 1) {
+                SRV_INF("reloading auto-detected DFlash draft model on a single device; pass --spec-draft-device to override\n");
+                model_dft.reset();
+                params_dft.split_mode = LLAMA_SPLIT_MODE_NONE;
+                mparams_dft = common_model_params_to_llama(params_dft);
+                model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
+                if (model_dft == nullptr) {
+                    SRV_ERR("failed to reload DFlash draft model on a single device, '%s'\n", params_dft.model.path.c_str());
+                    return false;
+                }
+                draft_is_dflash = server_model_is_dflash_drafter(model_dft.get());
+            }
             if (draft_is_dflash &&
                 params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
                 params_base.speculative.set_type(COMMON_SPECULATIVE_TYPE_DFLASH);
