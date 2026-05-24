@@ -7988,6 +7988,51 @@ void llama_dflash_cross_ring_gpu_write(void * handle, int layer, int ring_pos, c
     h->fn_write(h->gpu_ring, layer, ring_pos, data, n_tokens, n_embd);
 }
 
+static bool dflash_gpu_hidden_span_in_bounds(
+        const ggml_tensor * tensor,
+        int                 src_offset,
+        int                 n_tokens,
+        int                 n_embd,
+        const char *        where) {
+    if (!tensor || !tensor->data || src_offset < 0 || n_tokens <= 0 || n_embd <= 0) {
+        LLAMA_LOG_WARN("%s: invalid DFlash hidden tensor span request tensor=%p src_offset=%d n_tokens=%d n_embd=%d\n",
+            where, (const void *) tensor, src_offset, n_tokens, n_embd);
+        return false;
+    }
+    if (tensor->type != GGML_TYPE_F32) {
+        LLAMA_LOG_WARN("%s: invalid DFlash hidden tensor type %s, expected f32\n",
+            where, ggml_type_name(tensor->type));
+        return false;
+    }
+
+    const size_t n_embd_size = (size_t) n_embd;
+    if (n_embd_size > std::numeric_limits<size_t>::max() / sizeof(float)) {
+        LLAMA_LOG_WARN("%s: DFlash hidden tensor row-size overflow n_embd=%d\n",
+            where, n_embd);
+        return false;
+    }
+
+    const size_t row_bytes = n_embd_size * sizeof(float);
+    if ((size_t) src_offset > std::numeric_limits<size_t>::max() / row_bytes ||
+            (size_t) n_tokens > std::numeric_limits<size_t>::max() / row_bytes) {
+        LLAMA_LOG_WARN("%s: DFlash hidden tensor span overflow src_offset=%d n_tokens=%d n_embd=%d\n",
+            where, src_offset, n_tokens, n_embd);
+        return false;
+    }
+
+    const size_t src_offset_bytes = (size_t) src_offset * row_bytes;
+    const size_t n_bytes = (size_t) n_tokens * row_bytes;
+    if (src_offset_bytes > std::numeric_limits<size_t>::max() - n_bytes ||
+            !(src_offset_bytes + n_bytes <= ggml_nbytes(tensor))) {
+        LLAMA_LOG_WARN("%s: DFlash hidden tensor span out of bounds offset=%zu size=%zu tensor_bytes=%zu ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+            where, src_offset_bytes, n_bytes, ggml_nbytes(tensor),
+            tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+        return false;
+    }
+
+    return true;
+}
+
 bool llama_context::cross_ring_gpu_write_hidden(void * handle, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd) {
     if (!handle || !dflash_capture) {
         return false;
@@ -8003,6 +8048,9 @@ bool llama_context::cross_ring_gpu_write_hidden(void * handle, int layer, int ri
 
     auto * tensor = hgpu->layers[layer];
     if (!tensor || !tensor->data) {
+        return false;
+    }
+    if (!dflash_gpu_hidden_span_in_bounds(tensor, src_offset, n_tokens, n_embd, __func__)) {
         return false;
     }
 
@@ -8051,6 +8099,9 @@ bool llama_context::prefill_gpu_write_hidden(void * handle, int slot, int layer,
 
     auto * tensor = pgpu->layers[layer];
     if (!tensor || !tensor->data) {
+        return false;
+    }
+    if (!dflash_gpu_hidden_span_in_bounds(tensor, src_offset, n_tokens, n_embd, __func__)) {
         return false;
     }
 

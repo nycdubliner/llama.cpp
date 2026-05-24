@@ -176,6 +176,10 @@ int main(int argc, char ** argv) {
     ok &= expect(context_cpp.find("dflash_capture->hidden_gpu.size()") != std::string::npos &&
                  context_cpp.find("dflash_capture->prefill_gpu.size()") != std::string::npos,
         "active DFlash slot must work without GPU tape and account for hidden-only/prefill-only contexts");
+    ok &= expect(context_cpp.find("dflash_gpu_hidden_span_in_bounds") != std::string::npos &&
+                 count_occurrences(context_cpp, "dflash_gpu_hidden_span_in_bounds(") >= 3 &&
+                 context_cpp.find("src_offset_bytes + n_bytes <= ggml_nbytes(tensor)") != std::string::npos,
+        "DFlash GPU hidden ring writes must byte-check tensor spans before D2D/readback to avoid backend read OOB asserts");
     ok &= expect(context_cpp.find("get_tensor_data(gpu_layer->qkv") != std::string::npos, "conv rebuild must read QKV from GPU tape through placement-safe tensor access");
     ok &= expect(graph_cpp.find("t_logits_argmax = nullptr;") != std::string::npos, "graph reset must clear reduced logits output pointer");
     ok &= expect(graph_cpp.find("params.cparams.embeddings_pre_norm && t_h_pre_norm != nullptr") != std::string::npos ||
