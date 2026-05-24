@@ -1661,7 +1661,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                    const bool async_ok = split_backend->iface.cpy_tensor_async && split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
+                    if (!async_ok) {
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -1702,11 +1703,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     return ec;
                 }
 
-                // TODO: pass backend to the callback, then the user can decide if they want to synchronize
-                ggml_backend_synchronize(split_backend);
+                if (need) {
+                    // TODO: pass backend to the callback, then the user can decide if they want to synchronize
+                    ggml_backend_synchronize(split_backend);
 
-                if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
-                    break;
+                    if (!sched->callback_eval(t, false, sched->callback_eval_user_data)) {
+                        break;
+                    }
                 }
 
                 j0 = j1;

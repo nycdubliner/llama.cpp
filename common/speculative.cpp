@@ -119,9 +119,13 @@ static bool common_dflash_gpu_ring_allowed(llama_context * ctx_tgt, llama_contex
     const int32_t n_tgt_devices = ctx_tgt ? llama_model_n_devices(llama_get_model(ctx_tgt)) : 1;
     const int32_t n_dft_devices = ctx_dft ? llama_model_n_devices(llama_get_model(ctx_dft)) : 1;
     if (n_tgt_devices > 1 || n_dft_devices > 1) {
-        LOG_INF("dflash: multi-GPU placement detected (target=%d devices, drafter=%d devices); disabling GPU cross ring and graph hidden capture\n",
+        if (!llama_dflash_allow_multi_gpu_tape()) {
+            LOG_INF("dflash: multi-GPU placement detected (target=%d devices, drafter=%d devices); disabling GPU cross ring and graph hidden capture by multi-GPU tape kill switch\n",
+                    n_tgt_devices, n_dft_devices);
+            return false;
+        }
+        LOG_INF("dflash: multi-GPU placement detected (target=%d devices, drafter=%d devices); enabling GPU cross ring and graph hidden capture\n",
                 n_tgt_devices, n_dft_devices);
-        return false;
     }
 
     return true;

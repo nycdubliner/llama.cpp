@@ -71,6 +71,8 @@ llama-server -m target.gguf \
 
 DFlash supports both full GPU offload (`-ngl all`) and partial offload (`-ngl < total layers`). The tape replay path detects when recurrent state buffers are in host memory and falls back to CPU replay instead of crashing on a broken DeviceToDevice copy.
 
+On `v0.3.0`, DFlash GPU capture/tape is also enabled by default for split CUDA/ROCm target placement. Hidden capture, prefill capture, recurrent tape, conv replay, direct GDN replay, and recurrent rollback follow each layer's backend device and synchronize all touched devices. If the backend helpers or pointer placement checks are not available, Bee falls back to the CPU/eval-callback path. `GGML_DFLASH_MULTI_GPU_TAPE=0` disables this multi-GPU path for isolation.
+
 The accept path (rollback, state restore, and DeltaNet replay after token acceptance or rejection) uses batched asynchronous GPU-to-GPU copies and a direct CUDA GDN state-replay kernel. This avoids per-layer synchronization and per-cycle ggml graph construction for the recurrent state update, keeping accept-side overhead small relative to target-model verification time.
 
 Public llama.cpp and public TheTom do not have the DFlash draft architecture or DFlash server path at the checked refs. Public buun does have DFlash. Bee's DFlash surface is more complete for server tuning because it adds canonical `--spec-*` names, configurable cross context, branch-only DDTree budgeting, sampled-drafter CLI control, adaptive draft controllers, request overrides, and multimodal flat-DFlash guardrails.

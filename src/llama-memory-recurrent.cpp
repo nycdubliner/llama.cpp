@@ -462,13 +462,16 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
 bool llama_memory_recurrent::build_recurrent_copy_plan() {
     copy_plan_valid = true;
     copy_plan_cuda_fast = false;
-    copy_plan_device = -1;
     copy_plan_entries.clear();
+    copy_plan_touched_devices.clear();
     copy_plan_fn_copy = nullptr;
     copy_plan_fn_set_device = nullptr;
     copy_plan_fn_sync_device = nullptr;
 
     ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
+    if (!cuda_reg) {
+        cuda_reg = ggml_backend_reg_by_name("ROCm");
+    }
     auto fn_ptr_device = cuda_reg
         ? (dflash_cuda_ptr_device_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_ptr_device")
         : nullptr;
@@ -483,6 +486,11 @@ bool llama_memory_recurrent::build_recurrent_copy_plan() {
         : nullptr;
 
     if (!fn_ptr_device || !fn_copy || !fn_set_device || !fn_sync_device) {
+        if (dflash_profile_enabled(DFLASH_PROFILE_COPY)) {
+            LLAMA_LOG_INFO("%s: dflash recurrent D2D copy unavailable: cuda_reg=%d ptr_device=%d copy=%d set_device=%d sync_device=%d\n",
+                    __func__, cuda_reg ? 1 : 0, fn_ptr_device ? 1 : 0, fn_copy ? 1 : 0,
+                    fn_set_device ? 1 : 0, fn_sync_device ? 1 : 0);
+        }
         return false;
     }
 
@@ -492,21 +500,26 @@ bool llama_memory_recurrent::build_recurrent_copy_plan() {
         }
 
         const char * buffer_name = tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : nullptr;
-        if (!buffer_name || std::strncmp(buffer_name, "CUDA", 4) != 0) {
+        if (!buffer_name ||
+                (std::strncmp(buffer_name, "CUDA", 4) != 0 &&
+                 std::strncmp(buffer_name, "ROCm", 4) != 0)) {
+            if (dflash_profile_enabled(DFLASH_PROFILE_COPY)) {
+                LLAMA_LOG_INFO("%s: dflash recurrent D2D copy unavailable: tensor=%s buffer=%s\n",
+                        __func__, tensor->name, buffer_name ? buffer_name : "<null>");
+            }
             return false;
         }
 
         int tensor_device = -1;
         if (!fn_ptr_device(tensor->data, &tensor_device)) {
-            return false;
-        }
-        if (copy_plan_device < 0) {
-            copy_plan_device = tensor_device;
-        } else if (copy_plan_device != tensor_device) {
+            if (dflash_profile_enabled(DFLASH_PROFILE_COPY)) {
+                LLAMA_LOG_INFO("%s: dflash recurrent D2D copy unavailable: tensor=%s buffer=%s ptr_device_failed\n",
+                        __func__, tensor->name, buffer_name);
+            }
             return false;
         }
 
-        copy_plan_entries.push_back({ tensor, ggml_row_size(tensor->type, n_embd) });
+        copy_plan_entries.push_back({ tensor, ggml_row_size(tensor->type, n_embd), tensor_device });
         return true;
     };
 
@@ -514,12 +527,12 @@ bool llama_memory_recurrent::build_recurrent_copy_plan() {
         if (!add_tensor(r_l[il], hparams.n_embd_r()) ||
             !add_tensor(s_l[il], hparams.n_embd_s())) {
             copy_plan_entries.clear();
-            copy_plan_device = -1;
+            copy_plan_touched_devices.clear();
             return false;
         }
     }
 
-    if (copy_plan_entries.empty() || copy_plan_device < 0) {
+    if (copy_plan_entries.empty()) {
         return false;
     }
 
@@ -533,8 +546,8 @@ bool llama_memory_recurrent::build_recurrent_copy_plan() {
 void llama_memory_recurrent::invalidate_recurrent_copy_plan() {
     copy_plan_valid = false;
     copy_plan_cuda_fast = false;
-    copy_plan_device = -1;
     copy_plan_entries.clear();
+    copy_plan_touched_devices.clear();
     copy_plan_fn_copy = nullptr;
     copy_plan_fn_set_device = nullptr;
     copy_plan_fn_sync_device = nullptr;
@@ -573,12 +586,21 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
         build_recurrent_copy_plan();
     }
     if (copy_plan_cuda_fast) {
-        bool all_queued = copy_plan_fn_set_device && copy_plan_fn_set_device(copy_plan_device);
+        bool all_queued = copy_plan_fn_set_device != nullptr;
         bool any_queued = false;
+        int current_device = -1;
+        copy_plan_touched_devices.clear();
         const int64_t t_enqueue_start = profile_timing ? ggml_time_us() : 0;
 
         if (all_queued) {
             for (const recurrent_copy_plan_entry & entry : copy_plan_entries) {
+                if (current_device != entry.device) {
+                    if (!copy_plan_fn_set_device(entry.device)) {
+                        all_queued = false;
+                        break;
+                    }
+                    current_device = entry.device;
+                }
                 const char * src = (const char *) entry.tensor->data + (size_t) i_src * entry.row_bytes;
                 char * dst = (char *) entry.tensor->data + (size_t) i_dst * entry.row_bytes;
                 if (!copy_plan_fn_copy(dst, src, entry.row_bytes)) {
@@ -586,6 +608,9 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
                     break;
                 }
                 any_queued = true;
+                if (std::find(copy_plan_touched_devices.begin(), copy_plan_touched_devices.end(), entry.device) == copy_plan_touched_devices.end()) {
+                    copy_plan_touched_devices.push_back(entry.device);
+                }
                 profile.tensors_copied++;
                 profile.cuda_d2d_queued++;
             }
@@ -603,7 +628,10 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
         bool synced = false;
         if (any_queued && copy_plan_fn_sync_device) {
             const int64_t t_sync_start = profile_timing ? ggml_time_us() : 0;
-            synced = copy_plan_fn_sync_device(copy_plan_device);
+            synced = true;
+            for (int device : copy_plan_touched_devices) {
+                synced = copy_plan_fn_sync_device(device) && synced;
+            }
             if (t_sync_start != 0) {
                 profile.sync_us += ggml_time_us() - t_sync_start;
             }

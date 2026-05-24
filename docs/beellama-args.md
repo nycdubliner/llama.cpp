@@ -300,6 +300,12 @@ llama-server -m target.gguf \
 
 Sampled DFlash activates the rejection-sampling path when both drafter and target temperature exceed zero. Draft log-probabilities must be available for rejection sampling to produce correct output. Without those conditions, Bee uses the normal greedy speculative path.
 
+Multi-GPU DFlash:
+
+In `v0.3.0`, DFlash GPU cross rings, graph hidden capture, recurrent tape buffers, conv replay, and direct GDN replay are attempted by default on split CUDA/ROCm target placement. The runtime allocates capture and tape buffers on each layer's backend device and synchronizes every backend touched by a DFlash capture or replay. Unsupported placement, host recurrent state, missing backend helpers, or pointer-device validation failure falls back to the CPU/eval-callback path instead of forcing one GPU path.
+
+Use `GGML_DFLASH_MULTI_GPU_TAPE=0` to disable this default-on multi-GPU path. `GGML_DFLASH_ALLOW_MULTI_GPU_TAPE=0` is accepted as a compatibility spelling from PR #32 review/testing notes. Both variables are kill switches only; unset means enabled.
+
 ## Adaptive Draft-Max
 
 Adaptive Draft-Max is enabled by default for DFlash. It can reduce the active draft depth below `--spec-draft-n-max`, turn speculation off after consecutive below-threshold cycles, and probe again periodically.
@@ -518,6 +524,8 @@ DFlash diagnostic environment variables:
 | `GGML_DFLASH_FORCE_CPU_CROSS=1` | Force the CPU hidden-state cross path even when the GPU ring is available. |
 | `GGML_DFLASH_VERIFY_PAD=1` | Re-enable diagnostic verifier padding to the active draft depth. Default is off because padded rows consume target verify time but are not sampled or accepted. |
 | `GGML_DFLASH_GPU_RING=0` | Disable the GPU cross-attention ring and force the CPU ring path. |
+| `GGML_DFLASH_MULTI_GPU_TAPE=0` | Disable default-on multi-GPU DFlash GPU ring, hidden capture, tape, and replay. Use to force the CPU/eval-callback fallback for split target placement. |
+| `GGML_DFLASH_ALLOW_MULTI_GPU_TAPE=0` | Compatibility spelling for the same multi-GPU DFlash kill switch. |
 | `GGML_DFLASH_MAX_CTX=N` | Cap the DFlash cross-attention context length. `0` removes the cap. |
 | `GGML_DFLASH_KV_CACHE_MODE=k|v|both|off` | Keep only K projections, only V projections, both, or disable the DFlash drafter K/V cache entirely. |
 

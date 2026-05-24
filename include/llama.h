@@ -1115,6 +1115,9 @@ extern "C" {
     // tensors directly, so the eval callback keeps CPU hidden buffers populated.
     LLAMA_API void llama_set_dflash_gpu_capture(struct llama_context * ctx, bool enabled);
 
+    // DFlash: true unless multi-GPU tape is explicitly disabled by environment.
+    LLAMA_API bool llama_dflash_allow_multi_gpu_tape(void);
+
     // DFlash: set drafter sampling temperature (Gumbel-max trick)
     // temp=0: greedy argmax (default), temp>0: sample from softmax(logits/temp)
     LLAMA_API void llama_set_dflash_sample_temp(struct llama_context * ctx, float temp);

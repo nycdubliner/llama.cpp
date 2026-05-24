@@ -9,7 +9,7 @@
 #include <mutex>
 
 #ifndef GGML_CUDA_MAX_DEVICES
-#define GGML_CUDA_MAX_DEVICES 16
+#define GGML_CUDA_MAX_DEVICES 32
 #endif
 
 // GPU cross-attention ring buffer for DFlash speculative decoding.
@@ -251,20 +251,34 @@ extern "C" bool dflash_cross_ring_gpu_write_d2d(
                 layer, ring_pos, n_tokens, n_embd, ring->ring_size);
     }
 
+    int prev_device = -1;
+    if (cudaGetDevice(&prev_device) != cudaSuccess) {
+        cudaGetLastError();
+        prev_device = -1;
+    }
+    auto restore_device = [&]() {
+        if (prev_device >= 0) {
+            (void)cudaSetDevice(prev_device);
+        }
+    };
+
     (void)cudaSetDevice(ring->device);
 
     cudaPointerAttributes attr;
     cudaError_t attr_err = cudaPointerGetAttributes(&attr, device_data);
     if (attr_err != cudaSuccess) {
         cudaGetLastError();
+        restore_device();
         return false;
     }
 #if CUDART_VERSION >= 10000 || defined(GGML_USE_HIP)
     if (attr.type != cudaMemoryTypeDevice) {
+        restore_device();
         return false;
     }
 #else
     if (attr.memoryType != cudaMemoryTypeDevice) {
+        restore_device();
         return false;
     }
 #endif
@@ -287,6 +301,7 @@ extern "C" bool dflash_cross_ring_gpu_write_d2d(
     int first = ring->ring_size - pos;
     if (attr.device != ring->device) {
         if (!dflash_cuda_enable_peer_access(ring->device, attr.device)) {
+            restore_device();
             return false;
         }
 
@@ -311,7 +326,9 @@ extern "C" bool dflash_cross_ring_gpu_write_d2d(
         }
     }
 
-    return cudaGetLastError() == cudaSuccess;
+    const bool ok = cudaGetLastError() == cudaSuccess;
+    restore_device();
+    return ok;
 }
 
 __global__ static void k_dflash_rebuild_conv_state(
@@ -482,7 +499,6 @@ extern "C" bool dflash_cuda_ptr_device(const void * ptr, int * device) {
     *device = attr.device;
 #endif
 
-    (void)cudaSetDevice(*device);
     return true;
 }
 
@@ -577,6 +593,17 @@ extern "C" void dflash_cross_ring_gpu_set_tensor(
         void * d_dst, const void * d_src, size_t offset, size_t size) {
     if (!d_dst || !d_src || size == 0) return;
 
+    int prev_device = -1;
+    if (cudaGetDevice(&prev_device) != cudaSuccess) {
+        cudaGetLastError();
+        prev_device = -1;
+    }
+    auto restore_device = [&]() {
+        if (prev_device >= 0) {
+            (void)cudaSetDevice(prev_device);
+        }
+    };
+
     char * dst = (char *) d_dst + offset;
 
     cudaPointerAttributes dst_attr;
@@ -601,6 +628,7 @@ extern "C" void dflash_cross_ring_gpu_set_tensor(
 
     if (dst_is_device && src_is_device && dst_attr.device != src_attr.device) {
         if (!dflash_cuda_enable_peer_access(dst_attr.device, src_attr.device)) {
+            restore_device();
             return;
         }
         cudaSetDevice(dst_attr.device);
@@ -612,6 +640,7 @@ extern "C" void dflash_cross_ring_gpu_set_tensor(
         cudaMemcpyAsync(dst, d_src, size, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
     }
     cudaStreamSynchronize(cudaStreamPerThread);
+    restore_device();
 }
 
 extern "C" bool dflash_kv_cache_write_d2d(

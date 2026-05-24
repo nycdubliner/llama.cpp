@@ -102,6 +102,9 @@ struct dflash_tape_gpu_layer {
     ggml_tensor * gate = nullptr;  // [1, H_v, max_tokens]
     ggml_tensor * beta = nullptr;  // [1, H_v, max_tokens]
     ggml_tensor * qkv  = nullptr;  // [conv_channels, max_tokens]
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_context * ctx = nullptr;
+    ggml_backend_dev_t dev = nullptr;
 };
 
 struct dflash_tape_gpu {
@@ -113,6 +116,10 @@ struct dflash_tape_gpu {
     int n_tokens = 0;                           // actual tokens recorded this pass
 
     ~dflash_tape_gpu() {
+        for (auto & layer : layers) {
+            if (layer.buf) ggml_backend_buffer_free(layer.buf);
+            if (layer.ctx) ggml_free(layer.ctx);
+        }
         if (buf) ggml_backend_buffer_free(buf);
         if (ctx) ggml_free(ctx);
     }
@@ -121,15 +128,19 @@ struct dflash_tape_gpu {
 struct dflash_hidden_gpu {
     std::vector<ggml_tensor *> layers;  // one [n_embd, max_tokens] tensor per captured layer
     std::vector<int32_t> layer_ids;
-    ggml_backend_buffer_t buf = nullptr;
-    ggml_context * ctx = nullptr;
+    std::vector<ggml_backend_buffer_t> bufs;
+    std::vector<ggml_context *> ctxs;
     int64_t n_embd = 0;
     int max_tokens = 0;
     int n_tokens = 0;
 
     ~dflash_hidden_gpu() {
-        if (buf) ggml_backend_buffer_free(buf);
-        if (ctx) ggml_free(ctx);
+        for (auto b : bufs) {
+            if (b) ggml_backend_buffer_free(b);
+        }
+        for (auto c : ctxs) {
+            if (c) ggml_free(c);
+        }
     }
 };
 
@@ -245,6 +256,11 @@ struct dflash_capture_data {
     using sync_backend_to_stream_fn_t = bool (*)(ggml_backend_t);
     sync_backend_to_stream_fn_t fn_sync_backend_to_stream = nullptr;
     ggml_backend_t sync_backend_to_stream_backend = nullptr;
+    struct capture_wait_backend {
+        ggml_backend_t backend = nullptr;
+        sync_backend_to_stream_fn_t fn = nullptr;
+    };
+    std::vector<capture_wait_backend> capture_wait_backends;
 
     dflash_tape_gpu * active_tape() const {
         return (active_tape_idx >= 0 && active_tape_idx < (int) tapes.size())
