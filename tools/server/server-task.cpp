@@ -665,7 +665,11 @@ common_chat_msg task_result_state::update_chat_msg(
                         }
                     } else {
                         // Not sent yet.
-                        if (!d.tool_call_delta.arguments.empty() || !is_partial) {
+                        const bool has_stable_partial_header =
+                            is_partial &&
+                            d.tool_call_delta.arguments.empty() &&
+                            task_result_has_stable_partial_tool_call_header(generated_text, chat_msg.tool_calls[i]);
+                        if (!d.tool_call_delta.arguments.empty() || !is_partial || has_stable_partial_header) {
                             d.tool_call_delta.name = chat_msg.tool_calls[i].name;
                             d.tool_call_delta.id   = chat_msg.tool_calls[i].id;
                             diffs.push_back(std::move(d));

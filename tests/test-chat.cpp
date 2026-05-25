@@ -4555,10 +4555,13 @@ static void test_task_result_state_tool_call_stream_filter() {
         assert_equals(std::string("special_function"), diffs[0].tool_call_delta.name);
         assert_equals(false, diffs[0].tool_call_delta.id.empty());
         assert_equals(std::string(""), diffs[0].tool_call_delta.arguments);
+        assert_equals(std::string(""), qwen_state.chat_msg.content);
+        assert_equals(std::string(""), qwen_state.chat_msg.reasoning_content);
 
         diffs.clear();
         qwen_state.update_chat_msg("1\n", true, diffs, true);
         assert_equals(size_t(0), diffs.size());
+        assert_equals(std::string(""), qwen_state.chat_msg.tool_calls[0].arguments);
 
         diffs.clear();
         qwen_state.update_chat_msg("</parameter>\n</function>\n", true, diffs, true);
