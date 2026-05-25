@@ -877,6 +877,7 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     bool dflash_kv_cache_multi_gpu_fallback_logged = false;
+    bool dflash_kv_cache_multiseq_fallback_logged = false;
     std::unique_ptr<dflash_kv_cache_data> dflash_kv_cache;
 
     llm_graph_result_ptr gf_res_prev;

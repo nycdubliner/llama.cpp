@@ -361,12 +361,21 @@ int main(int argc, char ** argv) {
     const size_t kv_cache_init_fn = context_cpp.find("bool llama_context::dflash_kv_cache_init");
     const size_t kv_cache_update_fn = context_cpp.find("bool llama_context::dflash_kv_cache_update");
     const size_t kv_cache_update_graph = context_cpp.find("ggml_backend_graph_compute_async(gpu_backend, gf)", kv_cache_update_fn);
-    ok &= expect(context_h.find("dflash_kv_cache_multi_gpu_fallback_logged") != std::string::npos, "DFlash K/V cache multi-GPU fallback logging must be per context");
+    ok &= expect(context_h.find("dflash_kv_cache_multi_gpu_fallback_logged") != std::string::npos &&
+                 context_h.find("dflash_kv_cache_multiseq_fallback_logged") != std::string::npos,
+        "DFlash K/V cache fallback logging must be tracked per context for both multi-GPU and multi-slot draft paths");
     ok &= expect(
         kv_cache_init_fn != std::string::npos &&
         kv_cache_update_fn != std::string::npos &&
         context_cpp.find("multi-GPU drafter detected", kv_cache_init_fn) < kv_cache_update_fn,
         "DFlash drafter K/V cache must fall back before initializing on multi-GPU draft placement");
+    ok &= expect(
+        kv_cache_init_fn != std::string::npos &&
+        kv_cache_update_fn != std::string::npos &&
+        context_cpp.find("cparams.n_seq_max > 1", kv_cache_init_fn) != std::string::npos &&
+        context_cpp.find("multi-seq drafter context detected", kv_cache_init_fn) < kv_cache_update_fn &&
+        context_cpp.find("cparams.n_seq_max > 1", kv_cache_update_fn) < kv_cache_update_graph,
+        "DFlash drafter K/V cache must stay disabled on shared multi-slot draft contexts because the cache is global to the drafter context");
     ok &= expect(
         kv_cache_update_fn != std::string::npos &&
         kv_cache_update_graph != std::string::npos &&

@@ -3954,6 +3954,16 @@ bool llama_context::dflash_kv_cache_init(int ctx_size) {
     if (ctx_size <= 0 || !llm_arch_is_dflash_drafter(model.arch)) {
         return false;
     }
+    if (cparams.n_seq_max > 1) {
+        dflash_kv_cache.reset();
+        cross.dflash_kv_cache = nullptr;
+        if (!dflash_kv_cache_multiseq_fallback_logged) {
+            LLAMA_LOG_INFO("%s: multi-seq drafter context detected (n_seq_max=%u); disabling DFlash drafter K/V projection cache because the cache is shared across slots\n",
+                __func__, cparams.n_seq_max);
+            dflash_kv_cache_multiseq_fallback_logged = true;
+        }
+        return false;
+    }
     if (model.n_devices() > 1) {
         dflash_kv_cache.reset();
         cross.dflash_kv_cache = nullptr;
@@ -4100,6 +4110,11 @@ bool llama_context::dflash_kv_cache_prepare(int ctx_window) {
 
 bool llama_context::dflash_kv_cache_update(int n_tokens) {
     if (!dflash_kv_cache || n_tokens <= 0 || !llm_arch_is_dflash_drafter(model.arch)) {
+        return false;
+    }
+    if (cparams.n_seq_max > 1) {
+        dflash_kv_cache.reset();
+        cross.dflash_kv_cache = nullptr;
         return false;
     }
     if (model.n_devices() > 1) {
