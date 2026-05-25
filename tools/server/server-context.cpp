@@ -1642,8 +1642,6 @@ private:
     int  n_parallel_user = 0;
     int  n_seq_max_full = 0;      // target n_seq_max after expansion (2*n_parallel_user)
     bool recurrent_expanded = true; // false = backup cells deferred, expand before first draft
-    bool dflash_shared_drafter_batch_recurrent_logged = false;
-    size_t dflash_recurrent_draft_rr = 0;
 
     int32_t n_ctx; // total context for all clients / slots
 
@@ -1881,17 +1879,7 @@ private:
                 params_base.speculative.branch_budget != 0) {
             return false;
         }
-
-        const bool target_non_recurrent = !needs_reeval;
-        if (!target_non_recurrent) {
-            if (!dflash_shared_drafter_batch_recurrent_logged) {
-                SRV_WRN("%s", "DFlash shared drafter batching disabled: reason=target-recurrent; using per-slot DFlash drafts for recurrent/hybrid target correctness\n");
-                dflash_shared_drafter_batch_recurrent_logged = true;
-            }
-            return false;
-        }
-
-        return target_non_recurrent;
+        return true;
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1916,8 +1904,6 @@ private:
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
         params_base = params;
-        dflash_shared_drafter_batch_recurrent_logged = false;
-
         const std::string & mmproj_path = params_base.mmproj.path;
         const bool has_mmproj = !mmproj_path.empty();
 
@@ -3900,39 +3886,19 @@ private:
         std::vector<llama_tokens> batched_drafts(slots.size());
         std::vector<std::vector<float>> batched_log_probs(slots.size());
         const bool use_rejection_sampling = params_base.speculative.sample_temp > 0.0f && params_base.sampling.temp > 0.0f;
-        const bool dflash_recurrent_single_slot_cycle =
-            params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH && needs_reeval;
         const bool dflash_recurrent_has_pending_prompt =
-            dflash_recurrent_single_slot_cycle &&
+            params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+            needs_reeval &&
             std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
                 return slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT;
             });
-        int dflash_recurrent_cycle_slot_id = -1;
-        if (dflash_recurrent_single_slot_cycle && !dflash_recurrent_has_pending_prompt && !slots.empty()) {
-            const size_t n_slots = slots.size();
-            dflash_recurrent_draft_rr %= n_slots;
-            for (size_t off = 0; off < n_slots; ++off) {
-                const size_t idx = (dflash_recurrent_draft_rr + off) % n_slots;
-                auto & slot = slots[idx];
-                const bool sampler_blocks_speculative =
-                    slot.smpl && common_sampler_blocks_speculative(slot.smpl.get());
-                if (slot.state == SLOT_STATE_GENERATING &&
-                        slot.can_speculate() &&
-                        slot.get_n_draft_max(params_base, false) > 0 &&
-                        !sampler_blocks_speculative) {
-                    dflash_recurrent_cycle_slot_id = slot.id;
-                    dflash_recurrent_draft_rr = (idx + 1) % n_slots;
-                    break;
-                }
-            }
-        }
         if (ctx_dft_shared) {
             int n_drafting = 0;
             for (auto & slot : slots) {
                 if (slot.state == SLOT_STATE_GENERATING &&
                         slot.can_speculate() &&
                         slot.get_n_draft_max(params_base, false) > 0 &&
-                        (!dflash_recurrent_single_slot_cycle || slot.id == dflash_recurrent_cycle_slot_id)) {
+                        !dflash_recurrent_has_pending_prompt) {
                     n_drafting++;
                 }
             }
@@ -3949,7 +3915,7 @@ private:
                     if (slot.state == SLOT_STATE_GENERATING &&
                             slot.can_speculate() &&
                             slot.get_n_draft_max(params_base, false) > 0 &&
-                            (!dflash_recurrent_single_slot_cycle || slot.id == dflash_recurrent_cycle_slot_id)) {
+                            !dflash_recurrent_has_pending_prompt) {
                         batch_specs.push_back(slot.get_spec());
                         batch_id_lasts.push_back(slot.sampled);
                         batch_slot_ids.push_back(slot.id);
@@ -3982,16 +3948,7 @@ private:
                 continue;
             }
 
-            if (dflash_recurrent_single_slot_cycle &&
-                    dflash_recurrent_has_pending_prompt &&
-                    slot.can_speculate()) {
-                continue;
-            }
-
-            if (dflash_recurrent_single_slot_cycle &&
-                    dflash_recurrent_cycle_slot_id >= 0 &&
-                    slot.can_speculate() &&
-                    slot.id != dflash_recurrent_cycle_slot_id) {
+            if (dflash_recurrent_has_pending_prompt && slot.can_speculate()) {
                 continue;
             }
 
@@ -4943,10 +4900,12 @@ private:
                 }
             }
 
-            if (needs_reeval && dflash_multiseq_n_unique > 1) {
-                // Recurrent/hybrid target verification needs per-seq ubatches
-                // until multi-slot recurrent capture/tape/rollback is proven safe.
-                dflash_multiseq_block_reason = "target-recurrent-multiseq";
+            if (needs_reeval && dflash_multiseq_n_unique > 1 && ddtree_batch_active) {
+                // Tree verification still relies on per-seq recurrent rollback
+                // and indexed hidden capture. Flat DFlash can batch multiple
+                // recurrent slots now that acceptance consumes all verifier
+                // outputs before any rollback mutates the target context.
+                dflash_multiseq_block_reason = "target-recurrent-tree";
                 dflash_multiseq_block_seq = unique_seqs[1];
                 return false;
             }
@@ -5597,6 +5556,97 @@ private:
 
             // speculative decoding - main model sample and accept
             const int64_t t_accept_start = ggml_time_us();
+            struct dflash_flat_accept_prefetch {
+                bool ready = false;
+                llama_tokens ids;
+                bool speculative_has_bonus = true;
+                int n_accepted_draft = 0;
+                int n_hidden_keep = 0;
+                int64_t sample_us = 0;
+                int64_t update_us = 0;
+            };
+            const bool dflash_multislot_flat_accept_barrier =
+                params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                n_slots_drafted > 1 &&
+                !ddtree_batch_active &&
+                std::none_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                    return slot.state == SLOT_STATE_GENERATING &&
+                        slot.can_speculate() &&
+                        slot.has_draft_tree;
+                });
+            std::vector<dflash_flat_accept_prefetch> dflash_flat_accept_prefetches(slots.size());
+
+            if (dflash_multislot_flat_accept_barrier) {
+                for (auto & slot : slots) {
+                    if (slot.id < 0 || slot.id >= (int) dflash_flat_accept_prefetches.size()) {
+                        continue;
+                    }
+                    if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
+                        continue;
+                    }
+
+                    auto & prefetched = dflash_flat_accept_prefetches[slot.id];
+                    const int64_t t_sample_start = ggml_time_us();
+                    const bool use_rejection = params_base.speculative.sample_temp > 0.0f
+                                            && params_base.sampling.temp > 0.0f
+                                            && !slot.draft_log_probs.empty();
+                    if (use_rejection) {
+                        prefetched.ids = speculative_reject_sample(slot.smpl.get(), ctx_tgt, slot.spec_draft,
+                            slot.spec_i_batch, slot.draft_log_probs, params_base.sampling.temp, slot.reject_rng,
+                            slot.n_reject_exact, slot.n_reject_prob_accept, slot.n_reject_reject, slot.n_reject_no_prob);
+                    } else {
+                        if (dflash_reduced_verify_ready && dflash_verify_plan.enabled) {
+                            std::vector<int> reduced_idxs = slot.spec_i_batch;
+                            for (int & idx : reduced_idxs) {
+                                idx -= dflash_reduced_verify_view_start;
+                            }
+                            prefetched.ids = dflash_sample_reduced_verify(slot.smpl.get(), ctx_tgt, reduced_idxs,
+                                    slot.spec_draft, dflash_reduced_verify_top_k);
+                            if (prefetched.ids.empty()) {
+                                GGML_ABORT("DFlash reduced verifier output missing; falling back is unsafe because raw logits were not copied\n");
+                            }
+                        } else {
+                            prefetched.ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                        }
+                    }
+                    prefetched.sample_us = ggml_time_us() - t_sample_start;
+
+                    const int32_t remaining = slot.remaining_generation_budget(params_base);
+                    if (remaining != -1 && (int32_t) prefetched.ids.size() > remaining) {
+                        SLT_WRN(slot, "accepted draft tokens exceed remaining budget (%d > %d), truncating\n",
+                                (int) prefetched.ids.size(), remaining);
+                        prefetched.ids.resize((size_t) std::max<int32_t>(0, remaining));
+                    }
+                    GGML_ASSERT(slot.remaining_generation_budget(params_base) == -1 ||
+                            (int32_t) prefetched.ids.size() <= slot.remaining_generation_budget(params_base));
+
+                    prefetched.speculative_has_bonus =
+                        speculative_flat_result_has_bonus(prefetched.ids, slot.spec_draft, slot.smpl.get());
+                    prefetched.n_accepted_draft =
+                        std::max(0, (int) prefetched.ids.size() - (prefetched.speculative_has_bonus ? 1 : 0));
+                    prefetched.n_hidden_keep = prefetched.ids.empty() ? 0 : prefetched.n_accepted_draft + 1;
+                    prefetched.ready = true;
+                }
+
+                for (auto & slot : slots) {
+                    if (slot.id < 0 || slot.id >= (int) dflash_flat_accept_prefetches.size()) {
+                        continue;
+                    }
+                    auto & prefetched = dflash_flat_accept_prefetches[slot.id];
+                    if (!prefetched.ready || prefetched.ids.empty()) {
+                        continue;
+                    }
+
+                    const int64_t t_update_start = ggml_time_us();
+                    llama_dflash_set_active_slot(ctx_tgt, slot.id);
+                    llama_tokens batch_tokens;
+                    batch_tokens.push_back(slot.sampled);
+                    batch_tokens.insert(batch_tokens.end(), slot.spec_draft.begin(), slot.spec_draft.end());
+                    common_speculative_update_logits(slot.get_spec(), ctx_tgt, batch_tokens, prefetched.n_hidden_keep);
+                    prefetched.update_us = ggml_time_us() - t_update_start;
+                }
+            }
+
             for (auto & slot : slots) {
                 if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || (slot.spec_draft.empty() && !slot.has_draft_tree)) {
                     continue;
@@ -5634,7 +5684,17 @@ private:
                 int  n_hidden_keep = 0;
                 std::vector<int> capture_indices;
 
-                if (is_draft_tree) {
+                if (dflash_multislot_flat_accept_barrier && !is_draft_tree) {
+                    const auto & prefetched = dflash_flat_accept_prefetches[slot.id];
+                    GGML_ASSERT(prefetched.ready);
+                    ids = prefetched.ids;
+                    speculative_has_bonus = prefetched.speculative_has_bonus;
+                    n_accepted_draft = prefetched.n_accepted_draft;
+                    n_hidden_keep = prefetched.n_hidden_keep;
+                    profile_accept_sample_us = prefetched.sample_us;
+                    profile_accept_update_us = prefetched.update_us;
+                    profile_accept_phase_start = ggml_time_us();
+                } else if (is_draft_tree) {
                     const bool use_tree_rejection = params_base.speculative.sample_temp > 0.0f
                                                    && params_base.sampling.temp > 0.0f
                                                    && !slot.draft_log_probs.empty();
