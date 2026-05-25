@@ -702,6 +702,9 @@ public:
     bool dflash_kv_cache_update_gpu(const void * d_hidden, int n_tokens, int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d);
     bool dflash_target_kv_cache_update_gpu(llama_seq_id seq_id, llama_pos start_pos, const void * d_hidden, int n_tokens, int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d);
     bool dflash_kv_cache_prepare(int ctx_window);
+    dflash_kv_cache_data * dflash_kv_cache_active();
+    void dflash_kv_cache_set_active_seq(llama_seq_id seq_id);
+    std::unique_ptr<dflash_kv_cache_data> & dflash_kv_cache_active_ref();
 
     // DDTree: set/clear tree attention mask for verification
     void set_tree_mask(const uint8_t * visibility, int n_tree_tokens);
@@ -877,8 +880,8 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     bool dflash_kv_cache_multi_gpu_fallback_logged = false;
-    bool dflash_kv_cache_multiseq_fallback_logged = false;
-    std::unique_ptr<dflash_kv_cache_data> dflash_kv_cache;
+    llama_seq_id dflash_kv_cache_active_seq = -1;
+    std::map<llama_seq_id, std::unique_ptr<dflash_kv_cache_data>> dflash_kv_caches;
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;

@@ -149,6 +149,7 @@ static void common_dflash_clear_drafter_seq(llama_context * ctx_dft, llama_seq_i
 static void common_dflash_reset_drafter_seq_and_kv_cache(llama_context * ctx_dft, llama_seq_id seq_id, const char * reason) {
     common_dflash_clear_drafter_seq(ctx_dft, seq_id, reason);
     if (ctx_dft) {
+        llama_dflash_kv_cache_set_active_seq(ctx_dft, seq_id);
         llama_dflash_kv_cache_reset(ctx_dft);
     }
 }
@@ -2204,6 +2205,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
         if (!kv_cache_init_attempted) {
             kv_cache_init_attempted = true;
+            llama_dflash_kv_cache_set_active_seq(ctx_dft, seq_id);
             kv_cache_enabled = llama_dflash_kv_cache_init(ctx_dft, cross_ctx);
             if (kv_cache_enabled) {
                 LOG_INF("dflash: drafter K/V projection cache enabled (%d-token window)\n", cross_ctx);
@@ -2217,8 +2219,8 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
         const bool profile_copy = profile_enabled(DFLASH_PROFILE_COPY);
         const int64_t t_start = profile_copy ? ggml_time_us() : 0;
-        const bool ok = llama_dflash_kv_cache_update_from_ring(ctx_dft, gpu_ring_handle,
-                gpu_write_pos, gpu_filled, n_target_layers, n_embd, n_update);
+        const bool ok = llama_dflash_kv_cache_update_from_ring_seq(ctx_dft, gpu_ring_handle,
+                gpu_write_pos, gpu_filled, n_target_layers, n_embd, n_update, seq_id);
         if (profile_copy) {
             LOG_INF("dflash profile: kv_cache_update requested=%d update=%d ok=%d time=%.3f ms ring_pos=%d filled=%d committed=%d\n",
                     n_written, n_update, ok ? 1 : 0, (ggml_time_us() - t_start) / 1e3,
@@ -4389,6 +4391,12 @@ void common_speculative_draft_batch(
     };
     std::vector<ready_slot> ready;
     ready.reserve(n_specs);
+
+    // The DFlash projection cache is shared by the drafter context. Put the
+    // context into multi-slot mode before prepare_batch_draft() builds per-slot
+    // cross data so an active batched draft cannot expose single-slot cache
+    // state from a previous request.
+    llama_set_dflash_n_slots(ctx_dft, std::max(1, std::min(n_specs, (int) LLAMA_DFLASH_MAX_SLOTS)));
 
     for (int s = 0; s < n_specs; s++) {
         for (auto & impl : specs[s]->impls) {

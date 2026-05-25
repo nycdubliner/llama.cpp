@@ -1251,11 +1251,17 @@ extern "C" {
     LLAMA_API void   llama_dflash_cross_ring_gpu_set_cross(struct llama_context * ctx, void * handle, llama_seq_id seq_id, int ring_write_pos, int ring_filled, int n_layers, int n_embd, int ctx_window);
     LLAMA_API bool   llama_dflash_kv_cache_init(struct llama_context * ctx, int ctx_size);
     LLAMA_API void   llama_dflash_kv_cache_reset(struct llama_context * ctx);
+    LLAMA_API void   llama_dflash_kv_cache_set_active_seq(struct llama_context * ctx, llama_seq_id seq_id);
     LLAMA_API bool   llama_dflash_kv_cache_update(struct llama_context * ctx, int n_tokens);
     LLAMA_API bool   llama_dflash_kv_cache_update_from_ring(
             struct llama_context * ctx, void * handle,
             int ring_write_pos, int ring_filled,
             int n_layers, int n_embd, int n_tokens);
+    LLAMA_API bool   llama_dflash_kv_cache_update_from_ring_seq(
+            struct llama_context * ctx, void * handle,
+            int ring_write_pos, int ring_filled,
+            int n_layers, int n_embd, int n_tokens,
+            llama_seq_id seq_id);
     LLAMA_API bool   llama_dflash_target_kv_cache_update_from_ring(
             struct llama_context * ctx, void * handle,
             int ring_write_pos, int ring_filled,

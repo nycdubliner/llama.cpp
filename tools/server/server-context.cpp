@@ -827,12 +827,6 @@ struct server_slot : server_adaptive_dm_state {
             return 0;
         }
 
-        if (dm_adaptive &&
-                dm_controller == COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT &&
-                profit_acceptance_collapse_disabled) {
-            return 0;
-        }
-
         const int n_draft_min = common_speculative_n_min(get_spec(), task->params.speculative);
 
         const int base_n_max = common_speculative_n_max(get_spec(), task->params.speculative);
@@ -4901,10 +4895,6 @@ private:
             }
 
             if (needs_reeval && dflash_multiseq_n_unique > 1 && ddtree_batch_active) {
-                // Tree verification still relies on per-seq recurrent rollback
-                // and indexed hidden capture. Flat DFlash can batch multiple
-                // recurrent slots now that acceptance consumes all verifier
-                // outputs before any rollback mutates the target context.
                 dflash_multiseq_block_reason = "target-recurrent-tree";
                 dflash_multiseq_block_seq = unique_seqs[1];
                 return false;
@@ -5135,11 +5125,6 @@ private:
             };
 
             if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
-                auto dflash_slot_runtime_enabled = [](const server_slot & slot) {
-                    return !(slot.dm_adaptive &&
-                            server_adaptive_dm_uses_profit_controller(slot.dm_controller) &&
-                            slot.profit_acceptance_collapse_disabled);
-                };
                 bool dflash_view_has_generating = false;
                 std::vector<server_slot *> dflash_slots_in_view;
                 for (auto & slot : slots) {
@@ -5152,7 +5137,7 @@ private:
                     }
                     dflash_slots_in_view.push_back(&slot);
 
-                    if (slot.state == SLOT_STATE_GENERATING && dflash_slot_runtime_enabled(slot)) {
+                    if (slot.state == SLOT_STATE_GENERATING) {
                         dflash_capture_needed_for_view = true;
                         dflash_view_has_generating = true;
                     }
@@ -5496,12 +5481,7 @@ private:
                 // silently corrupting the drafter's cross-attention context on every subsequent
                 // verify. Fires correctly on the fallback non-spec path during generation
                 // (draft too small → single-token decode), where slot.sampled was just decoded.
-                const bool dflash_request_disabled =
-                    params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
-                    slot.dm_adaptive &&
-                    server_adaptive_dm_uses_profit_controller(slot.dm_controller) &&
-                    slot.profit_acceptance_collapse_disabled;
-                if (slot.can_speculate() && slot.n_decoded > 0 && !dflash_request_disabled) {
+                if (slot.can_speculate() && slot.n_decoded > 0) {
                     if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                         llama_dflash_set_active_slot(ctx_tgt, slot.id);
                     }
@@ -6079,6 +6059,9 @@ private:
                         } else {
                             llama_clear_tree_parent_ids(ctx_tgt);
                             llama_dflash_rollback(ctx_tgt, slot.id, seq_backup, slot.n_pos_before_draft, n_hidden_keep);
+                            // Multi-slot accept can immediately roll back another seq; make this
+                            // seq's async recurrent replay visible before the next mutation.
+                            llama_tape_replay_sync(ctx_tgt);
                         }
                     } else {
                         auto * mem = llama_get_memory(ctx_tgt);

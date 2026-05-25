@@ -65,6 +65,7 @@ int main(int argc, char ** argv) {
     const std::string sampling_h = read_file(root + "/common/sampling.h");
     const std::string sampling_cpp = read_file(root + "/common/sampling.cpp");
     const std::string server_context = read_file(root + "/tools/server/server-context.cpp");
+    const std::string server_adaptive_dm_h = read_file(root + "/tools/server/server-adaptive-dm.h");
     const std::string server_task = read_file(root + "/tools/server/server-task.cpp");
     const std::string server_task_h = read_file(root + "/tools/server/server-task.h");
     const std::string chat_auto_parser_generator = read_file(root + "/common/chat-auto-parser-generator.cpp");
@@ -361,9 +362,8 @@ int main(int argc, char ** argv) {
     const size_t kv_cache_init_fn = context_cpp.find("bool llama_context::dflash_kv_cache_init");
     const size_t kv_cache_update_fn = context_cpp.find("bool llama_context::dflash_kv_cache_update");
     const size_t kv_cache_update_graph = context_cpp.find("ggml_backend_graph_compute_async(gpu_backend, gf)", kv_cache_update_fn);
-    ok &= expect(context_h.find("dflash_kv_cache_multi_gpu_fallback_logged") != std::string::npos &&
-                 context_h.find("dflash_kv_cache_multiseq_fallback_logged") != std::string::npos,
-        "DFlash K/V cache fallback logging must be tracked per context for both multi-GPU and multi-slot draft paths");
+    ok &= expect(context_h.find("dflash_kv_cache_multi_gpu_fallback_logged") != std::string::npos,
+        "DFlash K/V cache multi-GPU fallback logging must be tracked per context");
     ok &= expect(
         kv_cache_init_fn != std::string::npos &&
         kv_cache_update_fn != std::string::npos &&
@@ -372,16 +372,44 @@ int main(int argc, char ** argv) {
     ok &= expect(
         kv_cache_init_fn != std::string::npos &&
         kv_cache_update_fn != std::string::npos &&
-        context_cpp.find("cparams.n_seq_max > 1", kv_cache_init_fn) != std::string::npos &&
-        context_cpp.find("multi-seq drafter context detected", kv_cache_init_fn) < kv_cache_update_fn &&
-        context_cpp.find("cparams.n_seq_max > 1", kv_cache_update_fn) < kv_cache_update_graph,
-        "DFlash drafter K/V cache must stay disabled on shared multi-slot draft contexts because the cache is global to the drafter context");
+        context_cpp.find("cparams.n_seq_max > 1", kv_cache_init_fn) == std::string::npos &&
+        context_cpp.find("cparams.dflash_n_slots > 1", context_cpp.find("bool llama_context::dflash_kv_cache_prepare")) < kv_cache_update_fn &&
+        context_cpp.find("active multi-slot DFlash draft batch", kv_cache_update_fn) == std::string::npos &&
+        context_cpp.find("cparams.dflash_n_slots > 1", kv_cache_update_fn) == std::string::npos,
+        "DFlash drafter K/V cache updates must remain per-slot in an -np > 1 server instead of being disabled by active multi-slot drafting");
     ok &= expect(
         kv_cache_update_fn != std::string::npos &&
         kv_cache_update_graph != std::string::npos &&
         context_cpp.find("model.n_devices() > 1", kv_cache_update_fn) < kv_cache_update_graph,
         "DFlash K/V cache update must not compute a split drafter graph on one CUDA backend");
-    ok &= expect(speculative.find("llama_dflash_kv_cache_update_from_ring(ctx_dft, gpu_ring_handle") != std::string::npos, "DFlash accepted hiddens must update K/V cache from the GPU ring without mutating cross state");
+    ok &= expect(speculative.find("llama_dflash_kv_cache_update_from_ring_seq(ctx_dft, gpu_ring_handle") != std::string::npos &&
+                 speculative.find("llama_dflash_kv_cache_set_active_seq(ctx_dft, seq_id);") != std::string::npos &&
+                 llama_h.find("llama_dflash_kv_cache_update_from_ring_seq") != std::string::npos,
+        "DFlash accepted hiddens must update the slot-owned K/V projection cache from the GPU ring without mutating cross state");
+    ok &= expect(context_h.find("std::map<llama_seq_id, std::unique_ptr<dflash_kv_cache_data>> dflash_kv_caches") != std::string::npos &&
+                 context_cpp.find("void llama_context::dflash_kv_cache_set_active_seq") != std::string::npos &&
+                 context_cpp.find("dflash_kv_cache_active_seq = seq_id;") != std::string::npos,
+        "DFlash drafter K/V projection caches must be keyed by logical seq so concurrent slots cannot share one cache");
+    ok &= expect(context_cpp.find("bool llama_context::dflash_kv_cache_prepare_batch") == std::string::npos &&
+                 speculative.find("llama_dflash_kv_cache_prepare_batch") == std::string::npos &&
+                 llama_h.find("llama_dflash_kv_cache_prepare_batch") == std::string::npos,
+        "DFlash shared multi-slot drafts must not expose a single-slot K/V projection cache as a shared batch cache");
+    {
+        const size_t batch_fn = speculative.find("void common_speculative_draft_batch");
+        const size_t prewidth = speculative.find("llama_set_dflash_n_slots(ctx_dft, std::max", batch_fn);
+        const size_t prepare = speculative.find("prepare_batch_draft(ctx_dft)", batch_fn);
+        const size_t readywidth = speculative.find("llama_set_dflash_n_slots(ctx_dft, n_ready)", batch_fn);
+        const size_t decode = speculative.find("llama_decode(ctx_dft, batch)", batch_fn);
+        ok &= expect(batch_fn != std::string::npos &&
+                     prewidth != std::string::npos &&
+                     prepare != std::string::npos &&
+                     readywidth != std::string::npos &&
+                     decode != std::string::npos &&
+                     prewidth < prepare &&
+                     prepare < readywidth &&
+                     readywidth < decode,
+            "DFlash shared drafter must enter multi-slot mode before preparing cross data, then narrow to the actual ready slot count before decode");
+    }
     ok &= expect(context_h.find("dflash_target_kv_cache_update_gpu") != std::string::npos &&
                  llama_h.find("llama_dflash_target_kv_cache_update_from_ring") != std::string::npos &&
                  context_cpp.find("dflash_target_kv_cache_update_gpu") != std::string::npos &&
@@ -1526,10 +1554,12 @@ int main(int argc, char ** argv) {
                  server_context.find("dflash_recurrent_draft_rr") == std::string::npos &&
                  server_context.find("dflash_recurrent_cycle_slot_id") == std::string::npos,
         "DFlash recurrent/hybrid multi-slot scheduling must isolate prompt prefill, pre-sample every flat speculative slot before rollback, and remove the old one-slot recurrent round-robin");
-    ok &= expect(server_context.find("profit_acceptance_collapse_disabled") != std::string::npos &&
-                 server_context.find("dflash_slot_runtime_enabled") != std::string::npos &&
-                 server_context.find("dflash_request_disabled") != std::string::npos,
-        "DFlash adaptive collapse must disable request-local capture/update overhead instead of continuing expensive baseline-ring maintenance");
+    ok &= expect(server_context.find("profit_acceptance_collapse_disabled") == std::string::npos &&
+                 server_context.find("dflash_slot_runtime_enabled") == std::string::npos &&
+                 server_context.find("dflash_request_disabled") == std::string::npos &&
+                 server_adaptive_dm_h.find("profit_acceptance_collapse_disabled") == std::string::npos &&
+                 server_adaptive_dm_h.find("disabling DFlash for request after sustained low acceptance") == std::string::npos,
+        "DFlash adaptive DM must not hard-disable request-local DFlash capture/update state from low acceptance alone");
     ok &= expect(context_cpp.find("const size_t total_ids = (size_t) K * (size_t) n_outputs_all") != std::string::npos &&
                  context_cpp.find("const size_t offset_ids = (size_t) K * (size_t) n_outputs_prev") != std::string::npos &&
                  context_cpp.find("logits_argmax_count = (int32_t) (n_outputs_prev + n_outputs)") != std::string::npos,
@@ -1548,6 +1578,17 @@ int main(int argc, char ** argv) {
                      sync_comment < sync_call &&
                      sync_call < target_decode,
             "DFlash must synchronize pending recurrent tape replay immediately before every target decode, including non-spec fallback after a rejected draft");
+    }
+    {
+        const size_t rollback_call = server_context.find("llama_dflash_rollback(ctx_tgt, slot.id, seq_backup, slot.n_pos_before_draft, n_hidden_keep);");
+        const size_t rollback_sync = server_context.find("llama_tape_replay_sync(ctx_tgt);", rollback_call);
+        const size_t next_accept_lap = server_context.find("profile_accept_lap(profile_accept_rollback_us);", rollback_call);
+        ok &= expect(rollback_call != std::string::npos &&
+                     rollback_sync != std::string::npos &&
+                     next_accept_lap != std::string::npos &&
+                     rollback_call < rollback_sync &&
+                     rollback_sync < next_accept_lap,
+            "DFlash recurrent multi-slot accept must synchronize flat rollback replay before the next slot mutates recurrent state");
     }
 
     // dflash_diagnostic_debug_enabled must gate per-ubatch route logs
