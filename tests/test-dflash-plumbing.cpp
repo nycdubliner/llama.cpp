@@ -61,6 +61,7 @@ int main(int argc, char ** argv) {
     const std::string cparams_h = read_file(root + "/src/llama-cparams.h");
     const std::string graph_cpp = read_file(root + "/src/llama-graph.cpp");
     const std::string ggml_backend_cpp = read_file(root + "/ggml/src/ggml-backend.cpp");
+    const std::string ggml_backend_meta = read_file(root + "/ggml/src/ggml-backend-meta.cpp");
     const std::string llama_h = read_file(root + "/include/llama.h");
     const std::string llama_ext_h = read_file(root + "/src/llama-ext.h");
     const std::string sampling_h = read_file(root + "/common/sampling.h");
@@ -216,6 +217,11 @@ int main(int argc, char ** argv) {
         "backend scheduler copies must avoid re-running async-copy expressions when deciding fallback");
     ok &= expect(ggml_backend_cpp.find("if (need) {\n                    // TODO: pass backend to the callback") != std::string::npos,
         "backend scheduler must only synchronize split backends for eval-callback tensors that are actually needed");
+    ok &= expect(ggml_backend_meta.find("static void ggml_backend_meta_get_tensor_async") != std::string::npos &&
+                 ggml_backend_meta.find("GGML_ASSERT(offset == 0);") == std::string::npos &&
+                 ggml_backend_meta.find("const size_t simple_offset = i_start * chunk_size_j;") != std::string::npos &&
+                 ggml_backend_meta.find("ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor") != std::string::npos,
+        "Meta backend tensor reads must allow nonzero offsets for split compact outputs");
     ok &= expect(cuda_cpp.find("dflash_cuda_backend_wait_for_stream") != std::string::npos,
         "CUDA backend must expose an event wait from GGML compute stream to DFlash per-thread stream");
     ok &= expect(cuda_cpp.find("thread_local cudaEvent_t dflash_wait_events") != std::string::npos,

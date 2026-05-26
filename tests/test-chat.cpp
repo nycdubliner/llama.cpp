@@ -893,6 +893,7 @@ const common_chat_msg message_assist_call_withopt =
     simple_assist_msg("", "", "special_function_with_opt", "{\"arg1\": 1, \"arg2\": 2}");
 const common_chat_msg message_assist_call_content =
     simple_assist_msg("Hello, world!\nWhat's up?", "", "special_function", "{\"arg1\":1}");
+const common_chat_msg message_assist_prefill_content = simple_assist_msg("Hello, ", "I'm thinking");
 const common_chat_msg message_assist_call_empty_args  = simple_assist_msg("", "", "special_function");
 const common_chat_msg message_assist_call_cutoff_args = simple_assist_msg("", "", "special_function", "{\"arg");
 const common_chat_msg message_assist_call_thoughts =
@@ -1341,6 +1342,21 @@ class peg_test_builder {
 
     peg_test_builder & parallel_tool_calls(bool val) {
         tc_.params.parallel_tool_calls = val;
+        return *this;
+    }
+
+    peg_test_builder & messages(std::vector<common_chat_msg> messages) {
+        tc_.params.messages = std::move(messages);
+        return *this;
+    }
+
+    peg_test_builder & add_generation_prompt(bool val) {
+        tc_.params.add_generation_prompt = val;
+        return *this;
+    }
+
+    peg_test_builder & continue_final_message(common_chat_continuation val) {
+        tc_.params.continue_final_message = val;
         return *this;
     }
 
