@@ -1785,6 +1785,18 @@ int main(int argc, char ** argv) {
                  server_context.find("params_dft.split_mode = LLAMA_SPLIT_MODE_TENSOR;") != std::string::npos &&
                  server_context.find("server_model_supports_device_buffer(model_dft.get(), target_output_dev)") != std::string::npos,
         "DFlash draft auto-placement must keep a tensor-split drafter when shared target tensors live in a Meta buffer");
+    ok &= expect(llama_h.find("ggml_backend_dev_t output_device;") != std::string::npos &&
+                 common_h.find("ggml_backend_dev_t output_device = nullptr;") != std::string::npos &&
+                 common_cpp.find("mparams.output_device = params.output_device;") != std::string::npos &&
+                 model_cpp.find("/*.output_device                =*/ nullptr") != std::string::npos &&
+                 model_cpp.find("pimpl->dev_output = params.output_device") != std::string::npos,
+        "model loading must allow DFlash to pin the shared output tensor before target load");
+    ok &= expect(server_context.find("server_dflash_single_explicit_draft_device(params_base") != std::string::npos &&
+                 server_context.find("params_base.output_device = dflash_single_draft_dev;") != std::string::npos &&
+                 server_context.find("DFlash target output tensor will use explicit draft device") != std::string::npos &&
+                 server_context.find("const bool dflash_explicit_single_draft_device") != std::string::npos &&
+                 server_context.find("params_dft.split_mode = LLAMA_SPLIT_MODE_NONE;") != std::string::npos,
+        "DFlash single --spec-draft-device must move the target output tensor before loading the target model");
     ok &= expect(model_cpp.find("!llm_arch_is_dflash_drafter(model->arch)") != std::string::npos,
         "public DFlash hparam accessors must return zero for non-DFlash model architectures");
     ok &= expect(server_context.find("failed to initialize slot speculative decoding context") != std::string::npos,

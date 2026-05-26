@@ -104,6 +104,28 @@ static bool server_model_supports_device_buffer(const llama_model * model, ggml_
     return false;
 }
 
+static ggml_backend_dev_t server_single_gpu_device_from_list(const std::vector<ggml_backend_dev_t> & devices) {
+    if (devices.size() != 2 || devices[0] == nullptr || devices[1] != nullptr) {
+        return nullptr;
+    }
+
+    if (ggml_backend_dev_type(devices[0]) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return nullptr;
+    }
+
+    return devices[0];
+}
+
+static bool server_dflash_single_explicit_draft_device(const common_params & params, ggml_backend_dev_t & dev) {
+    dev = nullptr;
+    if (params.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH || !params.speculative.has_dft()) {
+        return false;
+    }
+
+    dev = server_single_gpu_device_from_list(params.speculative.draft.devices);
+    return dev != nullptr;
+}
+
 static bool server_tail_pos_is_in_code_fence(
         const std::string & text,
         size_t              pos) {
@@ -1938,6 +1960,17 @@ private:
         const std::string & mmproj_path = params_base.mmproj.path;
         const bool has_mmproj = !mmproj_path.empty();
 
+        ggml_backend_dev_t dflash_single_draft_dev = nullptr;
+        if (server_dflash_single_explicit_draft_device(params_base, dflash_single_draft_dev)) {
+            if (params_base.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+                SRV_WRN("%s", "DFlash single --spec-draft-device cannot pin the target output tensor while target split-mode tensor is active\n");
+            } else {
+                params_base.output_device = dflash_single_draft_dev;
+                SRV_INF("DFlash target output tensor will use explicit draft device %s before loading the target model\n",
+                        ggml_backend_dev_name(dflash_single_draft_dev));
+            }
+        }
+
         if (has_mmproj) {
             const mtmd_decode_requirements mmproj_decode_req = mtmd_get_decode_requirements_from_file(mmproj_path.c_str());
             adjust_mmproj_decoder_batch_for_non_causal(mmproj_decode_req);
@@ -2153,6 +2186,12 @@ private:
             params_dft.cache_type_v = params_spec.cache_type_v;
 
             const bool draft_type_is_dflash = params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH;
+            ggml_backend_dev_t explicit_single_draft_dev = server_single_gpu_device_from_list(params_spec.devices);
+            const bool dflash_explicit_single_draft_device = draft_type_is_dflash && explicit_single_draft_dev != nullptr;
+            if (dflash_explicit_single_draft_device) {
+                params_dft.split_mode = LLAMA_SPLIT_MODE_NONE;
+                params_dft.main_gpu = 0;
+            }
             ggml_backend_dev_t target_output_dev = llama_model_dev_output(model_tgt);
             const bool target_output_is_gpu  = target_output_dev && ggml_backend_dev_type(target_output_dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
             const bool target_output_is_meta = target_output_dev && ggml_backend_dev_type(target_output_dev) == GGML_BACKEND_DEVICE_TYPE_META;
@@ -2197,8 +2236,8 @@ private:
             bool draft_is_dflash = server_model_is_dflash_drafter(model_dft.get());
             if (draft_is_dflash && draft_devices_explicit && target_output_needs_shared_placement &&
                     !server_model_supports_device_buffer(model_dft.get(), target_output_dev)) {
-                SRV_ERR("DFlash draft model uses shared target output tensor on device %s, but --spec-draft-device did not create a compatible backend; omit --spec-draft-device for automatic placement or include %s\n",
-                        ggml_backend_dev_name(target_output_dev), ggml_backend_dev_name(target_output_dev));
+                SRV_ERR("DFlash draft model uses shared target output tensor on device %s, but --spec-draft-device did not create a compatible backend; for single-device DFlash, use one --spec-draft-device value so the target output tensor is pinned before target load, or omit --spec-draft-device for automatic placement\n",
+                        ggml_backend_dev_name(target_output_dev));
                 return false;
             }
             const bool dflash_auto_device_mismatch =

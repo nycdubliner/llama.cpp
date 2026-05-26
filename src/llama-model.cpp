@@ -1236,6 +1236,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
+    auto get_output_buft_list = [&](ggml_backend_dev_t dev) -> llama_model::impl::layer_dev {
+        if (dev == cpu_dev) {
+            LLAMA_LOG_DEBUG("%s: output tensor assigned to device %s by override\n", __func__, ggml_backend_dev_name(cpu_dev));
+            return {cpu_dev, &pimpl->cpu_buft_list};
+        }
+
+        auto it = pimpl->gpu_buft_list.find(dev);
+        if (it == pimpl->gpu_buft_list.end()) {
+            throw std::runtime_error(format("%s: output_device %s is not available to this model",
+                        __func__, dev ? ggml_backend_dev_name(dev) : "(null)"));
+        }
+
+        LLAMA_LOG_DEBUG("%s: output tensor assigned to device %s by override\n", __func__, ggml_backend_dev_name(dev));
+        return {dev, &it->second};
+    };
+
     // assign the input layer
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
@@ -1247,7 +1263,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // assign the output layer
-    pimpl->dev_output = get_layer_buft_list(n_layer);
+    pimpl->dev_output = params.output_device ? get_output_buft_list(params.output_device) : get_layer_buft_list(n_layer);
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -2153,6 +2169,7 @@ llama_model_params llama_model_default_params() {
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.main_gpu                    =*/ 0,
+        /*.output_device                =*/ nullptr,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,

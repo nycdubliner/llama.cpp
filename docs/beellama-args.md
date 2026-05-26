@@ -103,7 +103,7 @@ Bee auto-detects DFlash when a loaded draft model reports a DFlash block size an
 | `-ngl`, `--gpu-layers`, `--n-gpu-layers N|auto|all` | `auto` internally (`-1`) | Target model layer offload. Use `all` for full offload when VRAM allows. |
 | `--spec-draft-ngl`, `-ngld`, `--gpu-layers-draft`, `--n-gpu-layers-draft N|auto|all` | `auto` internally (`-1`) | Draft model layer offload. For DFlash, start with `all` if VRAM allows. |
 | `-dev`, `--device dev1,dev2,...` | All usable devices | Restrict target model devices. |
-| `--spec-draft-device`, `-devd`, `--device-draft dev1,dev2,...` | Inherited/available devices | Restrict draft model devices. |
+| `--spec-draft-device`, `-devd`, `--device-draft dev1,dev2,...` | Inherited/available devices | Restrict draft model devices. For DFlash, a single explicit GPU also pins the target output tensor to that GPU before target load, because the drafter shares the target output tensor. |
 | `-sm`, `--split-mode none|layer|row|tensor` | `layer` | Multi-GPU split strategy. |
 | `-mg`, `--main-gpu INDEX` | `0` | Main GPU for scratch/small tensors. |
 | `-ts`, `--tensor-split N0,N1,...` | Unset | Manual tensor split across devices. |
