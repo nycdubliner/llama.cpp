@@ -3357,6 +3357,12 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
+    auto is_turbo_kv_type = [](ggml_type type) {
+        return type == GGML_TYPE_TURBO2_0 ||
+               type == GGML_TYPE_TURBO3_0 ||
+               type == GGML_TYPE_TURBO4_0;
+    };
+
     if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
@@ -3366,17 +3372,16 @@ llama_context * llama_init_from_model(
             LLAMA_LOG_ERROR("%s: SPLIT_MODE_TENSOR requires flash_attn to be enabled\n", __func__);
             return nullptr;
         }
-        if (ggml_is_quantized(params.type_k) || ggml_is_quantized(params.type_v)) {
-            LLAMA_LOG_ERROR("%s: simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented\n", __func__);
+        if ((ggml_is_quantized(params.type_k) && !is_turbo_kv_type(params.type_k)) ||
+            (ggml_is_quantized(params.type_v) && !is_turbo_kv_type(params.type_v))) {
+            LLAMA_LOG_ERROR("%s: simultaneous use of SPLIT_MODE_TENSOR and non-TurboQuant KV cache quantization not implemented\n", __func__);
             return nullptr;
         }
     }
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
-        const bool k_is_turbo = (params.type_k == GGML_TYPE_TURBO2_0 ||
-                                 params.type_k == GGML_TYPE_TURBO3_0 ||
-                                 params.type_k == GGML_TYPE_TURBO4_0);
+        const bool k_is_turbo = is_turbo_kv_type(params.type_k);
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
             uint32_t head_k = model->hparams.n_embd_head_k(il);
             // Turbo types zero-pad heads to next multiple of 128 in llama-kv-cache.cpp
@@ -3393,9 +3398,7 @@ llama_context * llama_init_from_model(
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
         const uint32_t blck_size = ggml_blck_size(params.type_v);
-        const bool v_is_turbo = (params.type_v == GGML_TYPE_TURBO2_0 ||
-                                 params.type_v == GGML_TYPE_TURBO3_0 ||
-                                 params.type_v == GGML_TYPE_TURBO4_0);
+        const bool v_is_turbo = is_turbo_kv_type(params.type_v);
         const bool is_mla = model->hparams.is_mla();
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
             uint32_t head_v = model->hparams.n_embd_head_v(il);
@@ -3413,8 +3416,7 @@ llama_context * llama_init_from_model(
 
     // TurboQuant cache types require flash attention — auto-enable if disabled
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED &&
-        (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 ||
-         params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0)) {
+        (is_turbo_kv_type(params.type_k) || is_turbo_kv_type(params.type_v))) {
         LLAMA_LOG_WARN("%s: turbo cache types require flash_attn — enabling automatically\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }

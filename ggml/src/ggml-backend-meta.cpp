@@ -721,6 +721,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
         return src_ss[0];
     };
 
+    auto handle_turbo_wht = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0);
+        GGML_ASSERT(tensor->src[1] == nullptr || src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        return src_ss[0];
+    };
+
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
@@ -976,6 +982,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             case GGML_OP_OPT_STEP_SGD:
             case GGML_OP_GLU: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+            } break;
+            case GGML_OP_TURBO_WHT: {
+                split_state = handle_turbo_wht(src_ss);
             } break;
             default: {
                 GGML_ABORT("ggml op not implemented: %s", ggml_op_name(tensor->op));
