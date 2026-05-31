@@ -423,6 +423,7 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_b
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
+    const struct ggml_tensor * src2 = op->src[2];
 
     if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
         return true;
@@ -465,6 +466,18 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
         case GGML_OP_GET_ROWS_BACK:
             return src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16;
+        case GGML_OP_FLASH_ATTN_EXT: {
+            if (src0 == nullptr || src1 == nullptr || src2 == nullptr) {
+                return false;
+            }
+
+            ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(src1->type)->vec_dot_type;
+            ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
+            ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(src1->type)->vec_dot;
+            ggml_to_float_t   const v_to_float     = ggml_get_type_traits(src2->type)->to_float;
+
+            return q_to_vec_dot && kq_vec_dot && (src2->type == GGML_TYPE_F32 || v_to_float);
+        }
         case GGML_OP_OUT_PROD:
             return (
                 (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) ||

@@ -8413,6 +8413,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
 
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
+    GGML_ASSERT((                            kq_vec_dot  ) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
 
     int ith = params->ith;
