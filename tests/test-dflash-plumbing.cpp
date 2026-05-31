@@ -597,6 +597,14 @@ int main(int argc, char ** argv) {
     ok &= expect(context_cpp.find("GGML_DFLASH_MULTI_GPU_TAPE") != std::string::npos &&
                  context_cpp.find("GGML_DFLASH_ALLOW_MULTI_GPU_TAPE") != std::string::npos,
         "DFlash multi-GPU tape must be default-enabled with explicit env kill switches");
+    const std::string dflash_wait_gpu_capture = slice_between(
+        context_cpp,
+        "bool llama_context::dflash_wait_for_gpu_capture_stream()",
+        "bool llama_context::dflash_memory_seq_cp_recurrent_ordered");
+    ok &= expect(dflash_wait_gpu_capture.find("model.n_devices() > 1") != std::string::npos &&
+                 dflash_wait_gpu_capture.find("scheduler sync") != std::string::npos &&
+                 dflash_wait_gpu_capture.find("peer D2D") != std::string::npos,
+        "multi-GPU DFlash hidden capture must use scheduler sync before peer D2D ring writes");
     ok &= expect(context_cpp.find("allocate_hidden_gpu(n_slots, max_tokens)") != std::string::npos, "GPU tape allocation must allocate hidden capture buffers too");
     ok &= expect(context_cpp.find("dflash_skip_eval_callback ? nullptr : dflash_eval_callback") != std::string::npos, "eligible DFlash verifier graph must disable eval callback, including suppressed no-intersection ubatches");
     ok &= expect(context_cpp.find("bool dflash_graph_tape_ready") != std::string::npos, "DFlash decode must gate GPU tape copies separately from hidden capture");

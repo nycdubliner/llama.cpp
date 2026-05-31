@@ -2413,6 +2413,14 @@ bool llama_context::dflash_wait_for_gpu_capture_stream() {
         return false;
     }
 
+    if (model.n_devices() > 1) {
+        // Cross-device peer D2D ring writes are launched on the ring device
+        // stream. The per-backend event fast path only orders same-device
+        // streams, so use the caller's scheduler sync for split target
+        // placement before hidden/tape data can feed the drafter.
+        return false;
+    }
+
     if (!dflash_capture->capture_wait_backends.empty()) {
         bool synced = true;
         for (const auto & wait_backend : dflash_capture->capture_wait_backends) {
