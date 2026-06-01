@@ -347,6 +347,8 @@ struct server_adaptive_dm_state {
     }
 
     void reset_request_state() {
+        const int32_t resume_n_max = profit_last_recommended_n;
+        const bool preserve_profit_recommendation = profit_has_key;
         std::fill_n(fringe_ring, FRINGE_WINDOW, fringe_entry{});
         fringe_ring_idx = 0;
         fringe_ring_count = 0;
@@ -357,10 +359,13 @@ struct server_adaptive_dm_state {
         explore_counter = 0;
         fringe_epoch++;
         reset_fringe_epoch_reached();
-        reset_profit_state();
+        reset_request_profit_state(preserve_profit_recommendation);
+        if (preserve_profit_recommendation && resume_n_max >= 0) {
+            adaptive_n_max = resume_n_max;
+        }
     }
 
-    void reset_request_profit_state() {
+    void reset_request_profit_state(bool preserve_recommendation = false) {
         profit_pending = false;
         profit_pending_requested_n_max = 0;
         profit_pending_n_draft = 0;
@@ -368,7 +373,9 @@ struct server_adaptive_dm_state {
         profit_pending_tree = false;
         profit_consecutive_below_profit = 0;
         profit_current_score = 0.0f;
-        profit_last_recommended_n = -1;
+        if (!preserve_recommendation) {
+            profit_last_recommended_n = -1;
+        }
         profit_cycles_since_baseline = 0;
         profit_baseline_probe_pending = false;
         profit_baseline_probe_resume_n = -1;
@@ -826,11 +833,7 @@ struct server_adaptive_dm_state {
         const bool baseline_wins =
             best.n == 0 ||
             (best.n > 0 && best.score < baseline_score * (1.0f + dm_profit_min));
-        if (profit_initial_probe_set_ready(base_n_max) && baseline_wins) {
-            profit_consecutive_below_profit = dm_off_dwell;
-            profit_off_probe_failures++;
-            recommended = 0;
-        } else if (estimated_demote && (!baseline_ready ||
+        if (estimated_demote && (!baseline_ready ||
                     current_score >= baseline_score * (1.0f + dm_profit_min))) {
             recommended = current_n;
         } else if (baseline_ready && baseline_wins) {
@@ -847,7 +850,7 @@ struct server_adaptive_dm_state {
         } else {
             profit_consecutive_below_profit = 0;
             profit_off_probe_failures = 0;
-            if (!best.estimated && current_n > 0) {
+            if (!best.estimated && current_n > 0 && best.n > current_n) {
                 recommended = best.n;
             } else {
                 recommended = server_adaptive_dm_apply_profit_hysteresis(

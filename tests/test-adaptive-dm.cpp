@@ -156,21 +156,23 @@ int main() {
     assert(state.fringe_ring_idx == 0);
     assert(state.fringe_ring_count == 0);
     assert(state.rolling_fringe == 0.0f);
-    assert(state.adaptive_n_max == -1);
+    assert(state.adaptive_n_max == 4);
     assert(state.adaptive_probe_counter == 0);
     assert(state.off_dwell == 0);
     assert(state.explore_counter == 0);
     assert(state.fringe_epoch == 5);
     assert(state.fringe_epoch_reached[2] == 0);
     assert(state.fringe_epoch_accepted[2] == 0);
-    // request resets are prompt-change boundaries, so local profit telemetry is cleared
-    assert(state.profit_pos_accept_ewma[2] == 0.0f);
-    assert(state.profit_pos_samples[2] == 0);
-    assert(state.profit_depth[4].samples == 0);
-    assert(state.profit_baseline.samples == 0);
-    assert(state.profit_has_key == false);
+    // request resets are prompt-change boundaries, but profit telemetry is
+    // keyed by configuration and must survive so each request does not repeat
+    // cold-start baseline/probe learning.
+    assert(state.profit_pos_accept_ewma[2] == 0.75f);
+    assert(state.profit_pos_samples[2] == 9);
+    assert(state.profit_depth[4].samples == 3);
+    assert(state.profit_baseline.samples == 2);
+    assert(state.profit_has_key == true);
     assert(!state.profit_pending);
-    assert(state.profit_last_recommended_n == -1);
+    assert(state.profit_last_recommended_n == 4);
     assert(state.profit_consecutive_below_profit == 0);
     assert(state.profit_cycles_since_baseline == 0);
     assert(!state.profit_baseline_probe_pending);
@@ -269,7 +271,8 @@ int main() {
     observe_profit_cycle(state, 2, 2, 1, 60.0f);
     assert(state.decide_profit_n_max(8) == 4);
 
-    // test reset_request_state clears prompt-local profit data and request counters
+    // test reset_request_state preserves learned profit data while resetting
+    // request-local counters
     state.reset_profit_state();
     state.dm_profit_min_samples = 1;
     state.dm_off_dwell = 1;
@@ -285,10 +288,10 @@ int main() {
     assert(state.profit_consecutive_below_profit == 0);
     assert(state.profit_last_recommended_n == -1);
     assert(state.profit_off_probe_failures == 0);
-    // prompt-local profit data cleared
-    assert(state.profit_pos_samples[0] == 0);
-    assert(state.profit_depth[4].samples == 0);
-    assert(state.profit_pos_accept_ewma[0] == 0.0f);
+    // learned profit data preserved
+    assert(state.profit_pos_samples[0] == 1);
+    assert(state.profit_depth[4].samples == 1);
+    assert(state.profit_pos_accept_ewma[0] > 0.0f);
 
     state.dm_profit_min_samples = 1;
     common_params_speculative empty_spec;
@@ -373,7 +376,8 @@ int main() {
     }
 
     // Direct measured lower-depth candidates can demote an active full-depth
-    // DFlash horizon when they produce better output tokens per millisecond.
+    // DFlash horizon, but the change must still pass through hysteresis so a
+    // single request cannot collapse from full depth to shallow depth.
     {
         server_adaptive_dm_state est;
         est.dm_profit_min_samples = 3;
@@ -390,7 +394,7 @@ int main() {
             est.observe_profit_timing(0, 0, 0, 0.0f, 35.0f, 0.0f, 35.0f);
         }
 
-        assert(est.decide_profit_n_max(15) == 4);
+        assert(est.decide_profit_n_max(15) == 14);
     }
 
     // Sustained low acceptance without a baseline must collect baseline data,
@@ -411,16 +415,17 @@ int main() {
         assert(weak.profit_last_recommended_n == -1);
     }
 
-    // test baseline-best shuts speculation fully off after the initial probe set is measured
+    // test baseline-best still observes dwell after the initial probe set is measured
     {
         server_adaptive_dm_state weak;
         weak.dm_profit_min_samples = 1;
-        weak.dm_off_dwell = 8;
+        weak.dm_off_dwell = 2;
         weak.adaptive_n_max = 8;
         weak.observe_profit_timing(0, 0, 0, 0.0f, 25.0f, 0.0f, 25.0f);
         observe_profit_cycle(weak, 2, 2, 0, 80.0f);
         observe_profit_cycle(weak, 4, 4, 0, 90.0f);
         observe_profit_cycle(weak, 8, 8, 0, 105.0f);
+        assert(weak.decide_profit_n_max(8) == 8);
         assert(weak.decide_profit_n_max(8) == 0);
     }
 
