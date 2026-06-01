@@ -45,6 +45,7 @@ void llama_model_dflash_draft::load_arch_hparams(llama_model_loader & ml) {
 }
 
 void llama_model_dflash_draft::load_arch_tensors(llama_model_loader & ml) {
+    GGML_UNUSED(ml);
     LLAMA_LOAD_LOCALS;
 
     tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
@@ -451,7 +452,6 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
         // resolve cross data for the active seq (GPU path preferred, CPU fallback)
         const float * src_data  = nullptr;
         const void *  src_gpu   = nullptr;
-        int64_t       src_n_enc  = 0;
         int64_t       src_n_real = 0;
         if (cross) {
             llama_seq_id active_seq = -1;
@@ -463,11 +463,9 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
                 if (it != cross->v_embd_per_seq.end()) {
                     if (it->second.v_embd_gpu) {
                         src_gpu    = it->second.v_embd_gpu;
-                        src_n_enc  = it->second.n_enc;
                         src_n_real = it->second.v_embd_gpu_n_enc_real;
                     } else if (!it->second.v_embd.empty()) {
                         src_data   = it->second.v_embd.data();
-                        src_n_enc  = it->second.n_enc;
                         src_n_real = it->second.n_enc_real;
                     }
                 }
@@ -475,11 +473,9 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
             if (!src_data && !src_gpu) {
                 if (cross->v_embd_gpu) {
                     src_gpu    = cross->v_embd_gpu;
-                    src_n_enc  = cross->n_enc;
                     src_n_real = cross->v_embd_gpu_n_enc_real;
                 } else if (!cross->v_embd.empty()) {
                     src_data   = cross->v_embd.data();
-                    src_n_enc  = cross->n_enc;
                     src_n_real = cross->n_enc_real;
                 }
             }
