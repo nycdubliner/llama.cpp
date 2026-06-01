@@ -100,7 +100,7 @@ jobs:
             -DLLAMA_FATAL_WARNINGS=ON \
             -DLLAMA_BUILD_BORINGSSL=ON \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)" -- -k
+          cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)"
 
       - name: ccache stats
         if: always()
@@ -158,7 +158,7 @@ jobs:
             -DGGML_CPU_ALL_VARIANTS=ON \
             -DLLAMA_FATAL_WARNINGS=ON \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j "$(nproc)" -- -k
+          cmake --build build --config Release -j "$(nproc)"
 
       - name: ccache stats
         if: always()
@@ -219,7 +219,7 @@ jobs:
             -DGGML_VULKAN=ON \
             -DLLAMA_FATAL_WARNINGS=ON \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j "$(nproc)" -- -k
+          cmake --build build --config Release -j "$(nproc)"
 
       - name: ccache stats
         if: always()
@@ -390,12 +390,7 @@ jobs:
 
   windows-cuda:
     name: Windows x64 CUDA ${{ matrix.cuda }}
-    needs:
-      - release-meta
-      - macos-arm64
-      - ubuntu-cpu
-      - ubuntu-vulkan
-      - windows-cpu
+    needs: release-meta
     runs-on: windows-2022
     strategy:
       fail-fast: false
