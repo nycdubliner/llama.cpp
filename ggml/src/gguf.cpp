@@ -2,8 +2,6 @@
 #include "ggml-backend.h"
 #include "ggml-impl.h"
 #include "gguf.h"
-#define GGML_COMMON_DECL_CPP
-#include "ggml-common.h"
 
 #include <cinttypes>
 #include <cstddef>
@@ -729,13 +727,8 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
             // calculate byte offsets given the tensor shape and type
             info.t.nb[0] = type_size;
             info.t.nb[1] = info.t.nb[0]*(info.t.ne[0]/blck_size);
-            if (info.t.type == GGML_TYPE_MXFP6_E2M3) {
-                info.t.nb[2] = info.t.nb[1]*GGML_PAD(info.t.ne[1], MXFP6_TILE_ROWS);
-                info.t.nb[3] = info.t.nb[2]*info.t.ne[2];
-            } else {
-                for (int j = 2; j < GGML_MAX_DIMS; ++j) {
-                    info.t.nb[j] = info.t.nb[j - 1]*info.t.ne[j - 1];
-                }
+            for (int j = 2; j < GGML_MAX_DIMS; ++j) {
+                info.t.nb[j] = info.t.nb[j - 1]*info.t.ne[j - 1];
             }
         }
         if (!ok) {

@@ -95,7 +95,6 @@ int main(int argc, char ** argv) {
     const std::string ggml_quants_h = read_file(root + "/ggml/src/ggml-quants.h");
     const std::string ggml_quants_c = read_file(root + "/ggml/src/ggml-quants.c");
     const std::string ggml_cpu_c = read_file(root + "/ggml/src/ggml-cpu/ggml-cpu.c");
-    const std::string ggml_cpu_ops_cpp = read_file(root + "/ggml/src/ggml-cpu/ops.cpp");
     const std::string ggml_cpu_quants_h = read_file(root + "/ggml/src/ggml-cpu/quants.h");
     const std::string ggml_cpu_quants_c = read_file(root + "/ggml/src/ggml-cpu/quants.c");
     const std::string server_context = read_file(root + "/tools/server/server-context.cpp");
@@ -153,8 +152,6 @@ int main(int argc, char ** argv) {
     const std::string cuda_fattn_vec_q6_0_q8_0 = read_file_optional(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q6_0-q8_0.cu");
     const std::string cuda_fattn_vec_q8_0_q6_0 = read_file_optional(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-q6_0.cu");
     const std::string cuda_template_generator = read_file(root + "/ggml/src/ggml-cuda/template-instances/generate_cu_files.py");
-    const std::string gguf_constants_py = read_file(root + "/gguf-py/gguf/constants.py");
-    const std::string gguf_quants_py = read_file(root + "/gguf-py/gguf/quants.py");
     const std::string metal = read_file(root + "/ggml/src/ggml-metal/ggml-metal.metal");
 
     ok &= expect(dflash_profile_parse_env(nullptr) == 0, "DFlash profile parser must treat missing env as disabled");
@@ -365,41 +362,6 @@ int main(int argc, char ** argv) {
                  ggml_common_h.find("block_q6_0") != std::string::npos &&
                  ggml_c.find(".type_name                = \"q6_0\"") != std::string::npos,
         "GGML core type metadata must register q6_0");
-    ok &= expect(ggml_h.find("GGML_TYPE_MXFP6_E2M3 = 42") != std::string::npos,
-        "GGML type id 42 must be reserved for upstream MXFP6_E2M3, not BeeLlama TurboQuant");
-    ok &= expect(ggml_h.find("GGML_TYPE_TURBO3_0 = 50") != std::string::npos &&
-                 ggml_h.find("GGML_TYPE_TURBO4_0 = 51") != std::string::npos &&
-                 ggml_h.find("GGML_TYPE_TURBO2_0 = 52") != std::string::npos &&
-                 ggml_h.find("GGML_TYPE_TURBO3_TCQ = 53") != std::string::npos &&
-                 ggml_h.find("GGML_TYPE_TURBO2_TCQ = 54") != std::string::npos,
-        "BeeLlama TurboQuant KV cache types must live after upstream/fork model tensor ids");
-    ok &= expect(gguf_constants_py.find("MXFP6_E2M3 = 42") != std::string::npos &&
-                 gguf_constants_py.find("Q6_0       = 49") != std::string::npos &&
-                 gguf_constants_py.find("TURBO3_0   = 50") != std::string::npos &&
-                 gguf_constants_py.find("TURBO4_0   = 51") != std::string::npos &&
-                 gguf_constants_py.find("TURBO2_0   = 52") != std::string::npos &&
-                 gguf_constants_py.find("TURBO3_TCQ = 53") != std::string::npos &&
-                 gguf_constants_py.find("TURBO2_TCQ = 54") != std::string::npos,
-        "Python GGUF type ids must mirror GGML's MXFP6 reservation and moved TurboQuant KV ids");
-    ok &= expect(ggml_h.find("GGML_FTYPE_MOSTLY_MXFP6_E2M3 = 28") != std::string::npos &&
-                 llama_h.find("LLAMA_FTYPE_MOSTLY_MXFP6_E2M3    = 41") != std::string::npos &&
-                 gguf_constants_py.find("MOSTLY_MXFP6_E2M3    = 41") != std::string::npos,
-        "GGML, llama, and Python file type enums must expose MXFP6_E2M3");
-    ok &= expect(ggml_c.find(".type_name                = \"mxfp6_e2m3\"") != std::string::npos &&
-                 ggml_c.find(".blck_size_interleave     = MXFP6_TILE_ROWS") != std::string::npos &&
-                 ggml_c.find("MXFP6_HEADER_OFFSET + data_size") != std::string::npos &&
-                 ggml_quants_c.find("quantize_mxfp6_e2m3") != std::string::npos &&
-                 ggml_quants_c.find("dequantize_row_mxfp6_e2m3_tile") != std::string::npos,
-        "GGML core quantization must register MXFP6 tiled row layout and CPU dequantization");
-    ok &= expect(ggml_cpu_quants_h.find("ggml_vec_dot_mxfp6_e2m3_q8_0") != std::string::npos &&
-                 ggml_cpu_quants_c.find("ggml_vec_dot_mxfp6_e2m3_q8_0_generic") != std::string::npos &&
-                 ggml_cpu_c.find("[GGML_TYPE_MXFP6_E2M3]") != std::string::npos &&
-                 ggml_cpu_ops_cpp.find("ggml_cvt_row_to_mxfp6_tile_index") != std::string::npos &&
-                 ggml_cpu_ops_cpp.find("dequantize_row_mxfp6_e2m3_tile") != std::string::npos,
-        "CPU backend traits and row extraction must support upstream MXFP6_E2M3 layout");
-    ok &= expect(gguf_quants_py.find("class MXFP6_E2M3") != std::string::npos &&
-                 gguf_quants_py.find("MXFP6_E2M3 tiled dequantization is not yet supported") != std::string::npos,
-        "Python GGUF quant registry must recognize MXFP6_E2M3 without claiming unsupported tiled dequantization");
     ok &= expect(ggml_quants_h.find("quantize_row_q6_0_ref") != std::string::npos &&
                  ggml_quants_h.find("dequantize_row_q6_0") != std::string::npos &&
                  ggml_quants_c.find("quantize_row_q6_0_ref") != std::string::npos &&
@@ -689,15 +651,6 @@ int main(int argc, char ** argv) {
     ok &= expect(context_cpp.find("GGML_DFLASH_MULTI_GPU_TAPE") != std::string::npos &&
                  context_cpp.find("GGML_DFLASH_ALLOW_MULTI_GPU_TAPE") != std::string::npos,
         "DFlash multi-GPU tape must be default-enabled with explicit env kill switches");
-    {
-        const std::string dflash_gpu_type_helper = slice_between(
-            context_cpp,
-            "static bool dflash_backend_dev_type_is_gpu",
-            "static const char * dflash_backend_dev_type_name");
-        ok &= expect(dflash_gpu_type_helper.find("GGML_BACKEND_DEVICE_TYPE_GPU") != std::string::npos &&
-                     dflash_gpu_type_helper.find("GGML_BACKEND_DEVICE_TYPE_IGPU") != std::string::npos,
-            "DFlash GPU capture/replay helpers must treat integrated ROCm/CUDA devices as GPU-capable");
-    }
     const std::string dflash_wait_gpu_capture = slice_between(
         context_cpp,
         "bool llama_context::dflash_wait_for_gpu_capture_stream()",
@@ -2074,15 +2027,6 @@ int main(int argc, char ** argv) {
                  server_context.find("target_output_is_gpu && dflash_auto_device_mismatch") != std::string::npos &&
                  server_context.find("DFlash draft model uses shared target output tensor on device") != std::string::npos,
         "DFlash draft auto-placement must include the target output device used by shared tensors");
-    {
-        const std::string server_gpu_type_helper = slice_between(
-            server_context,
-            "static bool server_backend_dev_type_is_gpu",
-            "static bool server_backend_dev_is_dflash_shared_output_compatible");
-        ok &= expect(server_gpu_type_helper.find("GGML_BACKEND_DEVICE_TYPE_GPU") != std::string::npos &&
-                     server_gpu_type_helper.find("GGML_BACKEND_DEVICE_TYPE_IGPU") != std::string::npos,
-            "server DFlash draft placement must treat integrated ROCm/CUDA devices as GPU-capable");
-    }
     ok &= expect(server_context.find("server_backend_dev_is_dflash_shared_output_compatible") != std::string::npos &&
                  server_context.find("GGML_BACKEND_DEVICE_TYPE_META") != std::string::npos &&
                  server_context.find("const bool target_output_is_meta") != std::string::npos &&

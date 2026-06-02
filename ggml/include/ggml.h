@@ -429,16 +429,15 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_MXFP6_E2M3 = 42,
+        GGML_TYPE_TURBO3_0 = 42, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
+        GGML_TYPE_TURBO4_0 = 43, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL
+        GGML_TYPE_TURBO2_0 = 44, // TurboQuant 2-bit KV cache: 2-bit PolarQuant, no QJL
+        GGML_TYPE_TURBO3_TCQ = 45, // TurboQuant 3-bit KV cache: TCQ (Trellis-Coded Quantization)
+        GGML_TYPE_TURBO2_TCQ = 46, // TurboQuant 2-bit KV cache: TCQ (k=2, L=8, 256 states)
         GGML_TYPE_TQ3_1S  = 47, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
         GGML_TYPE_TQ4_1S  = 48, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
         GGML_TYPE_Q6_0    = 49,
-        GGML_TYPE_TURBO3_0 = 50, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
-        GGML_TYPE_TURBO4_0 = 51, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL
-        GGML_TYPE_TURBO2_0 = 52, // TurboQuant 2-bit KV cache: 2-bit PolarQuant, no QJL
-        GGML_TYPE_TURBO3_TCQ = 53, // TurboQuant 3-bit KV cache: TCQ (Trellis-Coded Quantization)
-        GGML_TYPE_TURBO2_TCQ = 54, // TurboQuant 2-bit KV cache: TCQ (k=2, L=8, 256 states)
-        GGML_TYPE_COUNT   = 55,
+        GGML_TYPE_COUNT   = 50,
     };
 
     // precision
@@ -482,7 +481,6 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
-        GGML_FTYPE_MOSTLY_MXFP6_E2M3 = 28, // except 1d tensors
     };
 
     // available tensor operations:

@@ -12,8 +12,6 @@ extern void quantize_row_tq3_1s_ref(const float * x, void * y, long long k);
 extern void dequantize_row_tq3_1s(const void * x, float * y, long long k);
 extern void quantize_row_tq4_1s_ref(const float * x, void * y, long long k);
 extern void dequantize_row_tq4_1s(const void * x, float * y, long long k);
-extern void quantize_row_mxfp6_e2m3_ref(const float * x, void * y, long long k);
-extern void dequantize_row_mxfp6_e2m3(const void * x, float * y, long long k);
 
 static float cosine_similarity(const float * x, const float * y, int n) {
     float dot = 0.0f;
@@ -36,19 +34,7 @@ int main(void) {
 
     printf("=== TurboQuant C Round-Trip Test ===\n\n");
 
-    if (GGML_TYPE_MXFP6_E2M3 != 42 ||
-        GGML_TYPE_TURBO3_0 <= GGML_TYPE_MXFP6_E2M3 ||
-        GGML_TYPE_TURBO4_0 <= GGML_TYPE_MXFP6_E2M3 ||
-        GGML_TYPE_TURBO2_0 <= GGML_TYPE_MXFP6_E2M3 ||
-        GGML_TYPE_TURBO3_TCQ <= GGML_TYPE_MXFP6_E2M3 ||
-        GGML_TYPE_TURBO2_TCQ <= GGML_TYPE_MXFP6_E2M3) {
-        printf("enum upstream slot separation FAILED: mxfp6=%d turbo3=%d turbo4=%d turbo2=%d turbo3_tcq=%d turbo2_tcq=%d\n",
-                GGML_TYPE_MXFP6_E2M3, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0,
-                GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO2_TCQ);
-        failed++;
-    }
-
-    if (GGML_TYPE_TURBO3_TCQ != 53 || GGML_TYPE_TURBO2_TCQ != 54 ||
+    if (GGML_TYPE_TURBO3_TCQ != 45 || GGML_TYPE_TURBO2_TCQ != 46 ||
         GGML_TYPE_TQ3_1S != 47 || GGML_TYPE_TQ4_1S != 48) {
         printf("enum separation FAILED: turbo3_tcq=%d turbo2_tcq=%d tq3_1s=%d tq4_1s=%d\n",
                 GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S);
@@ -58,28 +44,6 @@ int main(void) {
     if (ggml_type_size(GGML_TYPE_TQ3_1S) != 16 || ggml_type_size(GGML_TYPE_TQ4_1S) != 20) {
         printf("TQ type sizes FAILED: tq3_1s=%zu tq4_1s=%zu\n",
                 ggml_type_size(GGML_TYPE_TQ3_1S), ggml_type_size(GGML_TYPE_TQ4_1S));
-        failed++;
-    }
-
-    if (ggml_type_size(GGML_TYPE_MXFP6_E2M3) != 52 ||
-        ggml_blck_size(GGML_TYPE_MXFP6_E2M3) != 64 ||
-        !ggml_is_quantized(GGML_TYPE_MXFP6_E2M3)) {
-        printf("MXFP6 type traits FAILED: type_size=%zu block=%lld quant=%d\n",
-                ggml_type_size(GGML_TYPE_MXFP6_E2M3),
-                (long long) ggml_blck_size(GGML_TYPE_MXFP6_E2M3),
-                ggml_is_quantized(GGML_TYPE_MXFP6_E2M3));
-        failed++;
-    }
-
-    /* Test 0: upstream MXFP6 reference row format */
-    for (int i = 0; i < d; i++) input[i] = sinf(i*0.13f) * 3.0f + cosf(i*0.07f) * 0.5f;
-    quantize_row_mxfp6_e2m3_ref(input, buf, d);
-    memset(output, 0, sizeof(output));
-    dequantize_row_mxfp6_e2m3(buf, output, d);
-    cosv = cosine_similarity(input, output, d);
-    printf("Test 0 (mxfp6_e2m3): cosine=%.6f\n\n", cosv);
-    if (!isfinite(cosv) || cosv < 0.995f) {
-        printf("  FAILED: mxfp6_e2m3 cosine below threshold\n");
         failed++;
     }
 
