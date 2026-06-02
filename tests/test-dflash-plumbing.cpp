@@ -1772,7 +1772,7 @@ int main(int argc, char ** argv) {
         "DFlash recurrent multi-seq verification must still fall back to per-slot mode for tree batches, but stay enabled for flat multi-slot DFlash");
     ok &= expect(server_context.find("dflash_multislot_flat_accept_barrier") != std::string::npos &&
                  server_context.find("struct dflash_flat_accept_prefetch") != std::string::npos &&
-                 server_context.find("common_speculative_update_logits(slot.get_spec(), ctx_tgt, batch_tokens, prefetched.n_hidden_keep);") != std::string::npos &&
+                 server_context.find("common_speculative_update_logits_deferred_dflash_kv(slot.get_spec(), ctx_tgt, batch_tokens, prefetched.n_hidden_keep);") != std::string::npos &&
                  server_context.find("dflash_recurrent_has_pending_prompt") != std::string::npos &&
                  server_context.find("dflash_recurrent_draft_rr") == std::string::npos &&
                  server_context.find("dflash_recurrent_cycle_slot_id") == std::string::npos,
@@ -1812,6 +1812,9 @@ int main(int argc, char ** argv) {
                  server_context.find("slot.dm_adaptive && slot.adaptive_n_max == 0") != std::string::npos &&
                  server_context.find("common_speculative_update_logits_deferred_dflash_kv(slot.get_spec(), ctx_tgt, batch_tokens, 1)") != std::string::npos,
         "server adaptive-off DFlash fallback must keep the target ring current while skipping per-token drafter KV updates");
+    ok &= expect(server_context.find("common_speculative_update_logits_deferred_dflash_kv(slot.get_spec(), ctx_tgt, batch_tokens, prefetched.n_hidden_keep);") != std::string::npos &&
+                 server_context.find("common_speculative_update_logits_deferred_dflash_kv(slot.get_spec(), ctx_tgt, batch_tokens, n_hidden_keep);") != std::string::npos,
+        "DFlash flat speculative accept must defer drafter KV maintenance until the next draft while still updating the target hidden ring");
     {
         const size_t sync_comment = server_context.find("DFlash: a previous async rollback replay");
         const size_t sync_call    = server_context.find("llama_tape_replay_sync(ctx_tgt);", sync_comment);

@@ -6250,7 +6250,7 @@ private:
                     llama_tokens batch_tokens;
                     batch_tokens.push_back(slot.sampled);
                     batch_tokens.insert(batch_tokens.end(), slot.spec_draft.begin(), slot.spec_draft.end());
-                    common_speculative_update_logits(slot.get_spec(), ctx_tgt, batch_tokens, prefetched.n_hidden_keep);
+                    common_speculative_update_logits_deferred_dflash_kv(slot.get_spec(), ctx_tgt, batch_tokens, prefetched.n_hidden_keep);
                     prefetched.update_us = ggml_time_us() - t_update_start;
                 }
             }
@@ -6606,7 +6606,7 @@ private:
                     llama_tokens batch_tokens;
                     batch_tokens.push_back(slot.sampled);
                     batch_tokens.insert(batch_tokens.end(), slot.spec_draft.begin(), slot.spec_draft.end());
-                    common_speculative_update_logits(slot.get_spec(), ctx_tgt, batch_tokens, n_hidden_keep);
+                    common_speculative_update_logits_deferred_dflash_kv(slot.get_spec(), ctx_tgt, batch_tokens, n_hidden_keep);
                     profile_accept_lap(profile_accept_update_us);
                 }
 
