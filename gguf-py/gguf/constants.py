@@ -4242,13 +4242,15 @@ class GGMLQuantizationType(IntEnum):
     MXFP4   = 39
     NVFP4   = 40
     Q1_0    = 41
-    TURBO3_0   = 42
-    TURBO4_0   = 43
-    TURBO2_0   = 44
-    TURBO3_TCQ = 45
-    TURBO2_TCQ = 46
+    MXFP6_E2M3 = 42
     TQ3_1S     = 47
     TQ4_1S     = 48
+    Q6_0       = 49
+    TURBO3_0   = 50
+    TURBO4_0   = 51
+    TURBO2_0   = 52
+    TURBO3_TCQ = 53
+    TURBO2_TCQ = 54
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4303,6 +4305,7 @@ class LlamaFileType(IntEnum):
     MOSTLY_MXFP4_MOE     = 38  # except 1d tensors
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
+    MOSTLY_MXFP6_E2M3    = 41  # except 1d tensors
     MOSTLY_TQ3_1S        = 43  # except 1d tensors
     MOSTLY_TQ4_1S        = 44  # except 1d tensors
 
@@ -4427,6 +4430,8 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.MXFP4:   (32, 1 + 16),
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
+    GGMLQuantizationType.MXFP6_E2M3: (64, 52),
+    GGMLQuantizationType.Q6_0:    (32, 2 + 16 + 8),
     GGMLQuantizationType.TURBO3_0:   (128, 2 + 128 // 4 + 128 // 8),
     GGMLQuantizationType.TURBO4_0:   (128, 2 + 128 // 2),
     GGMLQuantizationType.TURBO2_0:   (128, 2 + 128 // 4),
