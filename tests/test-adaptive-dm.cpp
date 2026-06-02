@@ -65,21 +65,30 @@ int main() {
 
     {
         server_adaptive_dm_state explore;
-        assert(explore.profit_explore_depth_for_step(15, 15, 1) == 1);
-        assert(explore.profit_explore_depth_for_step(15, 15, 2) == 2);
-        assert(explore.profit_explore_depth_for_step(15, 15, 3) == 3);
-        assert(explore.profit_explore_depth_for_step(15, 15, 4) == 4);
-        assert(explore.profit_explore_depth_for_step(15, 15, 14) == 14);
-        assert(explore.profit_explore_depth_for_step(15, 15, 15) == 1);
-        assert(explore.profit_explore_depth_for_step(8, 15, 1) == 9);
-        assert(explore.profit_explore_depth_for_step(8, 15, 7) == 15);
-        assert(explore.profit_explore_depth_for_step(8, 15, 8) == 1);
+        assert(explore.profit_explore_depth_for_step(15, 15, 1) == 14);
+        assert(explore.profit_explore_depth_for_step(15, 15, 2) == 13);
+        assert(explore.profit_explore_depth_for_step(15, 15, 3) == 12);
+        assert(explore.profit_explore_depth_for_step(15, 15, 4) == 11);
+        assert(explore.profit_explore_depth_for_step(15, 15, 5) == 10);
+        assert(explore.profit_explore_depth_for_step(15, 15, 8) == 14);
+        assert(explore.profit_explore_depth_for_step(8, 15, 1) == 7);
+        assert(explore.profit_explore_depth_for_step(8, 15, 2) == 9);
+        assert(explore.profit_explore_depth_for_step(8, 15, 7) == 4);
+
+        int active_order[SERVER_ADAPTIVE_DM_PROFIT_CANDIDATES];
+        const int n_active = explore.profit_active_explore_depths(
+                15, 15, active_order, SERVER_ADAPTIVE_DM_PROFIT_CANDIDATES);
+        assert(n_active > 0);
+        assert(n_active <= 7);
+        for (int i = 0; i < n_active; ++i) {
+            assert(active_order[i] >= 4);
+        }
     }
 
     {
         server_adaptive_dm_state explore_ready;
         explore_ready.dm_profit_min_samples = 1;
-        assert(explore_ready.profit_next_unready_explore_depth(10, 15, 1) == 11);
+        assert(explore_ready.profit_next_unready_explore_depth(10, 15, 1) == 9);
         const int ready_depths[] = {1, 2, 3, 4, 5, 6, 7, 8,
                 9, 10, 11, 12, 13, 14, 15};
         for (const int depth : ready_depths) {
@@ -88,6 +97,45 @@ int main() {
             }
         }
         assert(explore_ready.profit_next_unready_explore_depth(10, 15, 1) == 0);
+    }
+
+    {
+        server_adaptive_dm_state strong_max;
+        strong_max.dm_profit_min_samples = 1;
+        strong_max.adaptive_n_max = 15;
+        strong_max.profit_last_recommended_n = 15;
+
+        strong_max.observe_profit_timing(0, 0, 0, 0.0f, 30.0f, 0.0f, 30.0f);
+        for (int i = 0; i < 6; ++i) {
+            observe_profit_cycle(strong_max, 15, 15, 10, 60.0f);
+        }
+        assert(strong_max.profit_next_unready_explore_depth(15, 15, 1) == 0);
+    }
+
+    {
+        server_adaptive_dm_state weak_max;
+        weak_max.dm_profit_min_samples = 1;
+        weak_max.adaptive_n_max = 15;
+        weak_max.profit_last_recommended_n = 15;
+
+        weak_max.observe_profit_timing(0, 0, 0, 0.0f, 30.0f, 0.0f, 30.0f);
+        for (int i = 0; i < 6; ++i) {
+            observe_profit_cycle(weak_max, 15, 15, 1, 95.0f);
+        }
+        assert(weak_max.profit_next_unready_explore_depth(15, 15, 1) == 14);
+    }
+
+    {
+        server_adaptive_dm_state strong_mid;
+        strong_mid.dm_profit_min_samples = 1;
+        strong_mid.adaptive_n_max = 8;
+        strong_mid.profit_last_recommended_n = 8;
+
+        strong_mid.observe_profit_timing(0, 0, 0, 0.0f, 30.0f, 0.0f, 30.0f);
+        for (int i = 0; i < 6; ++i) {
+            observe_profit_cycle(strong_mid, 8, 8, 7, 50.0f);
+        }
+        assert(strong_mid.profit_next_unready_explore_depth(8, 15, 1) == 9);
     }
 
     {
@@ -761,7 +809,37 @@ int main() {
 
         assert(preserved_challenger.decide_profit_n_max(15) == 15);
         observe_profit_cycle(preserved_challenger, 12, 12, 10, 70.0f);
+        assert(preserved_challenger.decide_profit_n_max(15) == 15);
+        for (int i = 0; i < 5; ++i) {
+            observe_profit_cycle(preserved_challenger, 12, 12, 10, 70.0f);
+        }
         assert(preserved_challenger.decide_profit_n_max(15) == 13);
+    }
+
+    // A preserved max-depth run must actively collect fresh local challenger
+    // evidence. Stale global stats can rank a lower challenger, but they cannot
+    // replace a same-request probe, and active mode should not sweep the low end.
+    {
+        server_adaptive_dm_state preserved_probe;
+        preserved_probe.dm_profit_min_samples = 1;
+        preserved_probe.adaptive_n_max = 15;
+        preserved_probe.profit_last_recommended_n = 15;
+        preserved_probe.profit_has_key = true;
+        preserved_probe.profit_key = {};
+        preserved_probe.profit_key.base_n_max = 15;
+
+        preserved_probe.observe_profit_timing(0, 0, 0, 0.0f, 30.0f, 0.0f, 30.0f);
+        observe_profit_cycle(preserved_probe, 12, 12, 10, 70.0f);
+        observe_profit_cycle(preserved_probe, 15, 15, 10, 90.0f);
+
+        preserved_probe.reset_request_state(true);
+        assert(preserved_probe.profit_next_unready_explore_depth(15, 15, 1) == 14);
+        observe_profit_cycle(preserved_probe, 14, 14, 10, 70.0f);
+        assert(preserved_probe.profit_next_unready_explore_depth(15, 15, 1) == 14);
+        for (int i = 0; i < 5; ++i) {
+            observe_profit_cycle(preserved_probe, 14, 14, 10, 70.0f);
+        }
+        assert(preserved_probe.profit_next_unready_explore_depth(15, 15, 1) == 13);
     }
 
     // test lower acceptance can still be faster; controller must optimize TPS,
@@ -988,9 +1066,10 @@ int main() {
         assert(recent_acceptance.decide_profit_n_max(15) == 10);
     }
 
-    // Off-state probes must sweep through every low-end depth before backing
-    // off, so a marginal prompt can still discover depth 1/2/3 instead of
-    // treating depth 4 as the minimum viable speculative horizon.
+    // Off-state probes should try useful anchors first, then fill nearby low
+    // depths. Dense candidate scoring is separate; recovery probes should not
+    // spend an entire sweep walking 1,2,3,... before testing the known productive
+    // mid/high range.
     {
         server_adaptive_dm_state sweep;
         sweep.dm_profit_min_samples = 1;
@@ -998,24 +1077,26 @@ int main() {
         sweep.adaptive_n_max = 0;
         sweep.observe_profit_timing(0, 0, 0, 0.0f, 30.0f, 0.0f, 30.0f);
 
-        assert(sweep.profit_next_off_probe_depth(15, 3) == 1);
-        for (int depth = 1; depth <= 14; ++depth) {
+        const int expected_order[] = {4, 8, 12, 15, 2, 3, 1, 5, 7, 9, 11, 13, 14, 6, 10};
+        for (int i = 0; i < 14; ++i) {
+            const int depth = expected_order[i];
+            assert(sweep.profit_next_off_probe_depth(15, 3) == depth);
             observe_profit_cycle(sweep, depth, depth, 0, 60.0f + (float) depth);
             sweep.profit_note_off_probe_result(depth, 15, false);
-            assert(sweep.profit_next_off_probe_depth(15, 3) == depth + 1);
+            assert(sweep.profit_next_off_probe_depth(15, 3) == expected_order[i + 1]);
             assert(sweep.profit_off_probe_failures == 0);
             assert(sweep.profit_off_probe_interval() == 4);
         }
 
-        observe_profit_cycle(sweep, 15, 15, 0, 80.0f);
-        sweep.profit_note_off_probe_result(15, 15, false);
-        assert(sweep.profit_next_off_probe_depth(15, 3) == 1);
+        observe_profit_cycle(sweep, expected_order[14], expected_order[14], 0, 80.0f);
+        sweep.profit_note_off_probe_result(expected_order[14], 15, false);
+        assert(sweep.profit_next_off_probe_depth(15, 3) == expected_order[0]);
         assert(sweep.profit_off_probe_failures == 1);
         assert(sweep.profit_off_probe_interval() == 8);
 
-        sweep.profit_note_off_probe_result(1, 15, true);
+        sweep.profit_note_off_probe_result(expected_order[0], 15, true);
         assert(sweep.profit_off_probe_failures == 0);
-        assert(sweep.profit_next_off_probe_depth(15, 3) == 1);
+        assert(sweep.profit_next_off_probe_depth(15, 3) == expected_order[0]);
     }
 
     // Failed wake probes advance the off-state sweep instead of retrying the
@@ -1034,7 +1115,7 @@ int main() {
         assert(failed.profit_off_probe_interval() == 4);
         assert(failed.decide_profit_n_max(8) == 0);
         assert(failed.profit_off_probe_failures == 0);
-        assert(failed.profit_next_off_probe_depth(8, 2) == 5);
+        assert(failed.profit_next_off_probe_depth(8, 2) == 8);
         assert(failed.profit_off_probe_interval() == 4);
     }
 

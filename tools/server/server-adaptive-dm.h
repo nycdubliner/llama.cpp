@@ -530,6 +530,38 @@ struct server_adaptive_dm_state {
         return server_adaptive_dm_score((float) output_tokens, (float) cycle_ms);
     }
 
+    bool profit_average_for_depth_since_request(
+            int depth,
+            int min_samples,
+            float * output_tokens,
+            float * cycle_ms) const {
+        if (!profit_depth_ready_since_request(depth, min_samples)) {
+            return false;
+        }
+
+        const int samples =
+            profit_depth[depth].samples - profit_request_depth_start_samples[depth];
+        const double total_output_tokens =
+            profit_depth[depth].total_output_tokens - profit_request_depth_start_output_tokens[depth];
+        const double total_cycle_ms =
+            profit_depth[depth].total_cycle_ms - profit_request_depth_start_cycle_ms[depth];
+        if (samples <= 0 ||
+                total_cycle_ms <= 0.0 ||
+                total_output_tokens <= 0.0 ||
+                !std::isfinite(total_cycle_ms) ||
+                !std::isfinite(total_output_tokens)) {
+            return false;
+        }
+
+        if (output_tokens) {
+            *output_tokens = (float) (total_output_tokens / (double) samples);
+        }
+        if (cycle_ms) {
+            *cycle_ms = (float) (total_cycle_ms / (double) samples);
+        }
+        return true;
+    }
+
     bool profit_depth_ready_for_decision(int depth) const {
         if (!profit_depth_ready(depth)) {
             return false;
@@ -540,13 +572,13 @@ struct server_adaptive_dm_state {
         return profit_depth_ready_since_request(depth, dm_profit_min_samples);
     }
 
-    bool profit_positive_switch_has_fresh_evidence(int depth, int current_n) const {
+    bool profit_positive_switch_has_fresh_evidence(int depth, int current_n, int base_n_max) const {
         if (!profit_request_requires_fresh_switch_sample ||
                 depth <= 0 ||
                 depth == current_n) {
             return true;
         }
-        return profit_depth_samples_since_request(depth) > 0;
+        return profit_depth_ready_since_request(depth, profit_candidate_min_samples(base_n_max));
     }
 
     int profit_initial_probe_min_samples() const {
@@ -719,17 +751,42 @@ struct server_adaptive_dm_state {
             out[n++] = value;
         };
 
-        if (base_n_max <= 32) {
-            for (int depth = 1; depth <= base_n_max; ++depth) {
-                add_unique(depth);
+        if (base_n_max >= 12) {
+            const int raw_probe = server_adaptive_dm_probe_n_max(base_n_max, dm_probe_fraction);
+            const int shallow = std::max(4, raw_probe);
+            const int mid_low = std::min(8, base_n_max);
+            const int mid_high = std::min(12, base_n_max);
+            const int anchors[] = {shallow, mid_low, mid_high, base_n_max};
+
+            add_unique(shallow);
+            add_unique(mid_low);
+            add_unique(mid_high);
+            add_unique(base_n_max);
+            add_unique(raw_probe - 1);
+            add_unique(raw_probe);
+            add_unique(1);
+
+            for (int radius = 1; radius <= base_n_max && n < out_cap; ++radius) {
+                for (const int anchor : anchors) {
+                    add_unique(anchor - radius);
+                    add_unique(anchor + radius);
+                }
             }
         } else {
-            for (int depth = 1; depth <= 16; ++depth) {
-                add_unique(depth);
-            }
-            const int ladder[] = {24, 32, 48, 64, 96, base_n_max};
-            for (const int depth : ladder) {
-                add_unique(depth);
+            const int shallow = server_adaptive_dm_probe_n_max(base_n_max, dm_probe_fraction);
+            const int mid = std::max(1, base_n_max / 2);
+            const int anchors[] = {shallow, mid, base_n_max};
+
+            add_unique(shallow);
+            add_unique(mid);
+            add_unique(base_n_max);
+            add_unique(1);
+
+            for (int radius = 1; radius <= base_n_max && n < out_cap; ++radius) {
+                for (const int anchor : anchors) {
+                    add_unique(anchor - radius);
+                    add_unique(anchor + radius);
+                }
             }
         }
 
@@ -752,11 +809,11 @@ struct server_adaptive_dm_state {
             return 0;
         }
         for (int i = 0; i < n_probes; ++i) {
-            if (probes[i] > current_n) {
+            if (probes[i] == current_n) {
                 if (wrapped) {
-                    *wrapped = false;
+                    *wrapped = i + 1 >= n_probes;
                 }
-                return probes[i];
+                return probes[(i + 1) % n_probes];
             }
         }
         if (wrapped) {
@@ -802,42 +859,137 @@ struct server_adaptive_dm_state {
         }
     }
 
+    int profit_active_explore_budget(int base_n_max) const {
+        if (base_n_max <= 1) {
+            return 0;
+        }
+        const int budget = base_n_max <= 8 ? 6 : 7;
+        return std::min(base_n_max - 1, budget);
+    }
+
+    bool profit_survival_expected_accept(int depth, float * expected_accept) const {
+        bool ready = false;
+        const float expected = server_adaptive_dm_survival_expected_accept(
+                profit_pos_accept_ewma,
+                profit_pos_samples,
+                PROFIT_POSITIONS,
+                depth,
+                dm_profit_min_samples,
+                &ready);
+        if (ready && expected_accept) {
+            *expected_accept = expected;
+        }
+        return ready;
+    }
+
+    bool profit_active_explore_prefers_higher(int current_n, int base_n_max) const {
+        if (current_n <= 0 || current_n >= base_n_max) {
+            return false;
+        }
+
+        float expected_accept = 0.0f;
+        if (!profit_survival_expected_accept(current_n, &expected_accept)) {
+            return false;
+        }
+
+        return expected_accept >= (float) current_n * dm_fringe_max;
+    }
+
+    bool profit_should_skip_active_explore(int current_n, int base_n_max) const {
+        if (current_n <= 0 || current_n < base_n_max) {
+            return false;
+        }
+        if (!profit_baseline_ready() ||
+                !profit_active_episode_ready(current_n, base_n_max)) {
+            return false;
+        }
+
+        const float baseline_score = profit_score_for_depth(0);
+        const float active_score = profit_active_episode_score(current_n);
+        if (baseline_score <= 0.0f ||
+                active_score < baseline_score * (1.0f + dm_profit_min)) {
+            return false;
+        }
+
+        float expected_accept = 0.0f;
+        if (!profit_survival_expected_accept(current_n, &expected_accept)) {
+            return false;
+        }
+
+        return expected_accept >= (float) current_n * dm_fringe_max;
+    }
+
+    int profit_active_explore_depths(int current_n, int base_n_max, int * out, int out_cap) const {
+        if (out_cap <= 0 || base_n_max <= 0) {
+            return 0;
+        }
+
+        const int current = std::clamp<int>(current_n, 0, base_n_max);
+        const int budget = std::min(out_cap, profit_active_explore_budget(base_n_max));
+        if (budget <= 0) {
+            return 0;
+        }
+
+        int n = 0;
+        auto add_unique = [&](int value) {
+            if (value <= 0 || value > base_n_max || value == current || n >= budget) {
+                return;
+            }
+            for (int i = 0; i < n; ++i) {
+                if (out[i] == value) {
+                    return;
+                }
+            }
+            out[n++] = value;
+        };
+
+        if (current <= 0) {
+            add_unique(server_adaptive_dm_probe_n_max(base_n_max, dm_probe_fraction));
+            add_unique(std::max(1, base_n_max / 2));
+            add_unique(base_n_max);
+            return n;
+        }
+
+        const bool prefer_higher = profit_active_explore_prefers_higher(current, base_n_max);
+        const int local_span = std::min(base_n_max, std::max(3, std::min(5, base_n_max / 3 + 1)));
+        for (int delta = 1; delta <= local_span && n < budget; ++delta) {
+            const int lower = current - delta;
+            const int higher = current + delta;
+            if (prefer_higher) {
+                add_unique(higher);
+                add_unique(lower);
+            } else {
+                add_unique(lower);
+                add_unique(higher);
+            }
+        }
+
+        if (n < budget) {
+            if (prefer_higher) {
+                add_unique(current + std::max(1, (base_n_max - current) / 2));
+                add_unique(base_n_max);
+                add_unique(current - std::max(1, current / 4));
+                add_unique(std::max(1, current / 2));
+            } else {
+                add_unique(current - std::max(1, current / 4));
+                add_unique((current + 1) / 2);
+                add_unique(std::min(base_n_max,
+                            std::max(4, server_adaptive_dm_probe_n_max(base_n_max, dm_probe_fraction))));
+                add_unique(base_n_max);
+            }
+        }
+
+        return n;
+    }
+
     int profit_explore_depth_for_step(int current_n, int base_n_max, int explore_step) const {
         if (base_n_max <= 0) {
             return 0;
         }
 
-        int probes[PROFIT_CANDIDATES];
-        const int n_probes = profit_off_probe_depths(base_n_max, probes, PROFIT_CANDIDATES);
-        if (n_probes <= 0) {
-            return std::clamp<int>(current_n, 0, base_n_max);
-        }
-
         int ordered[PROFIT_CANDIDATES];
-        int n_ordered = 0;
-        auto add = [&](int value) {
-            if (value <= 0 || value > base_n_max || value == current_n || n_ordered >= PROFIT_CANDIDATES) {
-                return;
-            }
-            for (int i = 0; i < n_ordered; ++i) {
-                if (ordered[i] == value) {
-                    return;
-                }
-            }
-            ordered[n_ordered++] = value;
-        };
-
-        for (int i = 0; i < n_probes; ++i) {
-            if (probes[i] > current_n) {
-                add(probes[i]);
-            }
-        }
-        for (int i = 0; i < n_probes; ++i) {
-            if (probes[i] < current_n) {
-                add(probes[i]);
-            }
-        }
-
+        const int n_ordered = profit_active_explore_depths(
+                current_n, base_n_max, ordered, PROFIT_CANDIDATES);
         if (n_ordered <= 0) {
             return std::clamp<int>(current_n, 0, base_n_max);
         }
@@ -847,18 +999,34 @@ struct server_adaptive_dm_state {
     }
 
     int profit_next_unready_explore_depth(int current_n, int base_n_max, int explore_step) const {
-        int probes[PROFIT_CANDIDATES];
-        const int n_probes = profit_off_probe_depths(base_n_max, probes, PROFIT_CANDIDATES);
-        for (int offset = 0; offset < n_probes; ++offset) {
-            const int candidate = profit_explore_depth_for_step(
-                    current_n,
-                    base_n_max,
-                    std::max(1, explore_step) + offset);
-            if (candidate > 0 && !profit_ladder_probe_depth_ready(candidate)) {
+        if (profit_should_skip_active_explore(current_n, base_n_max)) {
+            return 0;
+        }
+
+        int ordered[PROFIT_CANDIDATES];
+        const int n_ordered = profit_active_explore_depths(
+                current_n, base_n_max, ordered, PROFIT_CANDIDATES);
+        if (n_ordered <= 0) {
+            return 0;
+        }
+
+        const int start = std::max(1, explore_step) - 1;
+        for (int offset = 0; offset < n_ordered; ++offset) {
+            const int candidate = ordered[(start + offset) % n_ordered];
+            if (candidate > 0 && !profit_explore_probe_depth_ready(candidate, current_n, base_n_max)) {
                 return candidate;
             }
         }
         return 0;
+    }
+
+    bool profit_explore_probe_depth_ready(int depth, int current_n, int base_n_max) const {
+        if (profit_request_requires_fresh_switch_sample &&
+                depth > 0 &&
+                depth != current_n) {
+            return profit_depth_ready_since_request(depth, profit_candidate_min_samples(base_n_max));
+        }
+        return profit_ladder_probe_depth_ready(depth);
     }
 
     bool profit_ladder_probe_depth_ready(int depth) const {
@@ -1150,20 +1318,41 @@ struct server_adaptive_dm_state {
                 cycle_ms[i] = profit_baseline.cycle_ms;
                 direct_score[i] = baseline_score;
             } else if (profit_depth_ready_for_decision(n)) {
+                const bool fresh_challenger_required =
+                    profit_request_requires_fresh_switch_sample &&
+                    n != current_n;
+                if (fresh_challenger_required &&
+                        !profit_depth_ready_since_request(n, profit_candidate_min_samples(base_n_max))) {
+                    continue;
+                }
+
                 bool positions_ready = false;
                 const float survival_expected = server_adaptive_dm_survival_expected_accept(
                         profit_pos_accept_ewma, profit_pos_samples, PROFIT_POSITIONS,
                         n, dm_profit_min_samples, &positions_ready);
                 const bool lower_from_current_survival = n < current_n && positions_ready;
-                expected_accept[i] = lower_from_current_survival ?
-                    survival_expected :
-                    std::max(0.0f, profit_depth[n].output_tokens - 1.0f);
+                float request_output_tokens = 0.0f;
+                float request_cycle_ms = 0.0f;
+                const bool use_request_average =
+                    fresh_challenger_required &&
+                    profit_average_for_depth_since_request(
+                            n,
+                            profit_candidate_min_samples(base_n_max),
+                            &request_output_tokens,
+                            &request_cycle_ms);
+                expected_accept[i] = use_request_average ?
+                    std::max(0.0f, request_output_tokens - 1.0f) :
+                    (lower_from_current_survival ?
+                        survival_expected :
+                        std::max(0.0f, profit_depth[n].output_tokens - 1.0f));
                 ready[i] = true;
                 estimated[i] = false;
-                cycle_ms[i] = profit_depth[n].cycle_ms;
-                direct_score[i] = lower_from_current_survival ?
+                cycle_ms[i] = use_request_average ? request_cycle_ms : profit_depth[n].cycle_ms;
+                direct_score[i] = use_request_average ?
+                    server_adaptive_dm_score(request_output_tokens, request_cycle_ms) :
+                    (lower_from_current_survival ?
                     server_adaptive_dm_score(1.0f + expected_accept[i], cycle_ms[i]) :
-                    profit_score_for_depth(n);
+                    profit_score_for_depth(n));
             } else if (n > 0) {
                 // Find the ready depth closest to THIS candidate for extrapolation.
                 int ref_depth = -1;
@@ -1360,7 +1549,7 @@ struct server_adaptive_dm_state {
                 !profit_candidate_ready_for_switch(best.n, base_n_max);
             const bool stale_preserved_positive_switch =
                 positive_switch &&
-                !profit_positive_switch_has_fresh_evidence(best.n, current_n);
+                !profit_positive_switch_has_fresh_evidence(best.n, current_n, base_n_max);
             if (positive_switch && !active_episode_ready) {
                 recommended = current_n;
             } else if (unconfirmed_positive_switch) {
