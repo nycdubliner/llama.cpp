@@ -303,9 +303,9 @@ jobs:
             exit 1
           fi
 
-          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
-            gh release upload "${TAG_NAME}" "${release_files[@]}" --clobber
-            gh release edit "${TAG_NAME}" --title "${TAG_NAME}" --notes-file release-notes.md
+          if gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" "${release_files[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+            gh release edit "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" --title "${TAG_NAME}" --notes-file release-notes.md
           else
-            gh release create "${TAG_NAME}" "${release_files[@]}" --title "${TAG_NAME}" --notes-file release-notes.md --verify-tag
+            gh release create "${TAG_NAME}" "${release_files[@]}" --repo "${GITHUB_REPOSITORY}" --title "${TAG_NAME}" --notes-file release-notes.md --verify-tag
           fi
