@@ -152,8 +152,11 @@ gated_delta_net_cuda(const float * q,
         attn_data += S_v * H;
 
         if constexpr (keep_rs_t) {
-            const int64_t state_size_per_token = S_v * S_v * H * n_seqs;
+            // slot mapping: target_slot = t - shift. When n_tokens < K only the last n_tokens slots
+            // are written; earlier slots are left untouched (caller-owned).
             const int shift = (int) n_tokens - K;
+
+            const int64_t state_size_per_token = S_v * S_v * H * n_seqs; // per-slot stride in output
             const int target_slot = t - shift;
             if (target_slot >= 0 && target_slot < K) {
                 float * curr_state_out = (dst + attn_score_elems) + target_slot * state_size_per_token + state_out_offset;

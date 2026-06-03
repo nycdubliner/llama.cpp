@@ -77,6 +77,7 @@ static __global__ void argmax_f32(
         const int64_t nrows,
         const float inv_temp,
         const uint64_t seed,
+        const bool store_score,
         const bool output_logprob) {
 
     const int64_t row = blockIdx.x;
@@ -203,6 +204,10 @@ static __global__ void argmax_f32(
     if (warp_id == 0 && lane_id == 0) {
         dst[row] = argmax;
 
+        if (!store_score) {
+            return;
+        }
+
         if (argmax < 0 || argmax >= ncols) {
             const float invalid_score = -FLT_MAX;
             int32_t invalid_bits;
@@ -237,6 +242,7 @@ static __global__ void topk_f32(
         const int K,
         const float inv_temp,
         const uint64_t seed,
+        const bool store_score,
         const bool output_logprob) {
 
     const int64_t row = blockIdx.x;
@@ -438,6 +444,10 @@ static __global__ void topk_f32(
             dst[row * K + i] = heap_idx[i];
         }
 
+        if (!store_score) {
+            return;
+        }
+
         // Write log-probs: dst[K*nrows + row * K + 0..K-1]
         if (output_logprob) {
             float log_norm = logit_max + logf(sum_exp);
@@ -528,13 +538,14 @@ void ggml_cuda_argmax(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // Deterministic top-K verifier reduction only needs raw logits; adding or
     // subtracting a per-row constant does not affect the downstream sampler chain.
     const bool output_logprob = temp > 0.0f && seed != 0;
+    const bool store_score = ggml_nelements(dst) >= 2 * (int64_t) K * nrows;
 
     ggml_cuda_pool & pool = ctx.pool();
 
 #ifdef GGML_CUDA_DFLASH_CUB_TOP_K_AVAILABLE
     const int cub_mode = ggml_cuda_dflash_cub_topk_mode();
     const bool use_cub_topk =
-        K > 1 && !output_logprob && seed == 0 &&
+        store_score && K > 1 && !output_logprob && seed == 0 &&
         (K > 64 || cub_mode == 1 || (cub_mode < 0 && nrows > 32));
     if (ggml_cuda_dflash_argmax_profile_enabled() && K > 1) {
         GGML_LOG_INFO("%s: dflash argmax profile path=%s K=%d nrows=%" PRId64
@@ -560,12 +571,12 @@ void ggml_cuda_argmax(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const dim3 blocks_num(num_blocks, 1, 1);
 
     if (K == 1) {
-        argmax_f32<<<blocks_num, blocks_dim, 0, stream>>>(src0_d, dst_d, ne00, nrows, inv_temp, seed, output_logprob);
+        argmax_f32<<<blocks_num, blocks_dim, 0, stream>>>(src0_d, dst_d, ne00, nrows, inv_temp, seed, store_score, output_logprob);
     } else {
         GGML_ASSERT(K <= 64);
         // Shared memory: K * n_warps floats + K * n_warps ints + 2 * n_warps floats (softmax)
         const int n_warps = (int)(num_threads / WARP_SIZE);
         const size_t smem_size = K * n_warps * (sizeof(float) + sizeof(int32_t)) + 2 * n_warps * sizeof(float);
-        topk_f32<<<blocks_num, blocks_dim, smem_size, stream>>>(src0_d, dst_d, ne00, nrows, K, inv_temp, seed, output_logprob);
+        topk_f32<<<blocks_num, blocks_dim, smem_size, stream>>>(src0_d, dst_d, ne00, nrows, K, inv_temp, seed, store_score, output_logprob);
     }
 }
