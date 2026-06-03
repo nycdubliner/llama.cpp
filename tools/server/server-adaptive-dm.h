@@ -100,6 +100,41 @@ static inline int server_adaptive_dm_build_candidates(int base_n_max, int * out,
     return n;
 }
 
+static inline int server_adaptive_dm_resolve_cohort_n_max(
+        const int * normal_n_max,
+        const int * cohort_cap_n_max,
+        int n_slots) {
+    if (!normal_n_max || !cohort_cap_n_max || n_slots < 2) {
+        return 0;
+    }
+
+    int n_eligible = 0;
+    int n_positive = 0;
+    int cohort_n_max = INT_MAX;
+    for (int i = 0; i < n_slots; ++i) {
+        const int slot_cap = cohort_cap_n_max[i];
+        if (slot_cap <= 0) {
+            continue;
+        }
+
+        n_eligible++;
+        if (normal_n_max[i] > 0) {
+            n_positive++;
+        }
+
+        const int slot_limit = normal_n_max[i] > 0
+            ? std::min(normal_n_max[i], slot_cap)
+            : slot_cap;
+        cohort_n_max = std::min(cohort_n_max, slot_limit);
+    }
+
+    if (n_eligible < 2 || n_positive == 0 || cohort_n_max == INT_MAX) {
+        return 0;
+    }
+
+    return std::max(0, cohort_n_max);
+}
+
 static inline int server_adaptive_dm_next_explore_depth(int current_n, int base_n_max, float probe_fraction) {
     if (base_n_max <= 0) {
         return 0;

@@ -1208,6 +1208,19 @@ int main(int argc, char ** argv) {
                  server_context.find("common_speculative_get_draft_params(slot.get_spec(), slot.id)") != std::string::npos &&
                  server_context.find("/* .n_past   = */ draft_n_past") != std::string::npos,
         "server must seed upstream MTP drafting through the shared upstream dparams path using slot.prompt.n_tokens()");
+    {
+        const size_t mtp_draft_phase = server_context.find("// Phase 2: single draft call for all collected MTP slots");
+        const size_t mtp_timer = server_context.find("const int64_t t_mtp_draft_start = ggml_time_us();", mtp_draft_phase);
+        const size_t mtp_draft = server_context.find("common_speculative_draft(spec.get());", mtp_timer);
+        const size_t mtp_account = server_context.find("t_draft_total += ggml_time_us() - t_mtp_draft_start;", mtp_draft);
+        ok &= expect(mtp_draft_phase != std::string::npos &&
+                     mtp_timer != std::string::npos &&
+                     mtp_draft != std::string::npos &&
+                     mtp_account != std::string::npos &&
+                     mtp_timer < mtp_draft &&
+                     mtp_draft < mtp_account,
+            "server must account post-loop MTP draft time as draft_ms instead of hiding it in other_ms");
+    }
     ok &= expect(server_context.find("common_speculative_accept(slot.get_spec(), slot.id, n_accepted_draft)") != std::string::npos,
         "server must accept upstream MTP drafts through the per-sequence shared speculative accept path");
     ok &= expect(server_context.find("slot.spec_ckpt.update_pos(") != std::string::npos,

@@ -1009,7 +1009,10 @@ struct server_slot : server_adaptive_dm_state {
         generated_token_probs.push_back(token);
     }
 
-    int get_n_draft_max(const common_params & global_params, bool advance_adaptive_probe = false) {
+    int get_n_draft_max(
+            const common_params & global_params,
+            bool advance_adaptive_probe = false,
+            int dflash_cohort_n_max = -1) {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
@@ -1033,43 +1036,58 @@ struct server_slot : server_adaptive_dm_state {
             : configured_base_n_max;
         const int probe_n_max = server_adaptive_dm_probe_n_max(base_n_max, dm_probe_fraction);
         int n_draft_max = (dm_adaptive && adaptive_n_max >= 0) ? std::min((int) adaptive_n_max, base_n_max) : base_n_max;
+        const bool use_dflash_cohort_n_max =
+            global_params.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+            global_params.speculative.branch_budget == 0 &&
+            dflash_cohort_n_max > 0;
 
         if (use_profit_controller) {
-            if (profit_baseline_probe_pending) {
+            if (profit_baseline_probe_pending && use_dflash_cohort_n_max) {
+                n_draft_max = dflash_cohort_n_max;
+            } else if (profit_baseline_probe_pending) {
                 return 0;
-            }
-
-            if (profit_should_probe_baseline()) {
+            } else if (profit_should_probe_baseline() && use_dflash_cohort_n_max) {
+                n_draft_max = dflash_cohort_n_max;
+            } else if (profit_should_probe_baseline()) {
                 if (advance_adaptive_probe) {
                     profit_mark_baseline_probe();
                 }
                 return 0;
-            }
-
-            if (adaptive_n_max < 0) {
+            } else if (adaptive_n_max < 0) {
                 if (advance_adaptive_probe) {
                     adaptive_n_max = 0;
                 }
-                return 0;
+                if (!use_dflash_cohort_n_max) {
+                    return 0;
+                }
+                n_draft_max = dflash_cohort_n_max;
             } else if (adaptive_n_max == 0) {
                 if (!profit_baseline_ready()) {
-                    return 0;
-                }
-                const bool probe_now = adaptive_probe_counter + 1 >= profit_off_probe_interval();
-                if (!probe_now) {
-                    if (advance_adaptive_probe) {
-                        adaptive_probe_counter++;
+                    if (!use_dflash_cohort_n_max) {
+                        return 0;
                     }
-                    return 0;
+                    n_draft_max = dflash_cohort_n_max;
+                } else {
+                    const bool probe_now = adaptive_probe_counter + 1 >= profit_off_probe_interval();
+                    if (!probe_now) {
+                        if (advance_adaptive_probe) {
+                            adaptive_probe_counter++;
+                        }
+                        if (!use_dflash_cohort_n_max) {
+                            return 0;
+                        }
+                        n_draft_max = dflash_cohort_n_max;
+                    } else {
+                        const int profit_probe_n_max = [&]() {
+                            return profit_next_off_probe_depth(base_n_max, probe_n_max);
+                        }();
+                        if (advance_adaptive_probe) {
+                            adaptive_probe_counter = 0;
+                            adaptive_n_max = profit_probe_n_max;
+                        }
+                        n_draft_max = profit_probe_n_max;
+                    }
                 }
-                const int profit_probe_n_max = [&]() {
-                    return profit_next_off_probe_depth(base_n_max, probe_n_max);
-                }();
-                if (advance_adaptive_probe) {
-                    adaptive_probe_counter = 0;
-                    adaptive_n_max = profit_probe_n_max;
-                }
-                n_draft_max = profit_probe_n_max;
             } else {
                 n_draft_max = std::min((int) adaptive_n_max, base_n_max);
                 if (advance_adaptive_probe) {
@@ -1113,6 +1131,10 @@ struct server_slot : server_adaptive_dm_state {
                     n_draft_max = base_n_max;
                 }
             }
+        }
+
+        if (use_dflash_cohort_n_max && n_draft_max > 0) {
+            n_draft_max = std::min(n_draft_max, dflash_cohort_n_max);
         }
 
         // determine the max draft that fits the current slot state
@@ -4384,8 +4406,8 @@ private:
             }
         };
         int n_slots_drafted = 0;
-        server_slot * profit_baseline_slot = nullptr;
         int n_profit_baseline_slots = 0;
+        std::vector<server_slot *> profit_baseline_slots;
         server_slot * dflash_cycle_slot = nullptr;
         int dflash_cycle_n_draft = 0;
         int dflash_cycle_n_accept = 0;
@@ -4405,12 +4427,53 @@ private:
             std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
                 return slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT;
             });
+        std::vector<int> dflash_cohort_n_draft_max(slots.size(), -1);
+        if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                params_base.speculative.branch_budget == 0 &&
+                !dflash_recurrent_has_pending_prompt) {
+            std::vector<int> normal_n_max(slots.size(), 0);
+            std::vector<int> cohort_cap_n_max(slots.size(), 0);
+
+            for (auto & slot : slots) {
+                if (slot.state != SLOT_STATE_GENERATING ||
+                        !slot.can_speculate() ||
+                        slot.id < 0 ||
+                        slot.id >= (int) slots.size()) {
+                    continue;
+                }
+
+                normal_n_max[slot.id] = slot.get_n_draft_max(params_base, false);
+                cohort_cap_n_max[slot.id] = normal_n_max[slot.id] > 0
+                    ? normal_n_max[slot.id]
+                    : slot.get_n_draft_max(params_base, false, INT_MAX);
+            }
+
+            const int cohort_n_max = server_adaptive_dm_resolve_cohort_n_max(
+                    normal_n_max.data(), cohort_cap_n_max.data(), (int) slots.size());
+            if (cohort_n_max > 0) {
+                for (auto & slot : slots) {
+                    if (slot.id < 0 || slot.id >= (int) slots.size() ||
+                            cohort_cap_n_max[slot.id] <= 0) {
+                        continue;
+                    }
+                    dflash_cohort_n_draft_max[slot.id] = std::min(cohort_n_max, cohort_cap_n_max[slot.id]);
+                }
+            }
+        }
+        auto dflash_scheduler_n_draft_max = [&](server_slot & slot, bool advance_adaptive_probe) {
+            if (slot.id >= 0 && slot.id < (int) dflash_cohort_n_draft_max.size() &&
+                    dflash_cohort_n_draft_max[slot.id] > 0) {
+                return slot.get_n_draft_max(
+                        params_base, advance_adaptive_probe, dflash_cohort_n_draft_max[slot.id]);
+            }
+            return slot.get_n_draft_max(params_base, advance_adaptive_probe);
+        };
         if (ctx_dft_shared) {
             int n_drafting = 0;
             for (auto & slot : slots) {
                 if (slot.state == SLOT_STATE_GENERATING &&
                         slot.can_speculate() &&
-                        slot.get_n_draft_max(params_base, false) > 0 &&
+                        dflash_scheduler_n_draft_max(slot, false) > 0 &&
                         !dflash_recurrent_has_pending_prompt) {
                     n_drafting++;
                 }
@@ -4427,7 +4490,7 @@ private:
                 for (auto & slot : slots) {
                     if (slot.state == SLOT_STATE_GENERATING &&
                             slot.can_speculate() &&
-                            slot.get_n_draft_max(params_base, false) > 0 &&
+                            dflash_scheduler_n_draft_max(slot, false) > 0 &&
                             !dflash_recurrent_has_pending_prompt) {
                         batch_specs.push_back(slot.get_spec());
                         batch_id_lasts.push_back(slot.sampled);
@@ -4437,10 +4500,21 @@ private:
 
                 std::vector<llama_tokens> batch_results;
                 std::vector<std::vector<float>> batch_log_probs;
+                common_params_speculative params_batch = params_base.speculative;
+                int batch_cohort_n_max = INT_MAX;
+                for (const int slot_id : batch_slot_ids) {
+                    if (slot_id >= 0 && slot_id < (int) dflash_cohort_n_draft_max.size() &&
+                            dflash_cohort_n_draft_max[slot_id] > 0) {
+                        batch_cohort_n_max = std::min(batch_cohort_n_max, dflash_cohort_n_draft_max[slot_id]);
+                    }
+                }
+                if (batch_cohort_n_max != INT_MAX) {
+                    params_batch.n_max = std::min(params_batch.n_max, batch_cohort_n_max);
+                }
                 const int64_t t_batch_start = ggml_time_us();
                 common_speculative_draft_batch(
                         batch_specs, ctx_dft_shared.get(),
-                        params_base.speculative, batch_id_lasts, batch_results,
+                        params_batch, batch_id_lasts, batch_results,
                         use_rejection_sampling ? &batch_log_probs : nullptr);
                 t_draft_total = ggml_time_us() - t_batch_start;
                 llama_set_dflash_n_slots(ctx_dft_shared.get(), 1);
@@ -4475,7 +4549,7 @@ private:
                 continue;
             }
 
-            int n_draft_max = slot.get_n_draft_max(params_base, true);
+            int n_draft_max = dflash_scheduler_n_draft_max(slot, true);
             if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
                     params_base.speculative.branch_budget == 0) {
                 n_draft_max = dflash_flat_effective_draft_max(ctx_dft_shared.get(), n_draft_max);
@@ -4757,8 +4831,8 @@ private:
                 if (slot.can_speculate() && slot.dm_adaptive &&
                         server_adaptive_dm_uses_profit_controller(slot.dm_controller) &&
                         slot.profit_expects_baseline_sample()) {
-                    profit_baseline_slot = &slot;
                     n_profit_baseline_slots++;
+                    profit_baseline_slots.push_back(&slot);
                 }
 
                 slot.i_batch = batch.n_tokens;
@@ -4775,7 +4849,9 @@ private:
         // --- MTP post-loop phases (upstream-aligned) ---
         // Phase 2: single draft call for all collected MTP slots
         if (!mtp_drafting.empty()) {
+            const int64_t t_mtp_draft_start = ggml_time_us();
             common_speculative_draft(spec.get());
+            t_draft_total += ggml_time_us() - t_mtp_draft_start;
         }
 
         // Phase 3: checkpoint creation and batch building for MTP slots
@@ -7042,19 +7118,24 @@ private:
         }
         llama_set_dflash_consume_reduced(ctx_tgt, false);
 
-        if (pure_tg_cycle && n_slots_drafted == 0 && n_profit_baseline_slots == 1 && n_tg_tokens == 1 &&
-                profit_baseline_slot && profit_baseline_slot->task &&
-                profit_baseline_slot->state == SLOT_STATE_GENERATING) {
+        if (pure_tg_cycle && n_slots_drafted == 0 && n_profit_baseline_slots > 0) {
             const int64_t t_cycle_total_now = ggml_time_us() - t_cycle_start;
-            profit_baseline_slot->observe_profit_timing(
-                    0,
-                    0,
-                    0,
-                    t_draft_total / 1000.0f,
-                    t_verify_total / 1000.0f,
-                    t_accept_total / 1000.0f,
-                    t_cycle_total_now / 1000.0f);
-            apply_profit_decision(*profit_baseline_slot);
+            const float baseline_shared_scale = n_tg_tokens > 1 ? 1.0f / (float) n_tg_tokens : 1.0f;
+            for (server_slot * slot_ptr : profit_baseline_slots) {
+                if (!slot_ptr || !slot_ptr->task || slot_ptr->state != SLOT_STATE_GENERATING) {
+                    continue;
+                }
+
+                slot_ptr->observe_profit_timing(
+                        0,
+                        0,
+                        0,
+                        (t_draft_total / 1000.0f) * baseline_shared_scale,
+                        (t_verify_total / 1000.0f) * baseline_shared_scale,
+                        (t_accept_total / 1000.0f) * baseline_shared_scale,
+                        (t_cycle_total_now / 1000.0f) * baseline_shared_scale);
+                apply_profit_decision(*slot_ptr);
+            }
         }
 
         // --- profiling: log per-cycle breakdown ---

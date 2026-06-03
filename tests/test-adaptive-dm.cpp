@@ -1099,6 +1099,27 @@ int main() {
         assert(sweep.profit_next_off_probe_depth(15, 3) == expected_order[0]);
     }
 
+    // Multi-slot flat DFlash verification needs equal row counts. If any
+    // eligible slot already has a positive adaptive depth, cold/off slots join a
+    // shared cohort depth instead of forcing a mixed speculative/baseline batch.
+    {
+        const int one_hot_normal[] = {15, 0};
+        const int one_hot_cap[] = {15, 15};
+        assert(server_adaptive_dm_resolve_cohort_n_max(one_hot_normal, one_hot_cap, 2) == 15);
+
+        const int mixed_positive_normal[] = {15, 8};
+        const int mixed_positive_cap[] = {15, 8};
+        assert(server_adaptive_dm_resolve_cohort_n_max(mixed_positive_normal, mixed_positive_cap, 2) == 8);
+
+        const int all_cold_normal[] = {0, 0};
+        const int all_cold_cap[] = {15, 15};
+        assert(server_adaptive_dm_resolve_cohort_n_max(all_cold_normal, all_cold_cap, 2) == 0);
+
+        const int blocked_normal[] = {15, 0};
+        const int blocked_cap[] = {15, 0};
+        assert(server_adaptive_dm_resolve_cohort_n_max(blocked_normal, blocked_cap, 2) == 0);
+    }
+
     // Failed wake probes advance the off-state sweep instead of retrying the
     // same shallow depth forever.
     {
