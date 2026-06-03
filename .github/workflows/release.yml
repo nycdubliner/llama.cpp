@@ -1101,7 +1101,7 @@ jobs:
             exit 0
           fi
 
-          deadline=$((SECONDS + 7200))
+          deadline=$((SECONDS + 19800))
           while (( SECONDS < deadline )); do
             run_info=""
             for event_name in push workflow_dispatch; do
