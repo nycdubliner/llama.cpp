@@ -1012,8 +1012,10 @@ llama_kv_cache::slot_info llama_kv_cache::mtp_slot_info(llama_seq_id seq_id) con
     }
 
     slot_info res;
-    res.s0   = 0;
-    res.s1   = 0;
+    // Read-only MTP paths use strm/idxs for logical placement, but K/V views still
+    // use s0/s1 as the backing stream window. Preserve the real stream here.
+    res.s0   = st;
+    res.s1   = st;
     res.strm = { (llama_seq_id) st };
     res.idxs.resize(1);
     res.idxs[0] = { idx };

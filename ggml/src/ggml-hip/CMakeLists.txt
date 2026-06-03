@@ -136,6 +136,8 @@ endif()
 
 if (GGML_HIP_ROCWMMA_FATTN)
     add_compile_definitions(GGML_HIP_ROCWMMA_FATTN)
+    add_compile_definitions(GGML_HIP_ROCWMMA_INCLUDE="${ROCM_PATH}/include/rocwmma/rocwmma.hpp")
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -I${ROCM_PATH}/include")
 endif()
 
 if (NOT GGML_HIP_MMQ_MFMA)

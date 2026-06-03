@@ -1253,7 +1253,6 @@ bool llama_context::ensure_sched_mtp() {
         return false;
     }
 
-    const uint32_t n_seqs   = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
     const size_t   max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -1274,14 +1273,6 @@ bool llama_context::ensure_sched_mtp() {
         auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
         if (!kv_iswa) {
             LLAMA_LOG_ERROR("%s: MTP requires llama_kv_cache_iswa memory\n", __func__);
-            sched_mtp.reset();
-            gf_res_prev_mtp.reset();
-            return false;
-        }
-
-        llama_memory_context_ptr mctx = memory->init_full();
-        if (!mctx) {
-            LLAMA_LOG_ERROR("%s: failed to init memory context for MTP reserve\n", __func__);
             sched_mtp.reset();
             gf_res_prev_mtp.reset();
             return false;
@@ -1320,6 +1311,18 @@ bool llama_context::ensure_sched_mtp() {
         ub.seq_idx      = data->seq_idx.data();
         ub.output       = data->output.data();
         ub.data         = data;
+
+        // Reserve the MTP graph against a dedicated shape-only KV view. Using
+        // init_full() here would build dummy slot_info spanning every server stream;
+        // with n_seq_max > 1 that changes the MTP attention output topology during
+        // reserve and Gemma4's single-stream reshape path later asserts.
+        llama_memory_context_ptr mctx = kv_iswa->init_mtp_reserve(ub);
+        if (!mctx) {
+            LLAMA_LOG_ERROR("%s: failed to init MTP memory context for reserve\n", __func__);
+            sched_mtp.reset();
+            gf_res_prev_mtp.reset();
+            return false;
+        }
 
         const uint32_t save_n_outputs = n_outputs;
         n_outputs = 1;
@@ -2534,7 +2537,11 @@ int32_t llama_context::decode_mtp(
     // Backward-compat facade: submit + immediately wait. out_logits is best-effort —
     // the async path only emits drafts and h_prev_last to keep the worker contract
     // narrow. Existing callers in common/speculative.cpp pass out_logits=NULL.
-    if (out_logits) {
+    //
+    // Multi-sequence server contexts share one context-global async MTP worker/state
+    // across all slots. In that configuration, use the synchronous path so one slot's
+    // submit cannot collide with another slot's in-flight prepare_next().
+    if (out_logits || n_seq_max() > 1) {
         // Fall back to the synchronous in-thread path that captures per-step logits.
         return decode_mtp_sync(seq_id, attn_pos, last_token, h_prev, n_steps,
                                out_drafts, out_logits, out_h_prev_last);

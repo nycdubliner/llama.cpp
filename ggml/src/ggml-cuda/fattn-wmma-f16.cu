@@ -15,7 +15,11 @@ namespace wmma = mtmusa::wmma;
 namespace wmma = nvcuda::wmma;
 #endif // GGML_USE_MUSA
 #elif defined(GGML_USE_HIP)
+#if defined(GGML_HIP_ROCWMMA_INCLUDE)
+#include GGML_HIP_ROCWMMA_INCLUDE
+#else
 #include <rocwmma/rocwmma.hpp>
+#endif
 namespace wmma = rocwmma;
 #endif // !defined(GGML_USE_HIP)
 #endif // GGML_USE_WMMA_FATTN

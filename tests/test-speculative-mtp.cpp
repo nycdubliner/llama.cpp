@@ -1,6 +1,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -174,6 +175,122 @@ int main() {
                 llama_model_free(model_tgt);
                 return 1;
             }
+        }
+
+        // Multi-sequence contexts must serialize the blocking facade so it does not
+        // leave context-global async MTP state behind between slots.
+        {
+            llama_context_params cparams_multi = cparams;
+            cparams_multi.n_seq_max = 2;
+
+            llama_context * ctx_multi = llama_init_from_model(model_tgt, cparams_multi);
+            if (!ctx_multi) {
+                std::cerr << "failed to create multi-sequence context\n";
+                llama_free(ctx);
+                llama_model_free(model_tgt);
+                return 1;
+            }
+
+            llama_batch b_multi = llama_batch_get_one(&bos, 1);
+            if (llama_decode(ctx_multi, b_multi) != 0) {
+                std::cerr << "multi-sequence initial decode failed\n";
+                llama_free(ctx_multi);
+                llama_free(ctx);
+                llama_model_free(model_tgt);
+                return 1;
+            }
+
+            std::vector<float> h_prev_multi(n_bb, 0.f);
+            if (float * h = llama_get_embeddings_ith(ctx_multi, -1)) {
+                const int no = llama_model_n_embd_out(model_tgt);
+                const int nc = (int) std::min((size_t) no, (size_t) n_bb);
+                std::memcpy(h_prev_multi.data(), h, (size_t) nc * sizeof(float));
+            }
+
+            llama_memory_t mem_multi = llama_get_memory(ctx_multi);
+            llama_pos attn_pos_multi = mem_multi ? llama_memory_seq_pos_max(mem_multi, 0) : 0;
+            if (attn_pos_multi < 0) {
+                attn_pos_multi = 0;
+            }
+
+            llama_token drafts_multi[4] = {};
+            const int32_t rc_multi = llama_decode_mtp(
+                    ctx_multi, 0, attn_pos_multi, bos, h_prev_multi.data(), 1, drafts_multi, nullptr, nullptr);
+            if (rc_multi != 0) {
+                std::cerr << "multi-sequence llama_decode_mtp returned " << rc_multi << "\n";
+                llama_free(ctx_multi);
+                llama_free(ctx);
+                llama_model_free(model_tgt);
+                return 1;
+            }
+
+            llama_token drain[4] = {};
+            if (llama_decode_mtp_wait(ctx_multi, drain, nullptr) != -7) {
+                std::cerr << "multi-sequence blocking MTP should not leave pending async state\n";
+                llama_free(ctx_multi);
+                llama_free(ctx);
+                llama_model_free(model_tgt);
+                return 1;
+            }
+
+            llama_memory_t mem_multi_live = llama_get_memory(ctx_multi);
+            llama_memory_seq_cp(mem_multi_live, 0, 1, -1, -1);
+
+            llama_pos attn_pos_seq0 = llama_memory_seq_pos_max(mem_multi_live, 0);
+            llama_pos attn_pos_seq1 = llama_memory_seq_pos_max(mem_multi_live, 1);
+            if (attn_pos_seq0 != attn_pos_seq1) {
+                std::cerr << "expected copied seq0/seq1 positions to match, got "
+                          << attn_pos_seq0 << " vs " << attn_pos_seq1 << "\n";
+                llama_free(ctx_multi);
+                llama_free(ctx);
+                llama_model_free(model_tgt);
+                return 1;
+            }
+
+            std::vector<float> h_prev_seq0 = h_prev_multi;
+            std::vector<float> h_prev_seq1 = h_prev_multi;
+            std::vector<float> h_post_seq0(n_bb, 0.f);
+            std::vector<float> h_post_seq1(n_bb, 0.f);
+            llama_token drafts_seq0[1] = {};
+            llama_token drafts_seq1[1] = {};
+
+            const int32_t rc_seq0 = llama_decode_mtp(
+                    ctx_multi, 0, attn_pos_seq0, bos, h_prev_seq0.data(), 1,
+                    drafts_seq0, nullptr, h_post_seq0.data());
+            const int32_t rc_seq1 = llama_decode_mtp(
+                    ctx_multi, 1, attn_pos_seq1, bos, h_prev_seq1.data(), 1,
+                    drafts_seq1, nullptr, h_post_seq1.data());
+            if (rc_seq0 != 0 || rc_seq1 != 0) {
+                std::cerr << "expected seq0/seq1 MTP to succeed, got "
+                          << rc_seq0 << " and " << rc_seq1 << "\n";
+                llama_free(ctx_multi);
+                llama_free(ctx);
+                llama_model_free(model_tgt);
+                return 1;
+            }
+
+            if (drafts_seq0[0] != drafts_seq1[0]) {
+                std::cerr << "expected seq0/seq1 draft parity, got "
+                          << drafts_seq0[0] << " vs " << drafts_seq1[0] << "\n";
+                llama_free(ctx_multi);
+                llama_free(ctx);
+                llama_model_free(model_tgt);
+                return 1;
+            }
+
+            const float eps = 1e-4f;
+            for (uint32_t i = 0; i < n_bb; ++i) {
+                if (std::fabs(h_post_seq0[i] - h_post_seq1[i]) > eps) {
+                    std::cerr << "expected seq0/seq1 h_post parity at index " << i
+                              << ", got " << h_post_seq0[i] << " vs " << h_post_seq1[i] << "\n";
+                    llama_free(ctx_multi);
+                    llama_free(ctx);
+                    llama_model_free(model_tgt);
+                    return 1;
+                }
+            }
+
+            llama_free(ctx_multi);
         }
     }
 

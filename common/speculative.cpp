@@ -593,6 +593,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
     bool skip_streak_last_draft = false;
 
     // Pipeline depth-2: submit at end of iteration via prepare_next(); draft() waits first.
+    bool                         depth2_enabled   = true;
     bool                         has_pending      = false;
     int32_t                      pending_n_steps  = 0;
     common_params_speculative    last_spec_params;
@@ -666,6 +667,18 @@ struct common_speculative_state_mtp : public common_speculative_state {
             if (v >= 1 && v <= 32) {
                 skip_streak_threshold = v;
             }
+        }
+
+        if (const char * v = std::getenv("LLAMA_PIPELINE_DEPTH2")) {
+            if (std::strcmp(v, "0") == 0) {
+                depth2_enabled = false;
+            }
+        }
+
+        if (depth2_enabled && llama_n_seq_max(ctx_tgt) > 1) {
+            depth2_enabled = false;
+            LOG_INF("%s: disabling async MTP overlap for multi-slot context (n_seq_max=%u); using serialized drafting\n",
+                    __func__, llama_n_seq_max(ctx_tgt));
         }
     }
 
@@ -819,22 +832,19 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
         // Bootstrap path (first iter or after drain): submit and wait immediately on sched_mtp.
         draft_tokens.resize((size_t) n_steps);
-        int32_t rc = llama_decode_mtp_async(
+        const int32_t rc = llama_decode_mtp(
                 ctx_tgt,
                 seq_id,
                 attn_pos,
                 id_last,
                 h_prev.data(),
-                n_steps);
+                n_steps,
+                draft_tokens.data(),
+                /*out_logits*/ nullptr,
+                /*out_h_prev_last*/ nullptr);
         if (rc != 0) {
-            LOG_ERR("%s: llama_decode_mtp_async failed (%d)\n", __func__, (int) rc);
+            LOG_ERR("%s: llama_decode_mtp failed (%d)\n", __func__, (int) rc);
             draft_tokens.clear();
-        } else {
-            rc = llama_decode_mtp_wait(ctx_tgt, draft_tokens.data(), /*out_h_prev_last*/ nullptr);
-            if (rc != 0) {
-                LOG_ERR("%s: llama_decode_mtp_wait failed (%d)\n", __func__, (int) rc);
-                draft_tokens.clear();
-            }
         }
         // Snapshot accepted-draft counter for next call's zero-accept detection.
         prev_n_acc_drafts = n_acc_drafts;
@@ -852,11 +862,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
     void prepare_next(llama_token id_last) override {
         // Kill switch for A/B testing depth-2 vs sync.
-        static const bool depth2_disabled = []() {
-            const char * v = std::getenv("LLAMA_PIPELINE_DEPTH2");
-            return v && std::strcmp(v, "0") == 0;
-        }();
-        if (depth2_disabled) {
+        if (!depth2_enabled) {
             return;
         }
         const llama_model * model_tgt = llama_get_model(ctx_tgt);
