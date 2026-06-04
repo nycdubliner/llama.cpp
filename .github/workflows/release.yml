@@ -1076,9 +1076,17 @@ jobs:
           ref: ${{ needs.release-meta.outputs.source_sha }}
           fetch-depth: 0
 
-      - name: Download artifacts
+      - name: Download package artifacts
         uses: actions/download-artifact@v7
         with:
+          pattern: beellama-bin-*
+          path: ./artifact
+          merge-multiple: true
+
+      - name: Download CUDA runtime artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: cudart-beellama-*
           path: ./artifact
           merge-multiple: true
 
