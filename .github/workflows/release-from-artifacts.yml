@@ -1,0 +1,245 @@
+name: Recover Release From Artifacts
+
+run-name: Recover ${{ inputs.tag_name }} from run ${{ inputs.artifact_run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_run_id:
+        description: "Workflow run ID that already produced the package artifacts"
+        required: true
+      tag_name:
+        description: "Release tag to publish, for example v0.3.1"
+        required: true
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: recover-release-${{ inputs.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    name: Recover release
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Clone main workflow helpers
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Verify source run and tag
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
+          TAG_NAME: ${{ inputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${TAG_NAME}" =~ ^v[0-9] ]]; then
+            echo "tag_name must be a v* release tag, got ${TAG_NAME}" >&2
+            exit 1
+          fi
+
+          git fetch origin +refs/tags/"${TAG_NAME}":refs/tags/"${TAG_NAME}"
+          source_sha="$(git rev-list -n 1 "${TAG_NAME}")"
+
+          run_status="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ARTIFACT_RUN_ID}" --jq '.status')"
+          run_head_sha="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ARTIFACT_RUN_ID}" --jq '.head_sha')"
+          run_url="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ARTIFACT_RUN_ID}" --jq '.html_url')"
+
+          if [[ "${run_status}" != "completed" ]]; then
+            echo "Artifact run ${ARTIFACT_RUN_ID} is ${run_status}, not completed: ${run_url}" >&2
+            exit 1
+          fi
+
+          if [[ "${run_head_sha}" != "${source_sha}" ]]; then
+            echo "Artifact run ${ARTIFACT_RUN_ID} built ${run_head_sha}, but ${TAG_NAME} points to ${source_sha}" >&2
+            exit 1
+          fi
+
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          repo_name="${repo_name,,}"
+          image_repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+
+          git show "${TAG_NAME}:CHANGELOG.md" > CHANGELOG.md
+
+          {
+            echo "source_sha=${source_sha}"
+            echo "image_repo=${image_repo}"
+            echo "package_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/pkgs/container/${repo_name}"
+            echo "run_url=${run_url}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Recovering ${TAG_NAME} (${source_sha}) from ${run_url}"
+
+      - name: Download package artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifact-download artifact
+
+          gh run download "${ARTIFACT_RUN_ID}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "beellama-bin-*" \
+            --dir artifact-download
+
+          gh run download "${ARTIFACT_RUN_ID}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "cudart-beellama-*" \
+            --dir artifact-download
+
+          while IFS= read -r -d '' artifact_file; do
+            cp "${artifact_file}" artifact/
+          done < <(find artifact-download -type f \( -name "beellama-bin-*" -o -name "beellama-*-bin-*" -o -name "cudart-beellama-*" \) -print0)
+
+          ls -lh artifact
+
+      - name: Verify recovered artifact set
+        env:
+          TAG_NAME: ${{ inputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          required=(
+            "beellama-${TAG_NAME}-bin-macos-arm64.tar.gz"
+            "beellama-${TAG_NAME}-bin-ubuntu-x64.tar.gz"
+            "beellama-${TAG_NAME}-bin-ubuntu-arm64.tar.gz"
+            "beellama-${TAG_NAME}-bin-ubuntu-cuda-12.4-x64.tar.gz"
+            "beellama-${TAG_NAME}-bin-ubuntu-cuda-13.1-x64.tar.gz"
+            "beellama-${TAG_NAME}-bin-ubuntu-vulkan-x64.tar.gz"
+            "beellama-${TAG_NAME}-bin-ubuntu-rocm-7.2-x64.tar.gz"
+            "beellama-${TAG_NAME}-bin-ubuntu-sycl-x64.tar.gz"
+            "beellama-bin-win-cpu-x64.zip"
+            "beellama-bin-win-sycl-x64.zip"
+            "beellama-bin-win-cuda-12.4-x64.zip"
+            "beellama-bin-win-cuda-13.1-x64.zip"
+            "beellama-bin-win-hip-radeon-x64.zip"
+            "cudart-beellama-bin-win-cuda-12.4-x64.zip"
+            "cudart-beellama-bin-win-cuda-13.1-x64.zip"
+          )
+
+          missing=()
+          for artifact_name in "${required[@]}"; do
+            if [[ ! -f "artifact/${artifact_name}" ]]; then
+              missing+=("${artifact_name}")
+            fi
+          done
+
+          if [[ "${#missing[@]}" -ne 0 ]]; then
+            printf 'Missing required artifacts:\n' >&2
+            printf '  %s\n' "${missing[@]}" >&2
+            exit 1
+          fi
+
+      - name: Prepare release assets
+        shell: bash
+        env:
+          TAG_NAME: ${{ inputs.tag_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          mkdir -p release
+
+          cpu_zip="artifact/beellama-bin-win-cpu-x64.zip"
+          if [[ -f "${cpu_zip}" ]]; then
+            temp_dir="$(mktemp -d)"
+            unzip -q "${cpu_zip}" -d "${temp_dir}"
+            for target_zip in artifact/beellama-bin-win-*-x64.zip; do
+              if [[ "$(basename "${target_zip}")" == "beellama-bin-win-cpu-x64.zip" ]]; then
+                continue
+              fi
+              realpath_target_zip="$(realpath "${target_zip}")"
+              (cd "${temp_dir}" && zip -qr "${realpath_target_zip}" .)
+            done
+            rm -rf "${temp_dir}"
+          fi
+
+          for zip_file in artifact/beellama-bin-win-*.zip; do
+            base_name="$(basename "${zip_file}" .zip)"
+            mv "${zip_file}" "release/beellama-${TAG_NAME}-${base_name#beellama-}.zip"
+          done
+
+          for zip_file in artifact/cudart-beellama-bin-win-cuda-*.zip; do
+            base_name="$(basename "${zip_file}" .zip)"
+            suffix="${base_name#cudart-beellama-bin-win-}"
+            mv "${zip_file}" "release/beellama-${TAG_NAME}-cudart-win-${suffix}.zip"
+          done
+
+          for tar_file in artifact/*.tar.gz; do
+            mv "${tar_file}" release/
+          done
+
+          python3 scripts/verify-windows-package.py release/beellama-${TAG_NAME}-bin-win-*.zip
+          for cuda_version in 12.4 13.1; do
+            package_zip="release/beellama-${TAG_NAME}-bin-win-cuda-${cuda_version}-x64.zip"
+            runtime_zip="release/beellama-${TAG_NAME}-cudart-win-cuda-${cuda_version}-x64.zip"
+            if [[ -f "${package_zip}" && -f "${runtime_zip}" ]]; then
+              temp_dir="$(mktemp -d)"
+              unzip -q "${package_zip}" -d "${temp_dir}"
+              unzip -q "${runtime_zip}" -d "${temp_dir}"
+              python3 scripts/verify-windows-package.py "${temp_dir}"
+              rm -rf "${temp_dir}"
+            fi
+          done
+          sha256sum release/* > release/SHA256SUMS.txt
+          ls -lh release
+
+      - name: Write release notes
+        shell: bash
+        env:
+          TAG_NAME: ${{ inputs.tag_name }}
+          IMAGE_REPO: ${{ steps.meta.outputs.image_repo }}
+          PACKAGE_URL: ${{ steps.meta.outputs.package_url }}
+        run: |
+          set -euo pipefail
+          release_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}"
+          changelog_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md"
+          python3 scripts/extract-changelog.py \
+            --tag "${TAG_NAME}" \
+            --changelog CHANGELOG.md \
+            --fallback-url "${changelog_url}" \
+            --output changelog-fragment.md
+          python3 scripts/write-release-notes.py \
+            --tag "${TAG_NAME}" \
+            --release-url "${release_url}" \
+            --image-repo "${IMAGE_REPO}" \
+            --package-url "${PACKAGE_URL}" \
+            --changelog changelog-fragment.md \
+            --output release-notes.md
+
+      - name: Upload recovered release bundle
+        uses: actions/upload-artifact@v6
+        with:
+          name: beellama-recovered-release-${{ inputs.tag_name }}
+          path: |
+            release/*
+            release-notes.md
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ inputs.tag_name }}
+        run: |
+          set -euo pipefail
+          notes_file="release-notes.md"
+
+          mapfile -t release_files < <(find release -type f | sort)
+          if [[ "${#release_files[@]}" -eq 0 ]]; then
+            echo "No release files found" >&2
+            exit 1
+          fi
+
+          if gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" "${release_files[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+            gh release edit "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" --title "${TAG_NAME}" --notes-file "${notes_file}"
+          else
+            gh release create "${TAG_NAME}" "${release_files[@]}" --repo "${GITHUB_REPOSITORY}" --title "${TAG_NAME}" --notes-file "${notes_file}" --verify-tag
+          fi
