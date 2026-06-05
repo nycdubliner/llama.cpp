@@ -103,11 +103,11 @@ int main(void) {
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
     params = common_params();
-    argv = {"binary_name", "--cache-type-k", "kvarn5"};
+    argv = {"binary_name", "--cache-type-k", "kvarn7"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
     params = common_params();
-    argv = {"binary_name", "--spec-draft-type-k", "kvarn4"};
+    argv = {"binary_name", "--spec-draft-type-k", "kvarn8"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
     params = common_params();
@@ -240,6 +240,43 @@ int main(void) {
     assert(params.kvarn.value_bits == 4);
     assert(params.cache_kvarn_bits_k == 4);
     assert(params.cache_kvarn_bits_v == 4);
+    assert(params.cache_type_k == GGML_TYPE_F16);
+    assert(params.cache_type_v == GGML_TYPE_F16);
+
+    params = common_params();
+    argv = {
+        "binary_name", "-m", "model_file.gguf",
+        "--cache-type-k", "kvarn5",
+        "--cache-type-v", "kvarn2",
+    };
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.kvarn.type == LLAMA_KVARN_K5V2_G128);
+    assert(params.kvarn.key_bits == 5);
+    assert(params.kvarn.value_bits == 2);
+    assert(params.cache_kvarn_bits_k == 5);
+    assert(params.cache_kvarn_bits_v == 2);
+    assert(params.cache_type_k == GGML_TYPE_F16);
+    assert(params.cache_type_v == GGML_TYPE_F16);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--cache-type-k", "kvarn6"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.kvarn.type == LLAMA_KVARN_K6V6_G128);
+    assert(params.kvarn.key_bits == 6);
+    assert(params.kvarn.value_bits == 6);
+    assert(params.cache_kvarn_bits_k == 6);
+    assert(params.cache_kvarn_bits_v == 6);
+    assert(params.cache_type_k == GGML_TYPE_F16);
+    assert(params.cache_type_v == GGML_TYPE_F16);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--cache-type-v", "kvarn8"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.kvarn.type == LLAMA_KVARN_K8V8_G128);
+    assert(params.kvarn.key_bits == 8);
+    assert(params.kvarn.value_bits == 8);
+    assert(params.cache_kvarn_bits_k == 8);
+    assert(params.cache_kvarn_bits_v == 8);
     assert(params.cache_type_k == GGML_TYPE_F16);
     assert(params.cache_type_v == GGML_TYPE_F16);
 

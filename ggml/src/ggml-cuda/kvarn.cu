@@ -10,6 +10,10 @@ static constexpr int KVAR_N_SHARED_BYTES = KVAR_N_SHARED_FLOATS * sizeof(float);
 static constexpr int KVAR_N_LOWSHMEM_FLOATS = 6 * KVAR_N_DIM + 2;
 static constexpr int KVAR_N_LOWSHMEM_BYTES = KVAR_N_LOWSHMEM_FLOATS * sizeof(float);
 
+static bool ggml_cuda_kvarn_valid_bits(int bits) {
+    return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8;
+}
+
 size_t ggml_cuda_kvarn_required_shared_bytes() {
     return KVAR_N_SHARED_BYTES;
 }
@@ -624,6 +628,9 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int bits = ggml_get_op_params_i32(dst, 0);
     const int iterations = ggml_get_op_params_i32(dst, 1);
     const bool value = ggml_get_op_params_i32(dst, 2) != 0;
+    GGML_ASSERT(ggml_cuda_kvarn_valid_bits(bits));
+    GGML_ASSERT((KVAR_N_TILE_VALUES * bits) % 8 == 0);
+    GGML_ASSERT((KVAR_N_DIM * bits) % 8 == 0);
     const int n_stream = (int) (stage->ne[2] / (KVAR_N_DIM * KVAR_N_STAGE_GROUPS));
     const int groups_per_stream = (int) (records->ne[2] / n_stream);
     const char * force_low = std::getenv("GGML_KVARN_FORCE_LOW_SHMEM");
@@ -678,6 +685,9 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
     const bool value = ggml_get_op_params_i32(dst, 1) != 0;
     const int stream_start = ggml_get_op_params_i32(dst, 2);
     const int n_stream = ggml_get_op_params_i32(dst, 3);
+    GGML_ASSERT(ggml_cuda_kvarn_valid_bits(bits));
+    GGML_ASSERT((KVAR_N_TILE_VALUES * bits) % 8 == 0);
+    GGML_ASSERT((KVAR_N_DIM * bits) % 8 == 0);
     const int n_total_stream = (int) (stage->ne[2] / (KVAR_N_DIM * KVAR_N_STAGE_GROUPS));
     const int groups_per_stream = (int) (records->ne[2] / n_total_stream);
     ggml_cuda_pool_alloc<int> live_groups(ctx.pool(), n_stream);

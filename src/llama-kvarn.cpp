@@ -8,21 +8,61 @@
 #include <limits>
 #include <vector>
 
-static constexpr std::array<llama_kvarn_type_desc, 10> KVAR_N_TYPES = {{
-    { LLAMA_KVARN_TYPE_DISABLED, "off",             0, 0, 128 },
-    { LLAMA_KVARN_K2V2_G128,     "kvarn_k2v2_g128", 2, 2, 128 },
-    { LLAMA_KVARN_K2V3_G128,     "kvarn_k2v3_g128", 2, 3, 128 },
-    { LLAMA_KVARN_K2V4_G128,     "kvarn_k2v4_g128", 2, 4, 128 },
-    { LLAMA_KVARN_K3V2_G128,     "kvarn_k3v2_g128", 3, 2, 128 },
-    { LLAMA_KVARN_K3V3_G128,     "kvarn_k3v3_g128", 3, 3, 128 },
-    { LLAMA_KVARN_K3V4_G128,     "kvarn_k3v4_g128", 3, 4, 128 },
-    { LLAMA_KVARN_K4V2_G128,     "kvarn_k4v2_g128", 4, 2, 128 },
-    { LLAMA_KVARN_K4V3_G128,     "kvarn_k4v3_g128", 4, 3, 128 },
-    { LLAMA_KVARN_K4V4_G128,     "kvarn_k4v4_g128", 4, 4, 128 },
+#define LLAMA_KVARN_DESC(KB, VB) { LLAMA_KVARN_K##KB##V##VB##_G128, "kvarn_k" #KB "v" #VB "_g128", KB, VB, 128 }
+
+static constexpr std::array<llama_kvarn_type_desc, LLAMA_KVARN_TYPE_COUNT> KVAR_N_TYPES = {{
+    { LLAMA_KVARN_TYPE_DISABLED, "off", 0, 0, 128 },
+
+    LLAMA_KVARN_DESC(2, 2),
+    LLAMA_KVARN_DESC(2, 3),
+    LLAMA_KVARN_DESC(2, 4),
+
+    LLAMA_KVARN_DESC(3, 2),
+    LLAMA_KVARN_DESC(3, 3),
+    LLAMA_KVARN_DESC(3, 4),
+
+    LLAMA_KVARN_DESC(4, 2),
+    LLAMA_KVARN_DESC(4, 3),
+    LLAMA_KVARN_DESC(4, 4),
+
+    LLAMA_KVARN_DESC(2, 5),
+    LLAMA_KVARN_DESC(2, 6),
+    LLAMA_KVARN_DESC(2, 8),
+
+    LLAMA_KVARN_DESC(3, 5),
+    LLAMA_KVARN_DESC(3, 6),
+    LLAMA_KVARN_DESC(3, 8),
+
+    LLAMA_KVARN_DESC(4, 5),
+    LLAMA_KVARN_DESC(4, 6),
+    LLAMA_KVARN_DESC(4, 8),
+
+    LLAMA_KVARN_DESC(5, 2),
+    LLAMA_KVARN_DESC(5, 3),
+    LLAMA_KVARN_DESC(5, 4),
+    LLAMA_KVARN_DESC(5, 5),
+    LLAMA_KVARN_DESC(5, 6),
+    LLAMA_KVARN_DESC(5, 8),
+
+    LLAMA_KVARN_DESC(6, 2),
+    LLAMA_KVARN_DESC(6, 3),
+    LLAMA_KVARN_DESC(6, 4),
+    LLAMA_KVARN_DESC(6, 5),
+    LLAMA_KVARN_DESC(6, 6),
+    LLAMA_KVARN_DESC(6, 8),
+
+    LLAMA_KVARN_DESC(8, 2),
+    LLAMA_KVARN_DESC(8, 3),
+    LLAMA_KVARN_DESC(8, 4),
+    LLAMA_KVARN_DESC(8, 5),
+    LLAMA_KVARN_DESC(8, 6),
+    LLAMA_KVARN_DESC(8, 8),
 }};
 
+#undef LLAMA_KVARN_DESC
+
 static bool llama_kvarn_valid_bits(int bits) {
-    return bits == 2 || bits == 3 || bits == 4;
+    return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8;
 }
 
 static size_t llama_kvarn_align_up(size_t value, size_t alignment) {
@@ -108,7 +148,7 @@ const char * llama_kvarn_validate_runtime(
         return "KVarN cache parameters do not match the selected preset";
     }
     if (!llama_kvarn_valid_bits(params.key_bits) || !llama_kvarn_valid_bits(params.value_bits)) {
-        return "KVarN supports only 2-, 3-, and 4-bit cache payloads";
+        return "KVarN supports only 2-, 3-, 4-, 5-, 6-, and 8-bit cache payloads";
     }
     if (params.group != 128) {
         return "KVarN currently requires a group size of 128 tokens";

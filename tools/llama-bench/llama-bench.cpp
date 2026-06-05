@@ -559,35 +559,20 @@ static int32_t kvarn_bits_from_cache_type(const std::string & value) {
     if (value == "kvarn4") {
         return 4;
     }
+    if (value == "kvarn5") {
+        return 5;
+    }
+    if (value == "kvarn6") {
+        return 6;
+    }
+    if (value == "kvarn8") {
+        return 8;
+    }
     return 0;
 }
 
 static llama_kvarn_type kvarn_type_from_bits(int32_t key_bits, int32_t value_bits) {
-    switch (key_bits) {
-        case 2:
-            switch (value_bits) {
-                case 2: return LLAMA_KVARN_K2V2_G128;
-                case 3: return LLAMA_KVARN_K2V3_G128;
-                case 4: return LLAMA_KVARN_K2V4_G128;
-            }
-            break;
-        case 3:
-            switch (value_bits) {
-                case 2: return LLAMA_KVARN_K3V2_G128;
-                case 3: return LLAMA_KVARN_K3V3_G128;
-                case 4: return LLAMA_KVARN_K3V4_G128;
-            }
-            break;
-        case 4:
-            switch (value_bits) {
-                case 2: return LLAMA_KVARN_K4V2_G128;
-                case 3: return LLAMA_KVARN_K4V3_G128;
-                case 4: return LLAMA_KVARN_K4V4_G128;
-            }
-            break;
-    }
-
-    return LLAMA_KVARN_TYPE_INVALID;
+    return llama_kvarn_type_from_name(string_format("kvarn_k%dv%d_g128", key_bits, value_bits).c_str());
 }
 
 static bench_cache_type bench_cache_type_from_name(const std::string & name) {

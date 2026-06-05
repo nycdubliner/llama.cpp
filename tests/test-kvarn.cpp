@@ -18,73 +18,49 @@ static void require(bool cond, const char * msg) {
 }
 
 static void test_type_table() {
-    struct expected_type {
-        const char * name;
-        llama_kvarn_type type;
-        int key_bits;
-        int value_bits;
-        int group;
-    };
+    const int supported_bits[] = { 2, 3, 4, 5, 6, 8 };
 
-    const expected_type expected[] = {
-        { "off",               LLAMA_KVARN_TYPE_DISABLED, 0, 0, 128 },
-        { "kvarn_k2v2_g128",   LLAMA_KVARN_K2V2_G128,     2, 2, 128 },
-        { "kvarn_k2v3_g128",   LLAMA_KVARN_K2V3_G128,     2, 3, 128 },
-        { "kvarn_k2v4_g128",   LLAMA_KVARN_K2V4_G128,     2, 4, 128 },
-        { "kvarn_k3v2_g128",   LLAMA_KVARN_K3V2_G128,     3, 2, 128 },
-        { "kvarn_k3v3_g128",   LLAMA_KVARN_K3V3_G128,     3, 3, 128 },
-        { "kvarn_k3v4_g128",   LLAMA_KVARN_K3V4_G128,     3, 4, 128 },
-        { "kvarn_k4v2_g128",   LLAMA_KVARN_K4V2_G128,     4, 2, 128 },
-        { "kvarn_k4v3_g128",   LLAMA_KVARN_K4V3_G128,     4, 3, 128 },
-        { "kvarn_k4v4_g128",   LLAMA_KVARN_K4V4_G128,     4, 4, 128 },
-    };
+    require(llama_kvarn_type_count() == 37, "unexpected KVarN type count");
 
-    require(llama_kvarn_type_count() == 10, "unexpected KVarN type count");
+    const llama_kvarn_type_desc * disabled = llama_kvarn_type_desc_from_name("off");
+    require(disabled != nullptr, "disabled type name did not parse");
+    require(disabled->type == LLAMA_KVARN_TYPE_DISABLED, "disabled type enum mismatch");
+    require(disabled->key_bits == 0 && disabled->value_bits == 0, "disabled bits mismatch");
+    require(disabled->group == 128, "disabled group mismatch");
 
-    for (const auto & exp : expected) {
-        const llama_kvarn_type_desc * desc = llama_kvarn_type_desc_from_name(exp.name);
-        require(desc != nullptr, "expected type name did not parse");
-        require(desc->type == exp.type, "parsed type enum mismatch");
-        require(desc->key_bits == exp.key_bits, "parsed key bits mismatch");
-        require(desc->value_bits == exp.value_bits, "parsed value bits mismatch");
-        require(desc->group == exp.group, "parsed group mismatch");
+    for (int key_bits : supported_bits) {
+        for (int value_bits : supported_bits) {
+            const std::string name = "kvarn_k" + std::to_string(key_bits) + "v" + std::to_string(value_bits) + "_g128";
+            const llama_kvarn_type_desc * desc = llama_kvarn_type_desc_from_name(name.c_str());
+            require(desc != nullptr, "expected type name did not parse");
+            require(desc->type != LLAMA_KVARN_TYPE_DISABLED && desc->type != LLAMA_KVARN_TYPE_INVALID, "parsed type enum mismatch");
+            require(desc->key_bits == key_bits, "parsed key bits mismatch");
+            require(desc->value_bits == value_bits, "parsed value bits mismatch");
+            require(desc->group == 128, "parsed group mismatch");
 
-        const llama_kvarn_type_desc * by_type = llama_kvarn_type_desc_from_type(exp.type);
-        require(by_type != nullptr, "expected enum did not map to descriptor");
-        require(std::string(by_type->name) == exp.name, "enum descriptor name mismatch");
+            const llama_kvarn_type_desc * by_type = llama_kvarn_type_desc_from_type(desc->type);
+            require(by_type != nullptr, "expected enum did not map to descriptor");
+            require(std::string(by_type->name) == name, "enum descriptor name mismatch");
+        }
     }
 
-    require(llama_kvarn_type_desc_from_name("kvarn_k5v2_g128") == nullptr, "invalid type parsed");
+    require(llama_kvarn_type_desc_from_name("kvarn_k7v2_g128") == nullptr, "invalid type parsed");
 }
 
 static void test_tile_layout() {
-    struct expected_layout {
-        llama_kvarn_type type;
-        size_t k_payload;
-        size_t v_payload;
-        size_t tile_bytes;
-    };
+    for (size_t i = 0; i < llama_kvarn_type_count(); ++i) {
+        const llama_kvarn_type type = (llama_kvarn_type) i;
+        if (type == LLAMA_KVARN_TYPE_DISABLED) {
+            continue;
+        }
 
-    const expected_layout expected[] = {
-        { LLAMA_KVARN_K2V2_G128, 4096, 4096,  9728 },
-        { LLAMA_KVARN_K2V3_G128, 4096, 6144, 11776 },
-        { LLAMA_KVARN_K2V4_G128, 4096, 8192, 13824 },
-        { LLAMA_KVARN_K3V2_G128, 6144, 4096, 11776 },
-        { LLAMA_KVARN_K3V3_G128, 6144, 6144, 13824 },
-        { LLAMA_KVARN_K3V4_G128, 6144, 8192, 15872 },
-        { LLAMA_KVARN_K4V2_G128, 8192, 4096, 13824 },
-        { LLAMA_KVARN_K4V3_G128, 8192, 6144, 15872 },
-        { LLAMA_KVARN_K4V4_G128, 8192, 8192, 17920 },
-    };
-
-    for (const auto & exp : expected) {
-        const llama_kvarn_type_desc * desc = llama_kvarn_type_desc_from_type(exp.type);
+        const llama_kvarn_type_desc * desc = llama_kvarn_type_desc_from_type(type);
         require(desc != nullptr, "layout type descriptor missing");
 
         const llama_kvarn_tile_layout layout = llama_kvarn_make_layout(128, 128, desc->key_bits, desc->value_bits);
-        require(layout.k_payload_bytes == exp.k_payload, "K payload bytes mismatch");
-        require(layout.v_payload_bytes == exp.v_payload, "V payload bytes mismatch");
-        require(layout.tile_bytes == exp.tile_bytes, "tile bytes mismatch");
+        require(layout.k_payload_bytes == size_t(2048 * desc->key_bits), "K payload bytes mismatch");
+        require(layout.v_payload_bytes == size_t(2048 * desc->value_bits), "V payload bytes mismatch");
+        require(layout.tile_bytes == size_t(2048 * (desc->key_bits + desc->value_bits) + 1536), "tile bytes mismatch");
         require(layout.k_s_col_off == layout.k_payload_off + layout.k_payload_bytes, "K scale offset mismatch");
         require(layout.v_payload_off == layout.k_s_row_off + 128 * sizeof(uint16_t), "V payload offset mismatch");
         require(layout.v_s_col_off == layout.v_payload_off + layout.v_payload_bytes, "V scale offset mismatch");
@@ -108,8 +84,13 @@ static void test_runtime_validation() {
     supported.n_seq_max = 1;
     supported.kv_unified = false;
 
-    for (int type = LLAMA_KVARN_K2V2_G128; type <= LLAMA_KVARN_K4V4_G128; ++type) {
-        const auto params = llama_kvarn_params_for_type((llama_kvarn_type) type);
+    for (size_t i = 0; i < llama_kvarn_type_count(); ++i) {
+        const llama_kvarn_type type = (llama_kvarn_type) i;
+        if (type == LLAMA_KVARN_TYPE_DISABLED) {
+            continue;
+        }
+
+        const auto params = llama_kvarn_params_for_type(type);
         require(llama_kvarn_validate_runtime(params, supported) == nullptr, "valid runtime rejected");
     }
 
@@ -236,7 +217,7 @@ static void test_tile_quantization(llama_kvarn_type type) {
         require(std::isfinite(v_dequant[i]), "V dequant produced non-finite value");
     }
 
-    const float max_rmse[] = { 0.0f, 0.0f, 0.40f, 0.22f, 0.12f };
+    const float max_rmse[] = { 0.0f, 0.0f, 0.40f, 0.22f, 0.12f, 0.08f, 0.05f, 0.0f, 0.025f };
     require(tile_rmse(k, k_dequant) < max_rmse[desc->key_bits], "K tile RMSE too high");
     require(tile_rmse(v, v_dequant) < max_rmse[desc->value_bits], "V tile RMSE too high");
 }
@@ -255,7 +236,7 @@ static ggml_backend_t init_test_backend(enum ggml_backend_dev_type device_type, 
     return backend;
 }
 
-static void test_cache_ops(enum ggml_backend_dev_type device_type, bool required) {
+static void test_cache_ops(enum ggml_backend_dev_type device_type, bool required, int bits) {
     ggml_backend_t backend = init_test_backend(device_type, required);
     if (backend == nullptr) {
         return;
@@ -269,7 +250,6 @@ static void test_cache_ops(enum ggml_backend_dev_type device_type, bool required
     ggml_context * ctx = ggml_init(params);
     require(ctx != nullptr, "failed to initialize ggml context");
 
-    constexpr int bits = 3;
     constexpr int n_tokens = 385;
     constexpr int n_heads = 1;
     const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
@@ -353,7 +333,7 @@ static void test_cache_ops(enum ggml_backend_dev_type device_type, bool required
     ggml_backend_free(backend);
 }
 
-static void test_cache_ops_multi_stream(enum ggml_backend_dev_type device_type, bool required) {
+static void test_cache_ops_multi_stream(enum ggml_backend_dev_type device_type, bool required, int bits) {
     ggml_backend_t backend = init_test_backend(device_type, required);
     if (backend == nullptr) {
         return;
@@ -367,7 +347,6 @@ static void test_cache_ops_multi_stream(enum ggml_backend_dev_type device_type, 
     ggml_context * ctx = ggml_init(params);
     require(ctx != nullptr, "failed to initialize ggml context");
 
-    constexpr int bits = 3;
     constexpr int n_stream = 2;
     constexpr int kv_size = 512;
     constexpr int n_groups_per_stream = kv_size / 128;
@@ -480,15 +459,24 @@ int main() {
     test_pack_roundtrip(2);
     test_pack_roundtrip(3);
     test_pack_roundtrip(4);
+    test_pack_roundtrip(5);
+    test_pack_roundtrip(6);
+    test_pack_roundtrip(8);
     test_hadamard_roundtrip();
 
-    for (int type = LLAMA_KVARN_K2V2_G128; type <= LLAMA_KVARN_K4V4_G128; ++type) {
-        test_tile_quantization((llama_kvarn_type) type);
+    for (size_t i = 0; i < llama_kvarn_type_count(); ++i) {
+        const llama_kvarn_type type = (llama_kvarn_type) i;
+        if (type != LLAMA_KVARN_TYPE_DISABLED) {
+            test_tile_quantization(type);
+        }
     }
-    test_cache_ops(GGML_BACKEND_DEVICE_TYPE_CPU, true);
-    test_cache_ops(GGML_BACKEND_DEVICE_TYPE_GPU, false);
-    test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_CPU, true);
-    test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+
+    for (int bits : { 3, 5, 6, 8 }) {
+        test_cache_ops(GGML_BACKEND_DEVICE_TYPE_CPU, true, bits);
+        test_cache_ops(GGML_BACKEND_DEVICE_TYPE_GPU, false, bits);
+    }
+    test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_CPU, true, 6);
+    test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_GPU, false, 6);
 
     std::printf("test-kvarn: all tests OK\n");
     return 0;

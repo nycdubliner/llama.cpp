@@ -6454,6 +6454,10 @@ struct ggml_tensor * ggml_turbo_wht(
 
 // ggml_kvarn_store
 
+static bool ggml_kvarn_valid_bits(int bits) {
+    return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8;
+}
+
 struct ggml_tensor * ggml_kvarn_store(
         struct ggml_context * ctx,
         struct ggml_tensor  * current,
@@ -6471,7 +6475,7 @@ struct ggml_tensor * ggml_kvarn_store(
     GGML_ASSERT(stage->ne[0] == 128 && stage->ne[2] % 384 == 0);
     GGML_ASSERT(current->ne[1] == stage->ne[1] && stage->ne[1] == records->ne[1]);
     GGML_ASSERT(current->ne[2] == indices->ne[0]);
-    GGML_ASSERT(bits >= 2 && bits <= 4 && sinkhorn_iters > 0);
+    GGML_ASSERT(ggml_kvarn_valid_bits(bits) && sinkhorn_iters > 0);
     const int64_t n_stream = stage->ne[2] / 384;
     GGML_ASSERT(n_stream > 0 && records->ne[2] % n_stream == 0);
 
@@ -6504,7 +6508,7 @@ struct ggml_tensor * ggml_kvarn_materialize(
     GGML_ASSERT(indices->type == GGML_TYPE_I64);
     GGML_ASSERT(stage_after_store->ne[0] == 128 && stage_after_store->ne[2] % 384 == 0);
     GGML_ASSERT(stage_after_store->ne[1] == records->ne[1]);
-    GGML_ASSERT(n_kv > 0 && bits >= 2 && bits <= 4);
+    GGML_ASSERT(n_kv > 0 && ggml_kvarn_valid_bits(bits));
     const int64_t n_total_stream = stage_after_store->ne[2] / 384;
     GGML_ASSERT(n_total_stream > 0 && records->ne[2] % n_total_stream == 0);
     GGML_ASSERT(stream_start >= 0 && n_stream > 0);

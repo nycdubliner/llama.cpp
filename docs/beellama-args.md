@@ -185,6 +185,7 @@ Accepted KV cache type names in the current parser include:
 | Floating | `f32`, `f16`, `bf16` |
 | Upstream quantized | `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1` |
 | Bee/Turbo lineage | `turbo2`, `turbo3`, `turbo4`, `turbo2_tcq`, `turbo3_tcq` |
+| Experimental KVarN pseudo types | `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, `kvarn8` |
 
 Bee fork cache storage:
 
@@ -203,6 +204,8 @@ For current long-context Qwen and Gemma DFlash serving, the common asymmetric ch
 ```
 
 Do not assume enum compatibility with TheTom's public TurboQuant fork. Bee uses the buun enum order for Turbo/TCQ cache types while keeping a 128-value `turbo3` block. Bee keeps TCQ cache IDs at `45` and `46`; Tom's `TQ3_1S` and `TQ4_1S` model weight formats use new GGML type IDs `47` and `48`.
+
+KVarN pseudo types are accepted only on the target `--cache-type-k` / `--cache-type-v` path. Draft cache arguments intentionally reject them. If only one side is specified, Bee mirrors that KVarN bit width to the other side; all K/V pairs over `2`, `3`, `4`, `5`, `6`, and `8` bits are selectable. KVarN still requires a supported attention/cache path, non-unified KV streams, 128-slice-compatible key/value head dimensions, and backend native KVarN ops unless `--kv-kvarn-fallback` is enabled.
 
 ## Model Weight Quantization
 

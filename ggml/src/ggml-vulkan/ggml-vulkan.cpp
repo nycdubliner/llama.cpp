@@ -3600,6 +3600,10 @@ static bool ggml_vk_kvarn_limits_supported(const vk_device& device) {
            device->properties.limits.maxComputeSharedMemorySize >= 4096;
 }
 
+static bool ggml_vk_kvarn_valid_bits(int bits) {
+    return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8;
+}
+
 // load_shaders walks the pipeline list under compile_mutex and either claims
 // the requested pipeline for compilation or, if another thread is already
 // compiling it, drops the lock and waits on compile_cv. Compiles themselves
@@ -9006,6 +9010,7 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
     const int bits = ggml_get_op_params_i32(dst, 0);
     const int iterations = ggml_get_op_params_i32(dst, 1);
     const bool value = ggml_get_op_params_i32(dst, 2) != 0;
+    GGML_ASSERT(ggml_vk_kvarn_valid_bits(bits));
     const int n_stream = (int) (stage->ne[2] / 384);
     const int groups_per_stream = (int) (records->ne[2] / n_stream);
 
@@ -9047,6 +9052,7 @@ static void ggml_vk_kvarn_materialize(ggml_backend_vk_context * ctx, vk_context&
     const bool value = ggml_get_op_params_i32(dst, 1) != 0;
     const int stream_start = ggml_get_op_params_i32(dst, 2);
     const int n_stream = ggml_get_op_params_i32(dst, 3);
+    GGML_ASSERT(ggml_vk_kvarn_valid_bits(bits));
     const int n_total_stream = (int) (stage->ne[2] / 384);
     const int groups_per_stream = (int) (records->ne[2] / n_total_stream);
 
@@ -16958,6 +16964,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 ggml_is_contiguous(op->src[1]) &&
                 ggml_is_contiguous(op->src[2]) &&
                 ggml_is_contiguous(op->src[3]) &&
+                ggml_vk_kvarn_valid_bits(ggml_get_op_params_i32(op, 0)) &&
                 op->src[0]->ne[0] == 128 &&
                 op->src[2]->ne[0] == 128 &&
                 op->src[2]->ne[2] % 384 == 0 &&
@@ -16971,6 +16978,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 ggml_is_contiguous(op->src[0]) &&
                 ggml_is_contiguous(op->src[1]) &&
                 ggml_is_contiguous(op->src[2]) &&
+                ggml_vk_kvarn_valid_bits(ggml_get_op_params_i32(op, 0)) &&
                 op->src[0]->ne[0] % 4 == 0 &&
                 op->src[1]->ne[0] == 128 &&
                 op->src[1]->ne[2] % 384 == 0;
