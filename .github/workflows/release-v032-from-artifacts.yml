@@ -180,17 +180,15 @@ jobs:
                 continue
               fi
 
-              artifact_file="$(
-                find "${download_dir}" -type f \( -name "${expected_file}" -o -name "${artifact_name}" \) | head -n 1
-              )"
+              artifact_file="$(find "${download_dir}" -type f | head -n 1)"
               if [[ -z "${artifact_file}" ]]; then
-                echo "Run ${run_id} artifact ${artifact_name} did not contain ${expected_file}."
+                echo "Run ${run_id} artifact ${artifact_name} did not contain any files."
                 continue
               fi
 
               cp "${artifact_file}" "artifact/${expected_file}"
               run_head_sha="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" --jq '.head_sha')"
-              printf '%s\t%s\t%s\t%s\n' "${expected_file}" "${artifact_name}" "${run_id}" "${run_head_sha}" >> recovery/artifact-provenance.tsv
+              printf '%s\t%s\t%s\t%s\t%s\n' "${expected_file}" "$(basename "${artifact_file}")" "${artifact_name}" "${run_id}" "${run_head_sha}" >> recovery/artifact-provenance.tsv
               found="true"
               break
             done
@@ -239,6 +237,21 @@ jobs:
           done
 
           for tar_file in artifact/*.tar.gz; do
+            real_tar_file="$(realpath "${tar_file}")"
+            repack_dir="$(mktemp -d)"
+            tar -xzf "${real_tar_file}" -C "${repack_dir}"
+            mapfile -t top_entries < <(find "${repack_dir}" -mindepth 1 -maxdepth 1 | sort)
+            if [[ "${#top_entries[@]}" -ne 1 || ! -d "${top_entries[0]}" ]]; then
+              echo "${tar_file} does not contain exactly one top-level directory." >&2
+              exit 1
+            fi
+            top_dir="${top_entries[0]}"
+            normalized_dir="${repack_dir}/beellama-${TAG_NAME}"
+            if [[ "${top_dir}" != "${normalized_dir}" ]]; then
+              mv "${top_dir}" "${normalized_dir}"
+            fi
+            tar -czf "${real_tar_file}" -C "${repack_dir}" "beellama-${TAG_NAME}"
+            rm -rf "${repack_dir}"
             mv "${tar_file}" release/
           done
 
