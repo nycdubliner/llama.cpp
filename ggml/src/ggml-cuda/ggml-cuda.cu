@@ -5285,6 +5285,29 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
     return ggml_backend_cuda_host_buffer_type();
 }
 
+static bool ggml_backend_cuda_kvarn_native_ops(ggml_backend_dev_t dev) {
+#if defined(GGML_USE_MUSA)
+    GGML_UNUSED(dev);
+    return false;
+#else
+    if (dev == nullptr || dev->context == nullptr) {
+        return false;
+    }
+
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    const int device = dev_ctx->device;
+    const auto & info = ggml_cuda_info();
+    if (device < 0 || device >= info.device_count) {
+        return false;
+    }
+
+    const size_t high_shared = ggml_cuda_kvarn_required_shared_bytes();
+    const size_t low_shared = ggml_cuda_kvarn_low_shared_bytes();
+    GGML_ASSERT(low_shared <= high_shared);
+    return info.devices[device].smpbo >= low_shared;
+#endif
+}
+
 // TODO: move these functions here
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
@@ -5689,7 +5712,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TURBO_WHT:
         case GGML_OP_KVARN_STORE:
         case GGML_OP_KVARN_MATERIALIZE:
-            return true;
+            return ggml_backend_cuda_kvarn_native_ops(dev);
 
         default:
             return false;
@@ -5902,6 +5925,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_native_ops") == 0) {
+        return (void *)ggml_backend_cuda_kvarn_native_ops;
     }
     if (strcmp(name, "dflash_cross_ring_gpu_alloc") == 0) {
         return (void *)dflash_cross_ring_gpu_alloc;

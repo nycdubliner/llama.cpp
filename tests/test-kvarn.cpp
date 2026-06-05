@@ -241,12 +241,25 @@ static void test_tile_quantization(llama_kvarn_type type) {
     require(tile_rmse(v, v_dequant) < max_rmse[desc->value_bits], "V tile RMSE too high");
 }
 
-static void test_cache_ops(enum ggml_backend_dev_type device_type, bool required) {
-    ggml_backend_t backend = ggml_backend_init_by_type(device_type, nullptr);
+static ggml_backend_t init_test_backend(enum ggml_backend_dev_type device_type, bool required) {
+    const char * backend_name = std::getenv("GGML_KVARN_TEST_BACKEND");
+    const bool use_named_gpu = backend_name != nullptr && backend_name[0] != '\0' && device_type == GGML_BACKEND_DEVICE_TYPE_GPU;
+
+    ggml_backend_t backend = use_named_gpu ?
+        ggml_backend_init_by_name(backend_name, nullptr) :
+        ggml_backend_init_by_type(device_type, nullptr);
     if (backend == nullptr && !required) {
+        return nullptr;
+    }
+    require(backend != nullptr, use_named_gpu ? "failed to initialize GGML_KVARN_TEST_BACKEND" : "failed to initialize requested backend");
+    return backend;
+}
+
+static void test_cache_ops(enum ggml_backend_dev_type device_type, bool required) {
+    ggml_backend_t backend = init_test_backend(device_type, required);
+    if (backend == nullptr) {
         return;
     }
-    require(backend != nullptr, "failed to initialize requested backend");
 
     ggml_init_params params = {
         /*.mem_size   =*/ 4 * 1024 * 1024,
@@ -341,11 +354,10 @@ static void test_cache_ops(enum ggml_backend_dev_type device_type, bool required
 }
 
 static void test_cache_ops_multi_stream(enum ggml_backend_dev_type device_type, bool required) {
-    ggml_backend_t backend = ggml_backend_init_by_type(device_type, nullptr);
-    if (backend == nullptr && !required) {
+    ggml_backend_t backend = init_test_backend(device_type, required);
+    if (backend == nullptr) {
         return;
     }
-    require(backend != nullptr, "failed to initialize requested backend");
 
     ggml_init_params params = {
         /*.mem_size   =*/ 8 * 1024 * 1024,

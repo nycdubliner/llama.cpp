@@ -873,6 +873,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_fwht_f32[4];
+    vk_pipeline pipeline_kvarn_store;
+    vk_pipeline pipeline_kvarn_materialize;
     vk_pipeline pipeline_cumsum_f32;
     vk_pipeline pipeline_cumsum_small_f32;
     vk_pipeline pipeline_cumsum_multipass1_f32;
@@ -1169,6 +1171,31 @@ struct vk_op_fwht_push_constants {
     uint32_t dst_offset;
     float scale;
 };
+
+struct vk_op_kvarn_store_push_constants {
+    uint32_t n_heads;
+    uint32_t n_tokens;
+    uint32_t n_stream;
+    uint32_t groups_per_stream;
+    uint32_t record_words;
+    uint32_t bits;
+    uint32_t iterations;
+    uint32_t value;
+};
+static_assert(sizeof(vk_op_kvarn_store_push_constants) <= 128, "sizeof(vk_op_kvarn_store_push_constants) must be <= 128");
+
+struct vk_op_kvarn_materialize_push_constants {
+    uint32_t n_heads;
+    uint32_t n_kv;
+    uint32_t stream_start;
+    uint32_t n_stream;
+    uint32_t groups_per_stream;
+    uint32_t record_words;
+    uint32_t bits;
+    uint32_t value;
+    uint32_t n_indices;
+};
+static_assert(sizeof(vk_op_kvarn_materialize_push_constants) <= 128, "sizeof(vk_op_kvarn_materialize_push_constants) must be <= 128");
 
 struct vk_op_count_experts_push_constants {
     uint32_t ne00;
@@ -3568,6 +3595,11 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
 #endif
 }
 
+static bool ggml_vk_kvarn_limits_supported(const vk_device& device) {
+    return device->properties.limits.maxComputeWorkGroupInvocations >= 128 &&
+           device->properties.limits.maxComputeSharedMemorySize >= 4096;
+}
+
 // load_shaders walks the pipeline list under compile_mutex and either claims
 // the requested pipeline for compilation or, if another thread is already
 // compiling it, drops the lock and waits on compile_cv. Compiles themselves
@@ -5084,6 +5116,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
             ++idx;
         }
+    }
+
+    if (ggml_vk_kvarn_limits_supported(device)) {
+        ggml_vk_create_pipeline(device, device->pipeline_kvarn_store, "kvarn_store", kvarn_store_len, kvarn_store_data, "main", 4, sizeof(vk_op_kvarn_store_push_constants), {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_kvarn_materialize, "kvarn_materialize", kvarn_materialize_len, kvarn_materialize_data, "main", 4, sizeof(vk_op_kvarn_materialize_push_constants), {1, 1, 1}, {}, 1);
     }
 
     const uint32_t cumsum_elem_per_thread = (device->vendor_id == VK_VENDOR_ID_AMD || device->vendor_id == VK_VENDOR_ID_INTEL) ? 2 : 4;
@@ -8949,6 +8986,90 @@ static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     init_pushconst_tensor_offsets(ctx, pc, src, nullptr, nullptr, nullptr, dst);
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, { workgroups_x, 1, 1 });
+}
+
+static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * current = dst->src[0];
+    const ggml_tensor * indices = dst->src[1];
+    ggml_tensor * stage = dst->src[2];
+    ggml_tensor * records = dst->src[3];
+    GGML_ASSERT(ggml_is_contiguous(current));
+    GGML_ASSERT(ggml_is_contiguous(indices));
+    GGML_ASSERT(ggml_is_contiguous(stage));
+    GGML_ASSERT(ggml_is_contiguous(records));
+    GGML_ASSERT(records->ne[0] % 4 == 0);
+
+    vk_pipeline pipeline = ctx->device->pipeline_kvarn_store;
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const int bits = ggml_get_op_params_i32(dst, 0);
+    const int iterations = ggml_get_op_params_i32(dst, 1);
+    const bool value = ggml_get_op_params_i32(dst, 2) != 0;
+    const int n_stream = (int) (stage->ne[2] / 384);
+    const int groups_per_stream = (int) (records->ne[2] / n_stream);
+
+    vk_op_kvarn_store_push_constants pc = {
+        (uint32_t) current->ne[1],
+        (uint32_t) current->ne[2],
+        (uint32_t) n_stream,
+        (uint32_t) groups_per_stream,
+        (uint32_t) (records->ne[0] / 4),
+        (uint32_t) bits,
+        (uint32_t) iterations,
+        value ? 1u : 0u,
+    };
+
+    const vk_subbuffer current_buf = ggml_vk_tensor_subbuffer(ctx, current);
+    const vk_subbuffer indices_buf = ggml_vk_tensor_subbuffer(ctx, indices);
+    const vk_subbuffer stage_buf = ggml_vk_tensor_subbuffer(ctx, stage);
+    const vk_subbuffer records_buf = ggml_vk_tensor_subbuffer(ctx, records);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { current_buf, indices_buf, stage_buf, records_buf }, pc, { pc.n_heads, 1, 1 });
+}
+
+static void ggml_vk_kvarn_materialize(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * records = dst->src[0];
+    const ggml_tensor * stage = dst->src[1];
+    const ggml_tensor * indices = dst->src[2];
+    GGML_ASSERT(ggml_is_contiguous(records));
+    GGML_ASSERT(ggml_is_contiguous(stage));
+    GGML_ASSERT(ggml_is_contiguous(indices));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(records->ne[0] % 4 == 0);
+
+    vk_pipeline pipeline = ctx->device->pipeline_kvarn_materialize;
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const int bits = ggml_get_op_params_i32(dst, 0);
+    const bool value = ggml_get_op_params_i32(dst, 1) != 0;
+    const int stream_start = ggml_get_op_params_i32(dst, 2);
+    const int n_stream = ggml_get_op_params_i32(dst, 3);
+    const int n_total_stream = (int) (stage->ne[2] / 384);
+    const int groups_per_stream = (int) (records->ne[2] / n_total_stream);
+
+    vk_op_kvarn_materialize_push_constants pc = {
+        (uint32_t) dst->ne[1],
+        (uint32_t) dst->ne[2],
+        (uint32_t) stream_start,
+        (uint32_t) n_stream,
+        (uint32_t) groups_per_stream,
+        (uint32_t) (records->ne[0] / 4),
+        (uint32_t) bits,
+        value ? 1u : 0u,
+        (uint32_t) indices->ne[0],
+    };
+
+    const vk_subbuffer records_buf = ggml_vk_tensor_subbuffer(ctx, records);
+    const vk_subbuffer stage_buf = ggml_vk_tensor_subbuffer(ctx, stage);
+    const vk_subbuffer indices_buf = ggml_vk_tensor_subbuffer(ctx, indices);
+    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    const uint32_t blocks = (uint32_t) (dst->ne[3] * dst->ne[2] * dst->ne[1]);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { records_buf, stage_buf, indices_buf, dst_buf }, pc, { blocks, 1, 1 });
 }
 
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -14112,6 +14233,14 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_count_equal(ctx, compute_ctx, src0, src1, node);
 
         break;
+    case GGML_OP_KVARN_STORE:
+        ggml_vk_kvarn_store(ctx, compute_ctx, node);
+
+        break;
+    case GGML_OP_KVARN_MATERIALIZE:
+        ggml_vk_kvarn_materialize(ctx, compute_ctx, node);
+
+        break;
     case GGML_OP_SOLVE_TRI:
         ggml_vk_solve_tri(ctx, compute_ctx, src0, src1, node);
 
@@ -16361,6 +16490,16 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
     return ggml_backend_vk_init(ctx->device);
 }
 
+static bool ggml_backend_vk_kvarn_native_ops(ggml_backend_dev_t dev) {
+    if (dev == nullptr || dev->context == nullptr) {
+        return false;
+    }
+
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+    const vk_device& device = ggml_vk_get_device(ctx->device);
+    return ggml_vk_kvarn_limits_supported(device);
+}
+
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
@@ -16808,6 +16947,33 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_COUNT_EQUAL:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_I32
                 && ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_I32;
+        case GGML_OP_KVARN_STORE:
+            return ggml_backend_vk_kvarn_native_ops(dev) &&
+                op->type == GGML_TYPE_F16 &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_I64 &&
+                op->src[2]->type == GGML_TYPE_F16 &&
+                op->src[3]->type == GGML_TYPE_I8 &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op->src[2]) &&
+                ggml_is_contiguous(op->src[3]) &&
+                op->src[0]->ne[0] == 128 &&
+                op->src[2]->ne[0] == 128 &&
+                op->src[2]->ne[2] % 384 == 0 &&
+                op->src[3]->ne[0] % 4 == 0;
+        case GGML_OP_KVARN_MATERIALIZE:
+            return ggml_backend_vk_kvarn_native_ops(dev) &&
+                op->type == GGML_TYPE_F16 &&
+                op->src[0]->type == GGML_TYPE_I8 &&
+                op->src[1]->type == GGML_TYPE_F16 &&
+                op->src[2]->type == GGML_TYPE_I64 &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op->src[2]) &&
+                op->src[0]->ne[0] % 4 == 0 &&
+                op->src[1]->ne[0] == 128 &&
+                op->src[1]->ne[2] % 384 == 0;
         case GGML_OP_IM2COL:
             return ggml_is_contiguous(op->src[1])
                 && op->src[1]->type == GGML_TYPE_F32
@@ -17112,11 +17278,19 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    UNUSED(reg);
+    if (strcmp(name, "ggml_backend_kvarn_native_ops") == 0) {
+        return (void *) ggml_backend_vk_kvarn_native_ops;
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

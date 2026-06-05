@@ -135,6 +135,7 @@ int main(int argc, char ** argv) {
     const std::string cuda_ring = read_file(root + "/ggml/src/ggml-cuda/cross-ring-interleave.cu");
     const std::string cuda_cpp = read_file(root + "/ggml/src/ggml-cuda/ggml-cuda.cu");
     const std::string ggml_cuda_kvarn = read_file(root + "/ggml/src/ggml-cuda/kvarn.cu");
+    const std::string ggml_cuda_kvarn_h = read_file(root + "/ggml/src/ggml-cuda/kvarn.cuh");
     const std::string cuda_argmax = read_file(root + "/ggml/src/ggml-cuda/argmax.cu");
     const std::string cuda_gdn = read_file(root + "/ggml/src/ggml-cuda/gated_delta_net.cu");
     const std::string cuda_reg = read_file(root + "/ggml/src/ggml-cuda/ggml-cuda.cu");
@@ -161,6 +162,10 @@ int main(int argc, char ** argv) {
     const std::string cuda_fattn_vec_q8_0_q6_0 = read_file_optional(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-q6_0.cu");
     const std::string cuda_template_generator = read_file(root + "/ggml/src/ggml-cuda/template-instances/generate_cu_files.py");
     const std::string metal = read_file(root + "/ggml/src/ggml-metal/ggml-metal.metal");
+    const std::string vulkan_cpp = read_file(root + "/ggml/src/ggml-vulkan/ggml-vulkan.cpp");
+    const std::string vulkan_shader_gen = read_file(root + "/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp");
+    const std::string vulkan_kvarn_store = read_file(root + "/ggml/src/ggml-vulkan/vulkan-shaders/kvarn_store.comp");
+    const std::string vulkan_kvarn_materialize = read_file(root + "/ggml/src/ggml-vulkan/vulkan-shaders/kvarn_materialize.comp");
 
     ok &= expect(dflash_profile_parse_env(nullptr) == 0, "DFlash profile parser must treat missing env as disabled");
     ok &= expect(dflash_profile_parse_env("0") == 0, "DFlash profile parser must treat 0 as disabled");
@@ -2231,11 +2236,37 @@ int main(int argc, char ** argv) {
                  kv_cache_kvarn_cpp.find("llama_synchronize(lctx)") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("copy_kvarn_stream") != std::string::npos,
         "KVarN cross-stream seq_cp must be queued and copied during synchronized update");
-    ok &= expect(kv_cache_kvarn_cpp.find("std::strstr(name, \"CUDA\")") != std::string::npos &&
+    ok &= expect(kv_cache_kvarn_cpp.find("ggml_backend_kvarn_native_ops") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("ggml_backend_reg_get_proc_address") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("std::strstr(name, \"CUDA\")") == std::string::npos &&
                  kv_cache_kvarn_cpp.find("std::strstr(name, \"ROCm\")") == std::string::npos &&
                  kv_cache_kvarn_cpp.find("std::strstr(name, \"HIP\")") == std::string::npos &&
-                 kv_cache_kvarn_cpp.find("std::strstr(name, \"MUSA\")") == std::string::npos,
-        "KVarN must fail closed on unverified GPU backends instead of accepting broad backend-name matches");
+                 kv_cache_kvarn_cpp.find("std::strstr(name, \"Vulkan\")") == std::string::npos,
+        "KVarN backend support must use a backend capability proc-address hook, not registry-name substring matching");
+    ok &= expect(cuda_reg.find("ggml_backend_kvarn_native_ops") != std::string::npos &&
+                 cuda_reg.find("ggml_backend_cuda_kvarn_native_ops") != std::string::npos &&
+                 cuda_reg.find("ggml_cuda_kvarn_required_shared_bytes()") != std::string::npos &&
+                 cuda_reg.find("GGML_USE_MUSA") != std::string::npos,
+        "CUDA/HIP backend registry must expose a KVarN native-op capability hook and keep MUSA disabled");
+    ok &= expect(vulkan_cpp.find("pipeline_kvarn_store") != std::string::npos &&
+                 vulkan_cpp.find("pipeline_kvarn_materialize") != std::string::npos &&
+                 vulkan_cpp.find("ggml_backend_vk_kvarn_native_ops") != std::string::npos &&
+                 vulkan_cpp.find("ggml_backend_kvarn_native_ops") != std::string::npos &&
+                 vulkan_cpp.find("GGML_OP_KVARN_STORE") != std::string::npos &&
+                 vulkan_cpp.find("GGML_OP_KVARN_MATERIALIZE") != std::string::npos &&
+                 vulkan_cpp.find("ggml_vk_kvarn_store") != std::string::npos &&
+                 vulkan_cpp.find("ggml_vk_kvarn_materialize") != std::string::npos &&
+                 vulkan_cpp.find("get_proc_address = */ ggml_backend_vk_reg_get_proc_address") != std::string::npos,
+        "Vulkan backend must expose real KVarN pipelines, dispatch, support checks, and capability hook");
+    ok &= expect(vulkan_shader_gen.find("kvarn_store.comp") != std::string::npos &&
+                 vulkan_shader_gen.find("kvarn_materialize.comp") != std::string::npos &&
+                 vulkan_kvarn_store.find("layout(local_size_x = 128") != std::string::npos &&
+                 vulkan_kvarn_store.find("packHalf2x16") != std::string::npos &&
+                 vulkan_kvarn_store.find("data_records") != std::string::npos &&
+                 vulkan_kvarn_materialize.find("layout(local_size_x = 128") != std::string::npos &&
+                 vulkan_kvarn_materialize.find("unpackHalf2x16") != std::string::npos &&
+                 vulkan_kvarn_materialize.find("compute_live_group") != std::string::npos,
+        "Vulkan KVarN shaders must be generated and preserve packed F16/record materialization semantics");
     ok &= expect(llama_kvarn_h.find("LLAMA_API") == std::string::npos,
         "internal C++ KVarN helper declarations must not be exported from the public DLL ABI");
     ok &= expect(kv_cache_iswa_cpp.find("KVarN enabled for non-SWA layers; SWA layers use compact normal KV cache") != std::string::npos &&
@@ -2257,6 +2288,12 @@ int main(int argc, char ** argv) {
                  ggml_cuda_kvarn.find("ggml_cuda_pool_alloc<int> live_groups") != std::string::npos &&
                  ggml_cuda_kvarn.find("live_groups[out_stream]") != std::string::npos,
         "CUDA KVarN materialization must precompute live groups once per stream instead of scanning indices inside every output block");
+    ok &= expect(ggml_cuda_kvarn_h.find("ggml_cuda_kvarn_required_shared_bytes") != std::string::npos &&
+                 ggml_cuda_kvarn.find("KVAR_N_LOWSHMEM_BYTES") != std::string::npos &&
+                 ggml_cuda_kvarn.find("kvarn_store_kernel_hishmem") != std::string::npos &&
+                 ggml_cuda_kvarn.find("kvarn_store_kernel_lowshmem") != std::string::npos &&
+                 ggml_cuda_kvarn.find("GGML_KVARN_FORCE_LOW_SHMEM") != std::string::npos,
+        "CUDA/HIP KVarN store must keep the high-shared-memory path and provide a force-testable low-shared-memory path");
 
     return ok ? 0 : 1;
 }
