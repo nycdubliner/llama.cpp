@@ -210,10 +210,10 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-macos-arm64
+          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-macos-arm64
           restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-macos-arm64-
-            release-macos-arm64-
+            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-macos-arm64-
+            ccache-release-macos-arm64-
           append-timestamp: false
           save: false
           evict-old-files: 1d
@@ -290,10 +290,10 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-${{ matrix.os }}-cpu
+          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-${{ matrix.os }}-cpu
           restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-${{ matrix.os }}-cpu-
-            release-${{ matrix.os }}-cpu-
+            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-${{ matrix.os }}-cpu-
+            ccache-release-${{ matrix.os }}-cpu-
           append-timestamp: false
           save: false
           evict-old-files: 1d
@@ -375,10 +375,10 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-vulkan-x64
+          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-vulkan-x64
           restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-vulkan-x64-
-            release-ubuntu-vulkan-x64-
+            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-vulkan-x64-
+            ccache-release-ubuntu-vulkan-x64-
           append-timestamp: false
           save: false
           evict-old-files: 1d
@@ -463,10 +463,10 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64
+          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64
           restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64-
-            release-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64-
+            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64-
+            ccache-release-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64-
           append-timestamp: false
           save: false
           evict-old-files: 1d
@@ -580,10 +580,10 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
+          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
           restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
-            release-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
+            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
+            ccache-release-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
           append-timestamp: false
           save: false
           evict-old-files: 1d
@@ -697,10 +697,10 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-cuda-${{ matrix.cuda }}-x64
+          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-cuda-${{ matrix.cuda }}-x64
           restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-cuda-${{ matrix.cuda }}-x64-
-            release-ubuntu-cuda-${{ matrix.cuda }}-x64-
+            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-cuda-${{ matrix.cuda }}-x64-
+            ccache-release-ubuntu-cuda-${{ matrix.cuda }}-x64-
           append-timestamp: false
           save: false
           evict-old-files: 1d
@@ -774,10 +774,10 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cpu-x64
+          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cpu-x64
           restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cpu-x64-
-            release-windows-cpu-x64-
+            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cpu-x64-
+            ccache-release-windows-cpu-x64-
           append-timestamp: false
           save: false
           variant: ccache
@@ -878,10 +878,10 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
+          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
           restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
-            release-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
+            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
+            ccache-release-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
           append-timestamp: false
           save: false
           variant: ccache
@@ -1006,10 +1006,10 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
+          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
           restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64-
-            release-windows-vulkan-${{ env.VULKAN_VERSION }}-x64-
+            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64-
+            ccache-release-windows-vulkan-${{ env.VULKAN_VERSION }}-x64-
           append-timestamp: false
           save: false
           variant: ccache
@@ -1081,10 +1081,10 @@ jobs:
       - name: Install ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cuda-${{ matrix.cuda }}
+          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cuda-${{ matrix.cuda }}
           restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cuda-${{ matrix.cuda }}-
-            release-windows-cuda-${{ matrix.cuda }}-
+            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cuda-${{ matrix.cuda }}-
+            ccache-release-windows-cuda-${{ matrix.cuda }}-
           append-timestamp: false
           save: false
           variant: ccache
@@ -1208,10 +1208,10 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64
+          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64
           restore-keys: |
-            release-${{ needs.release-meta.outputs.ccache_ref }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64-
-            release-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64-
+            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64-
+            ccache-release-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64-
           append-timestamp: false
           save: false
           evict-old-files: 1d
