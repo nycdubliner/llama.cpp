@@ -1415,22 +1415,37 @@ json convert_responses_to_chatcmpl(const json & response_body) {
             throw std::invalid_argument("'tools' must be an array of objects");
         }
         std::vector<json> chatcmpl_tools;
+        int tool_idx = 0;
         for (json resp_tool : response_body.at("tools")) {
             json chatcmpl_tool;
 
             const std::string tool_type = json_value(resp_tool, "type", std::string());
-            if (!tool_type.empty()) {
-                const bool looks_like_function_tool =
-                    resp_tool.contains("name") &&
-                    (resp_tool.contains("parameters") || resp_tool.contains("input_schema"));
-                if (tool_type != "function" && !looks_like_function_tool) {
-                    throw std::invalid_argument("'type' of tool must be 'function'");
-                }
+            if (tool_type == "function") {
+                resp_tool.erase("type");
+            } else if (!tool_type.empty()) {
+                // Codex/OpenAI Responses clients may send hosted/custom tool types
+                // that are not legal Chat Completions tools. Do not fail the whole
+                // request; normalize any schema-bearing tool into a function tool and
+                // provide a harmless placeholder schema otherwise.
                 resp_tool.erase("type");
             }
             if (resp_tool.contains("input_schema") && !resp_tool.contains("parameters")) {
                 resp_tool["parameters"] = resp_tool.at("input_schema");
                 resp_tool.erase("input_schema");
+            }
+            if (!resp_tool.contains("name")) {
+                resp_tool["name"] = tool_type.empty()
+                    ? string_format("tool_%d", tool_idx)
+                    : string_format("%s_%d", tool_type.c_str(), tool_idx);
+            }
+            if (!resp_tool.contains("description")) {
+                resp_tool["description"] = "Converted Responses API tool";
+            }
+            if (!resp_tool.contains("parameters")) {
+                resp_tool["parameters"] = json {
+                    {"type", "object"},
+                    {"properties", json::object()},
+                };
             }
             chatcmpl_tool["type"] = "function";
 
@@ -1439,6 +1454,7 @@ json convert_responses_to_chatcmpl(const json & response_body) {
             }
             chatcmpl_tool["function"] = resp_tool;
             chatcmpl_tools.push_back(chatcmpl_tool);
+            tool_idx++;
         }
         chatcmpl_body.erase("tools");
         chatcmpl_body["tools"] = chatcmpl_tools;
