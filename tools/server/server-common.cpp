@@ -1419,10 +1419,18 @@ json convert_responses_to_chatcmpl(const json & response_body) {
             json chatcmpl_tool;
 
             const std::string tool_type = json_value(resp_tool, "type", std::string());
-            if (tool_type == "function") {
+            if (!tool_type.empty()) {
+                const bool looks_like_function_tool =
+                    resp_tool.contains("name") &&
+                    (resp_tool.contains("parameters") || resp_tool.contains("input_schema"));
+                if (tool_type != "function" && !looks_like_function_tool) {
+                    throw std::invalid_argument("'type' of tool must be 'function'");
+                }
                 resp_tool.erase("type");
-            } else if (!tool_type.empty()) {
-                throw std::invalid_argument("'type' of tool must be 'function'");
+            }
+            if (resp_tool.contains("input_schema") && !resp_tool.contains("parameters")) {
+                resp_tool["parameters"] = resp_tool.at("input_schema");
+                resp_tool.erase("input_schema");
             }
             chatcmpl_tool["type"] = "function";
 
