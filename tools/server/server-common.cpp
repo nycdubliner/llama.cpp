@@ -1418,10 +1418,12 @@ json convert_responses_to_chatcmpl(const json & response_body) {
         for (json resp_tool : response_body.at("tools")) {
             json chatcmpl_tool;
 
-            if (json_value(resp_tool, "type", std::string()) != "function") {
+            const std::string tool_type = json_value(resp_tool, "type", std::string());
+            if (tool_type == "function") {
+                resp_tool.erase("type");
+            } else if (!tool_type.empty()) {
                 throw std::invalid_argument("'type' of tool must be 'function'");
             }
-            resp_tool.erase("type");
             chatcmpl_tool["type"] = "function";
 
             if (!resp_tool.contains("strict")) {
