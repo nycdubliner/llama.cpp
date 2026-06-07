@@ -200,9 +200,15 @@ public:
 
     bool empty() const { return tokens.empty(); }
 
+    void set_has_mtmd(bool value) {
+        GGML_ASSERT(tokens.empty() && map_idx_to_media.empty());
+        has_mtmd = value;
+    }
+
     void clear() {
         map_idx_to_media.clear();
         tokens.clear();
+        has_mtmd = false;
     }
 
     void keep_first(size_t n);

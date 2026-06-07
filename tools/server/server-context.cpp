@@ -912,7 +912,11 @@ private:
             slot.ctx_seq_rm_type = ctx_seq_rm_global;
 
             slot.mctx                   = mctx;
-            slot.prompt.tokens.has_mtmd = mctx != nullptr;
+            // A slot may be attached to a multimodal-capable server, but the
+            // current prompt is only multimodal if it actually contains media
+            // chunks. Setting this true at slot init disables MTP/NextN even
+            // for text-only turns when --mmproj is loaded.
+            slot.prompt.tokens.has_mtmd = false;
 
             // try speculative decoding
             if (can_spec) {
@@ -2340,6 +2344,17 @@ private:
                         slot.t_start_generation = 0;
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+
+                        if (slot.task->tokens.has_mtmd && !slot.prompt.tokens.has_mtmd && !slot.prompt.tokens.empty()) {
+                            // A media-bearing request cannot reuse a previous text-only prompt state:
+                            // the slot token container must be allowed to hold mtmd chunks before
+                            // process_chunk() copies them into the prompt.
+                            slot.prompt_clear(true);
+                        }
+
+                        if (slot.prompt.tokens.empty() && slot.task->tokens.has_mtmd) {
+                            slot.prompt.tokens.set_has_mtmd(true);
+                        }
 
                         SLT_INF(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
