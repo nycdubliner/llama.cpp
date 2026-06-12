@@ -1854,6 +1854,36 @@ struct ggml_cuda_fattn_route_plan {
     best_fattn_kernel kernel;
 };
 
+static inline bool ggml_cuda_fattn_can_force_hip_tile_fallback(
+        const ggml_tensor * Q,
+        const ggml_tensor * K,
+        const ggml_tensor * V,
+        const ggml_tensor * mask,
+        const ggml_cuda_fattn_route_plan & plan) {
+#if defined(GGML_USE_HIP)
+    if (plan.effective_type_K != GGML_TYPE_F16 || plan.effective_type_V != GGML_TYPE_F16) {
+        return false;
+    }
+
+    if (Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256) {
+        return false;
+    }
+
+    if (mask && mask->ne[2] != 1) {
+        return false;
+    }
+
+    return true;
+#else
+    GGML_UNUSED(Q);
+    GGML_UNUSED(K);
+    GGML_UNUSED(V);
+    GGML_UNUSED(mask);
+    GGML_UNUSED(plan);
+    return false;
+#endif
+}
+
 static ggml_cuda_fattn_route_plan ggml_cuda_fattn_make_route_plan(const int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst != nullptr);
     GGML_ASSERT(dst->src[0] != nullptr);
@@ -1960,6 +1990,27 @@ static ggml_cuda_fattn_route_plan ggml_cuda_fattn_make_route_plan(const int devi
     plan.allow_vec = !plan.unsafe_vec_after_turbo_v_decode;
 
     plan.kernel = ggml_cuda_get_best_fattn_kernel(device, &dst_eff, plan.allow_vec);
+
+    if (plan.kernel == BEST_FATTN_KERNEL_NONE &&
+        ggml_cuda_fattn_can_force_hip_tile_fallback(Q, &K_eff, &V_eff, dst->src[3], plan)) {
+        plan.kernel = BEST_FATTN_KERNEL_TILE;
+
+        if (ggml_cuda_fattn_route_debug_enabled()) {
+            fprintf(stderr,
+                "CUDA_FA_ROUTE_FALLBACK "
+                "device=%d forcing=HIP_TILE "
+                "Q=[%lld,%lld,%lld,%lld] "
+                "Keff=%s Veff=%s "
+                "Kshape=[%lld,%lld,%lld,%lld] Vshape=[%lld,%lld,%lld,%lld]\n",
+                device,
+                (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
+                ggml_type_name(plan.effective_type_K),
+                ggml_type_name(plan.effective_type_V),
+                (long long) K_eff.ne[0], (long long) K_eff.ne[1], (long long) K_eff.ne[2], (long long) K_eff.ne[3],
+                (long long) V_eff.ne[0], (long long) V_eff.ne[1], (long long) V_eff.ne[2], (long long) V_eff.ne[3]);
+            fflush(stderr);
+        }
+    }
 
     plan.need_generic_f16_K = false;
     plan.need_generic_f16_V = false;
