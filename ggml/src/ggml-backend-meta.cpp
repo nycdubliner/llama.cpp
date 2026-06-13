@@ -431,13 +431,10 @@ struct ggml_backend_meta_buffer_context {
 
     ggml_backend_meta_simple_tensor_container stc_static;
     ggml_init_params params_compute;
-    // buffer.init_tensor does not receive the backend that will execute the graph. graph_compute sets the active
-    // context while it rebuilds shadow graphs so external views are assigned to the backend context that owns them.
-    // INVALID_CONTEXT_ID is kept as a fallback for graph-external lookups before an executing context is known.
+    // Set during graph rebuild; INVALID is for graph-external lookups.
     context_id_t active_context_id = INVALID_CONTEXT_ID;
     std::vector<ggml_backend_buffer_ptr> bufs;
-    // External views use the source tensor's buffer. Remember which backend context registered each view so lookup and
-    // invalidation do not cross-contaminate cached shadow graphs from another meta backend context sharing the buffer.
+    // External views share source buffers but are owned by the executing backend context.
     std::map<const ggml_tensor *, context_id_t> external_view_context_ids;
     std::map<context_id_t, compute_state> stc_compute;
 
@@ -1905,8 +1902,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             auto & compute = buf_ctx->get_compute_state(context_id);
             compute.index_next = compute.index ^ 1;
             ggml_backend_meta_simple_tensor_container & stc = compute.stc[compute.index_next];
-            // Only discard external-view registrations owned by this backend context. Other contexts may still have
-            // cached shadow graphs that reference their current compute container.
+            // Preserve external views owned by other cached backend contexts.
             for (auto it = buf_ctx->external_view_context_ids.begin(); it != buf_ctx->external_view_context_ids.end();) {
                 if (it->second == context_id) {
                     it = buf_ctx->external_view_context_ids.erase(it);
